@@ -1146,6 +1146,21 @@ def _drawdown_from_peak_signal(entry: dict[str, Any]) -> tuple[int, Optional[str
     return 0, None
 
 
+def _ticker_starts_lowercase(ticker: Optional[str]) -> bool:
+    """All-lowercase-first-letter names ("fomobrain") read as low-effort/
+    spam-tier naming compared to Title Case ("Fomobrain") or full caps
+    ("FOMOBRAIN") — a real, if informal, signal the user asked to filter on.
+    Only judges the FIRST letter (covers both Title Case and full caps in one
+    check); tickers with no alphabetic character at all (pure symbols/emoji)
+    or still-unresolved "UNKNOWN" aren't judged either way."""
+    if not ticker or ticker == "UNKNOWN":
+        return False
+    for ch in ticker:
+        if ch.isalpha():
+            return ch.islower()
+    return False
+
+
 def compute_opportunity_score(entry: dict[str, Any]) -> tuple[int, list[str]]:
     """A heuristic 0-100 composite of everything this pipeline already knows about
     a token, so a viewer isn't left manually cross-referencing raw numbers to
@@ -1164,6 +1179,9 @@ def compute_opportunity_score(entry: dict[str, Any]) -> tuple[int, list[str]]:
             f"Below minimum floor (mcap {market_cap:.0f} / vol {volume_24h:.0f}) "
             f"— too little real activity to be considered"
         ]
+
+    if _ticker_starts_lowercase(entry.get("ticker")):
+        return 0, [f"Ticker \"{entry.get('ticker')}\" starts lowercase — low-effort naming, not considered"]
 
     # mcap is just price × supply — a $50k mcap with $1k volume (2% ratio) is
     # exactly the "obvious rug, price is fake" pattern: the number looks big
@@ -1438,6 +1456,9 @@ def compute_early_momentum_score(entry: dict[str, Any]) -> tuple[int, list[str]]
     # (that's the whole point of this being a different, earlier view).
     if market_cap <= 0 or (volume_24h <= 0 and txns_24h <= 0):
         return 0, ["No real market data yet — too early to evaluate"]
+
+    if _ticker_starts_lowercase(entry.get("ticker")):
+        return 0, [f"Ticker \"{entry.get('ticker')}\" starts lowercase — low-effort naming, not considered"]
 
     score = 0
     reasons: list[str] = []
