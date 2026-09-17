@@ -1,0 +1,1559 @@
+<title>Fair-Launch Tracker</title>
+<style>
+  :root {
+    --bg: #0a0e14;
+    --panel: #10151f;
+    --panel-alt: #141b28;
+    --border: #1f2937;
+    --text: #e5e9f0;
+    --text-dim: #7c8798;
+    --accent: #22d3ee;
+    --green: #34d399;
+    --red: #f87171;
+    --amber: #fbbf24;
+    --purple: #c084fc;
+    --chain-solana: #b48bff;
+    --chain-bnb: #f0b90b;
+    --chain-robinhood: #00c805;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: "SF Mono", "Cascadia Code", Consolas, monospace;
+    font-size: 13px;
+    padding: 0 16px 24px;
+  }
+  header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 16px 4px 12px;
+    border-bottom: 1px solid var(--border);
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+  header h1 {
+    font-size: 16px;
+    margin: 0;
+    letter-spacing: 0.5px;
+    color: var(--accent);
+  }
+  header h1 span { color: var(--text-dim); font-weight: normal; }
+  #status {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 12px;
+    color: var(--text-dim);
+  }
+  #status .dot {
+    width: 8px; height: 8px; border-radius: 50%;
+    background: var(--red);
+  }
+  #status.connected .dot { background: var(--green); }
+
+  #ticker-tape {
+    margin-top: 10px;
+    padding: 8px 12px;
+    background: var(--panel-alt);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    min-height: 34px;
+    display: flex;
+    align-items: center;
+    overflow: hidden;
+    white-space: nowrap;
+  }
+  #ticker-tape .flash {
+    animation: flashIn 0.6s ease-out;
+    font-weight: bold;
+  }
+  @keyframes flashIn {
+    0% { background: rgba(34, 211, 238, 0.35); }
+    100% { background: transparent; }
+  }
+  #ticker-tape .empty { color: var(--text-dim); }
+
+  .grid {
+    display: grid;
+    grid-template-columns: 1.2fr 1fr 1fr;
+    gap: 14px;
+    margin-top: 14px;
+  }
+  @media (max-width: 900px) {
+    .grid { grid-template-columns: 1fr; }
+  }
+
+  .panel {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    display: flex;
+    flex-direction: column;
+    min-height: 200px;
+    max-height: 78vh;
+  }
+  .panel.wide { margin-top: 14px; max-height: 46vh; }
+  .panel-header {
+    padding: 10px 12px;
+    border-bottom: 1px solid var(--border);
+    font-size: 12px;
+    text-transform: uppercase;
+    letter-spacing: 0.8px;
+    color: var(--text-dim);
+    display: flex;
+    justify-content: space-between;
+  }
+  .panel-body {
+    overflow-y: auto;
+    padding: 8px;
+    flex: 1;
+  }
+  .panel-body::-webkit-scrollbar { width: 6px; }
+  .panel-body::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+
+  .card {
+    background: var(--panel-alt);
+    border: 1px solid var(--border);
+    border-left: 3px solid var(--text-dim);
+    border-radius: 4px;
+    padding: 8px 10px;
+    margin-bottom: 6px;
+    font-size: 12px;
+    line-height: 1.5;
+  }
+  .card.severity-critical { border-left-color: var(--red); animation: flashCard 1.2s ease-out; }
+  .card.severity-high { border-left-color: var(--amber); }
+  .card.severity-success { border-left-color: var(--green); }
+  .card.severity-danger { border-left-color: var(--red); }
+  .card.severity-info { border-left-color: var(--text-dim); }
+  @keyframes flashCard {
+    0% { background: rgba(248, 113, 113, 0.25); }
+    100% { background: var(--panel-alt); }
+  }
+  .card .title { font-weight: bold; margin-bottom: 3px; }
+  .card .meta { color: var(--text-dim); font-size: 11px; }
+  .card .meta b { color: var(--text); }
+
+  .badge {
+    display: inline-block;
+    padding: 1px 6px;
+    border-radius: 3px;
+    font-size: 10px;
+    font-weight: bold;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    white-space: nowrap;
+  }
+  .badge.ACCELERATING { background: rgba(52, 211, 153, 0.15); color: var(--green); }
+  .badge.STABLE { background: rgba(34, 211, 238, 0.15); color: var(--accent); }
+  .badge.DECAYING { background: rgba(124, 135, 152, 0.2); color: var(--text-dim); }
+  .badge.FORMING, .badge.EMERGING_CLUSTER { background: rgba(192, 132, 252, 0.15); color: var(--purple); }
+
+  .badge.dev-ELITE { background: rgba(52, 211, 153, 0.15); color: var(--green); }
+  .badge.dev-SKIP, .badge.dev-SKIPPED { background: rgba(248, 113, 113, 0.15); color: var(--red); }
+  .badge.dev-PASS, .badge.dev-PENDING { background: rgba(124, 135, 152, 0.2); color: var(--text-dim); }
+
+  .badge.status-WATCHING { background: rgba(34, 211, 238, 0.15); color: var(--accent); }
+  .badge.status-GRADUATED { background: rgba(52, 211, 153, 0.15); color: var(--green); }
+  .badge.status-RUGGED { background: rgba(248, 113, 113, 0.15); color: var(--red); }
+  .badge.status-SKIPPED, .badge.status-EXPIRED_WATCH { background: rgba(124, 135, 152, 0.2); color: var(--text-dim); }
+
+  .narrative-card.DECAYING { opacity: 0.45; }
+  .token-row.status-RUGGED { opacity: 0.55; }
+  .token-row.status-SKIPPED { opacity: 0.4; }
+
+  .chain-tag {
+    display: inline-block;
+    font-size: 10px;
+    padding: 1px 5px;
+    border-radius: 3px;
+    background: var(--border);
+    color: var(--text-dim);
+    margin-right: 3px;
+    text-transform: uppercase;
+  }
+  .chain-tag.chain-solana { background: rgba(180, 139, 255, 0.15); color: var(--chain-solana); }
+  .chain-tag.chain-bnb { background: rgba(240, 185, 11, 0.15); color: var(--chain-bnb); }
+  .chain-tag.chain-robinhood { background: rgba(0, 200, 5, 0.15); color: var(--chain-robinhood); }
+
+  .empty-state {
+    color: var(--text-dim);
+    text-align: center;
+    padding: 24px 8px;
+    font-size: 12px;
+  }
+
+  .stat-row {
+    display: flex;
+    gap: 10px;
+    padding: 10px 12px;
+    border-bottom: 1px solid var(--border);
+    flex-wrap: wrap;
+  }
+  .stat {
+    flex: 1;
+    min-width: 70px;
+    text-align: center;
+  }
+  .stat .num { font-size: 20px; font-weight: bold; color: var(--accent); }
+  .stat .lbl { font-size: 10px; color: var(--text-dim); text-transform: uppercase; }
+
+  #token-feed { padding: 0; }
+  .token-tabs {
+    display: flex;
+    gap: 4px;
+    padding: 8px 10px 0;
+    flex-wrap: wrap;
+  }
+  .token-tab {
+    background: var(--panel-alt);
+    border: 1px solid var(--border);
+    color: var(--text-dim);
+    border-radius: 5px;
+    padding: 4px 10px;
+    font-size: 11px;
+    font-family: inherit;
+    cursor: pointer;
+  }
+  .token-tab:hover { color: var(--text); }
+  .token-tab.active { color: var(--bg); background: var(--accent); border-color: var(--accent); font-weight: bold; }
+
+  .token-row {
+    display: grid;
+    grid-template-columns: 58px 1fr 58px 155px 140px 44px 96px;
+    align-items: center;
+    gap: 8px;
+    padding: 7px 10px;
+    border-bottom: 1px solid var(--border);
+    font-size: 11px;
+  }
+  .token-row:hover { background: var(--panel-alt); }
+  .token-row .token-identity { overflow: hidden; }
+  .token-row .token-ticker { font-weight: bold; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; display: block; }
+  .token-row .token-platform { color: var(--text-dim); font-size: 10px; }
+  .token-row .token-addr { color: var(--text-dim); }
+  .token-row .token-mcap-cell { display: flex; align-items: center; justify-content: flex-end; gap: 6px; }
+  .token-row .mcap-stack { display: flex; flex-direction: column; align-items: flex-end; }
+  .token-row .token-mcap { text-align: right; }
+  .token-row .token-volume { font-size: 9px; color: var(--text-dim); }
+  .token-row .token-holders { font-size: 9px; color: var(--text-dim); }
+  .token-row .token-holders.concentrated { color: var(--amber); }
+  .token-img { border-radius: 4px; object-fit: cover; flex-shrink: 0; background: var(--panel-alt); }
+  .token-img-placeholder { border-radius: 4px; flex-shrink: 0; background: var(--panel-alt); display: inline-block; }
+  .token-row .token-age { color: var(--text-dim); text-align: right; }
+  .token-row .token-spark { display: flex; justify-content: center; flex-shrink: 0; }
+  .token-row .status-cell { display: flex; flex-direction: column; gap: 2px; }
+  .token-row .why-line { font-size: 9px; color: var(--text-dim); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .bonding-bar {
+    display: block;
+    width: 100%;
+    height: 4px;
+    border-radius: 2px;
+    background: var(--border);
+    overflow: hidden;
+    margin: 2px 0;
+  }
+  .bonding-bar-fill { display: block; height: 100%; background: var(--chain-solana); }
+  .token-row .token-actions { display: flex; gap: 4px; justify-content: flex-end; }
+  .token-row .action-btn {
+    width: 22px; height: 22px;
+    display: flex; align-items: center; justify-content: center;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    color: var(--text-dim);
+    text-decoration: none;
+    font-size: 11px;
+    cursor: pointer;
+    background: var(--panel-alt);
+  }
+  .token-row .action-btn:hover { color: var(--accent); border-color: var(--accent); }
+  /* .token-row sets display:grid, which (author CSS) overrides the browser's
+     default [hidden]{display:none} UA rule — without this, tab filtering
+     via row.hidden silently does nothing. */
+  .token-row[hidden] { display: none; }
+  .token-row-header {
+    display: grid;
+    grid-template-columns: 58px 1fr 58px 155px 140px 44px 96px;
+    gap: 8px;
+    padding: 6px 10px;
+    font-size: 10px;
+    text-transform: uppercase;
+    color: var(--text-dim);
+    border-bottom: 1px solid var(--border);
+    position: sticky;
+    top: 0;
+    background: var(--panel);
+  }
+  @media (max-width: 900px) {
+    .token-row, .token-row-header { grid-template-columns: 50px 1fr 90px 110px 76px; }
+    .token-row > *:nth-child(3), .token-row > *:nth-child(6),
+    .token-row-header > *:nth-child(3), .token-row-header > *:nth-child(6) {
+      display: none;
+    }
+  }
+
+  .summary-panel {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    margin-top: 14px;
+    padding: 4px 0 10px;
+  }
+  .summary-panel .panel-header { justify-content: flex-start; gap: 8px; }
+  .summary-panel .panel-header .hint { font-size: 10px; text-transform: none; color: var(--text-dim); }
+  .summary-grid {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px;
+    padding: 10px 12px 0;
+  }
+  .summary-stat {
+    flex: 1;
+    min-width: 90px;
+    text-align: center;
+    background: var(--panel-alt);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 8px 4px;
+  }
+  .summary-stat .num { font-size: 18px; font-weight: bold; }
+  .summary-stat .lbl { font-size: 10px; color: var(--text-dim); text-transform: uppercase; margin-top: 2px; }
+  .summary-stat.c-total .num { color: var(--accent); }
+  .summary-stat.c-elite .num { color: var(--purple); }
+  .summary-stat.c-graduated .num { color: var(--green); }
+  .summary-stat.c-rugged .num { color: var(--red); }
+  .summary-stat.c-skipped .num { color: var(--text-dim); }
+  .summary-stat.c-expired .num { color: var(--text-dim); }
+
+  .card .meta.detail { color: var(--text); }
+
+  .outcomes-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 14px;
+    margin-top: 14px;
+  }
+  @media (max-width: 700px) {
+    .outcomes-grid { grid-template-columns: 1fr; }
+  }
+
+  .opp-history-grid {
+    display: grid;
+    grid-template-columns: 3fr 1fr;
+    gap: 14px;
+  }
+  @media (max-width: 800px) {
+    .opp-history-grid { grid-template-columns: 1fr; }
+  }
+  .opp-history-grid .panel-body { max-height: 420px; }
+  .outcomes-col { max-height: 260px; }
+  .outcomes-col .panel-body { padding: 8px; }
+
+  .duo-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 14px;
+    margin-top: 14px;
+  }
+  @media (max-width: 700px) {
+    .duo-grid { grid-template-columns: 1fr; }
+  }
+
+  .weekly-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 12px;
+  }
+  .weekly-table th, .weekly-table td {
+    padding: 4px 8px;
+    text-align: right;
+    border-bottom: 1px solid var(--border, rgba(255,255,255,0.08));
+  }
+  .weekly-table th:first-child, .weekly-table td:first-child { text-align: left; }
+  .pnl-pos { color: var(--green); }
+  .pnl-neg { color: var(--red); }
+
+  .opp-status-badge {
+    display: inline-block;
+    font-size: 10px;
+    font-weight: 600;
+    padding: 1px 6px;
+    border-radius: 10px;
+    vertical-align: middle;
+  }
+  .opp-status-badge.status-rugged { background: rgba(248, 113, 113, 0.15); color: var(--red); }
+  .opp-status-badge.status-graduated { background: rgba(52, 211, 153, 0.15); color: var(--green); }
+  .opp-status-badge.status-expired { background: rgba(124, 135, 152, 0.15); color: var(--text-dim); }
+  .opp-status-badge.status-watching { background: rgba(34, 211, 238, 0.15); color: var(--accent); }
+
+  .launch-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 2px 6px;
+    margin: 2px 3px 2px 0;
+    font-size: 10px;
+    text-decoration: none;
+    color: var(--text);
+  }
+  .launch-chip:hover { border-color: var(--accent); }
+  .launch-chip.leader { border-color: var(--amber); box-shadow: 0 0 0 1px var(--amber); font-weight: bold; }
+  .launch-chips { margin-top: 4px; }
+
+  .opp-panel .panel-header { flex-wrap: wrap; gap: 4px; }
+  .opp-panel .hint { font-size: 10px; text-transform: none; color: var(--text-dim); }
+  .hint { font-size: 10px; color: var(--text-dim); }
+  .opp-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+    gap: 8px;
+    padding: 10px 12px;
+  }
+  .opp-card {
+    display: block;
+    background: var(--panel-alt);
+    border: 1px solid var(--border);
+    border-left: 3px solid var(--accent);
+    border-radius: 4px;
+    padding: 8px 10px;
+    text-decoration: none;
+    color: var(--text);
+    font-size: 11px;
+  }
+  .opp-card:hover { border-color: var(--accent); }
+  .opp-score {
+    display: inline-block;
+    padding: 0 6px;
+    border-radius: 3px;
+    font-weight: bold;
+    font-size: 11px;
+  }
+  .opp-score.score-high { background: rgba(52, 211, 153, 0.2); color: var(--green); }
+  .opp-score.score-mid { background: rgba(251, 191, 36, 0.2); color: var(--amber); }
+  .opp-score.score-low { background: rgba(124, 135, 152, 0.2); color: var(--text-dim); }
+</style>
+
+<header>
+  <h1>FAIR-LAUNCH TRACKER <span>// xjp2automation.online</span></h1>
+  <div id="status"><span class="dot"></span><span id="status-text">connecting...</span></div>
+</header>
+
+<div id="ticker-tape"><span class="empty">Waiting for high-priority alerts...</span></div>
+
+<div class="stat-row">
+  <div class="stat"><div class="num" id="stat-alerts">0</div><div class="lbl">Alerts</div></div>
+  <div class="stat"><div class="num" id="stat-tokens">0</div><div class="lbl">Tokens Seen</div></div>
+  <div class="stat"><div class="num" id="stat-narratives">0</div><div class="lbl">Active Narratives</div></div>
+  <div class="stat"><div class="num" id="stat-elite">0</div><div class="lbl">Elite Devs</div></div>
+  <div class="stat"><div class="num" id="stat-blacklist">0</div><div class="lbl">Blacklisted Devs</div></div>
+</div>
+
+<div class="summary-panel">
+  <div class="panel-header"><span>Today's Summary</span><span class="hint" id="today-date">tracked server-side, resets at UTC midnight</span></div>
+  <div class="summary-grid">
+    <div class="summary-stat c-total"><div class="num" id="sum-total">0</div><div class="lbl">Total Launches</div></div>
+    <div class="summary-stat c-elite"><div class="num" id="sum-elite">0</div><div class="lbl">Elite Launches</div></div>
+    <div class="summary-stat c-graduated"><div class="num" id="sum-graduated">0</div><div class="lbl">Graduated</div></div>
+    <div class="summary-stat c-rugged"><div class="num" id="sum-rugged">0</div><div class="lbl">Rugged</div></div>
+    <div class="summary-stat c-skipped"><div class="num" id="sum-skipped">0</div><div class="lbl">Skipped (Blacklisted)</div></div>
+    <div class="summary-stat c-expired"><div class="num" id="sum-expired">0</div><div class="lbl">Expired (No Verdict)</div></div>
+  </div>
+</div>
+
+<div class="duo-grid">
+  <div class="panel">
+    <div class="panel-header"><span>🕒 Launch Activity by Hour</span><span class="hint">when the market deploys the most contracts</span></div>
+    <div class="panel-body" id="hourly-activity"><div class="empty-state">No data yet.</div></div>
+  </div>
+  <div class="panel">
+    <div class="panel-header"><span>📅 Weekly Progress</span><span class="hint">day-by-day, up to 14 days</span></div>
+    <div class="panel-body" id="weekly-progress"><div class="empty-state">No daily history yet.</div></div>
+  </div>
+</div>
+
+<div class="opp-history-grid">
+  <div class="summary-panel opp-panel">
+    <div class="panel-header">
+      <span>🎯 Top Opportunities</span>
+      <span class="hint">heuristic score (0-100) from dev-trust + smart-money + volume + narrative signals — not financial advice</span>
+    </div>
+    <div class="opp-grid" id="top-opportunities"><div class="empty-state">No scored opportunities yet.</div></div>
+  </div>
+  <div class="panel outcomes-col" style="max-height:none;">
+    <div class="panel-header"><span>🎯 Opportunity History</span><span id="outcome-opportunities-count">0</span></div>
+    <div class="panel-body" id="outcome-opportunities"><div class="empty-state">None yet today.</div></div>
+  </div>
+</div>
+
+<div class="summary-panel opp-panel">
+  <div class="panel-header">
+    <span>⚡ Early Momentum</span>
+    <span class="hint">$50k–$200k mcap band — past the noisy launch-floor stage, not yet fully proven. Ratio, narrative &amp; smart-money signals only, not a prediction.</span>
+  </div>
+  <div class="opp-grid" id="early-momentum"><div class="empty-state">No early signals yet.</div></div>
+</div>
+
+<div class="panel wide">
+  <div class="panel-header">
+    <span>💰 Mock Portfolio</span>
+    <span class="hint" id="mock-portfolio-hint">paper trading — simulated $100 buy the instant each coin is flagged as an opportunity, not real funds</span>
+  </div>
+  <div class="panel-body" id="mock-portfolio"><div class="empty-state">No simulated positions yet — opens automatically the first time a coin is flagged as an opportunity.</div></div>
+</div>
+
+<div class="outcomes-grid">
+  <div class="panel outcomes-col">
+    <div class="panel-header"><span>🟢 Recent Graduations</span><span id="outcome-graduated-count">0</span></div>
+    <div class="panel-body" id="outcome-graduated"><div class="empty-state">None yet today.</div></div>
+  </div>
+  <div class="panel outcomes-col">
+    <div class="panel-header"><span>🔴 Recent Rugs</span><span id="outcome-rugged-count">0</span></div>
+    <div class="panel-body" id="outcome-rugged"><div class="empty-state">None yet today.</div></div>
+  </div>
+</div>
+
+<div class="panel wide">
+  <div class="panel-header"><span>Live Tokens</span><span id="token-count">0</span></div>
+  <div class="token-tabs" id="token-tabs">
+    <button class="token-tab active" data-filter="ALL">All <span id="tab-count-ALL">0</span></button>
+    <button class="token-tab" data-filter="WATCHING">Watching <span id="tab-count-WATCHING">0</span></button>
+    <button class="token-tab" data-filter="BONDING" title="Pump.fun tokens still on their bonding curve, not yet graduated">Bonding <span id="tab-count-BONDING">0</span></button>
+    <button class="token-tab" data-filter="GRADUATED">Graduated <span id="tab-count-GRADUATED">0</span></button>
+    <button class="token-tab" data-filter="RUGGED">Rugged <span id="tab-count-RUGGED">0</span></button>
+    <button class="token-tab" data-filter="SKIPPED">Skipped <span id="tab-count-SKIPPED">0</span></button>
+    <button class="token-tab" data-filter="EXPIRED_WATCH">Expired <span id="tab-count-EXPIRED_WATCH">0</span></button>
+  </div>
+  <div class="token-row-header">
+    <span>Chain</span><span>Token</span><span>Dev</span><span>Mcap</span><span>Status / Why</span><span>Age</span><span>Actions</span>
+  </div>
+  <div class="panel-body" id="token-feed"><div class="empty-state">No tokens seen yet.</div></div>
+</div>
+
+<div class="grid">
+  <div class="panel">
+    <div class="panel-header"><span>Live Alert Feed</span><span id="alert-count">0</span></div>
+    <div class="token-tabs" id="alert-tabs">
+      <button class="token-tab active" data-filter="IMPORTANT">Important <span id="alert-tab-count-IMPORTANT">0</span></button>
+      <button class="token-tab" data-filter="SKIPPED">Skipped <span id="alert-tab-count-SKIPPED">0</span></button>
+      <button class="token-tab" data-filter="ALL">All <span id="alert-tab-count-ALL">0</span></button>
+    </div>
+    <div class="panel-body" id="alert-feed"><div class="empty-state">No alerts yet.</div></div>
+  </div>
+
+  <div class="panel">
+    <div class="panel-header"><span>Narrative Velocity</span><span id="narrative-count">0</span></div>
+    <div class="hint" style="padding:4px 12px 0;">sorted hottest first &middot; decaying narratives collapsed at the bottom</div>
+    <div class="panel-body" id="narrative-feed"><div class="empty-state">No narrative clusters yet.</div></div>
+  </div>
+
+  <div class="panel">
+    <div class="panel-header"><span>Smart Money Activity</span><span id="smartmoney-count">0</span></div>
+    <div class="panel-body" id="smartmoney-feed"><div class="empty-state">No tracked-wallet activity yet.</div></div>
+  </div>
+</div>
+
+<script>
+(function () {
+  "use strict";
+
+  const alertFeed = document.getElementById("alert-feed");
+  const narrativeFeed = document.getElementById("narrative-feed");
+  const smartMoneyFeed = document.getElementById("smartmoney-feed");
+  const tokenFeed = document.getElementById("token-feed");
+  const tickerTape = document.getElementById("ticker-tape");
+  const statusEl = document.getElementById("status");
+  const statusText = document.getElementById("status-text");
+
+  const stats = {
+    alerts: 0,
+    tokensSeen: new Set(),
+    narratives: new Set(),
+    elite: new Set(),
+    blacklist: new Set(),
+  };
+
+  const narrativeCards = new Map(); // ticker -> DOM node
+  const tokenRows = new Map(); // token_address -> DOM node
+  const tokenPayloadOf = new Map(); // token_address -> latest full payload, for the Top Opportunities panel
+  let smartMoneyCount = 0;
+
+  const dailyStatsHistory = {}; // "YYYY-MM-DD" -> {total_tokens, graduated, rugged, ...}
+  const hourlyLaunchStats = {}; // "YYYY-MM-DDTHH" -> count
+
+  function fmtTime(ts) {
+    if (!ts) return "";
+    const d = new Date(ts * 1000);
+    return d.toLocaleTimeString();
+  }
+
+  function fmtAge(seconds) {
+    if (seconds === undefined || seconds === null || isNaN(seconds) || seconds < 0) return "-";
+    if (seconds < 60) return Math.floor(seconds) + "s";
+    if (seconds < 3600) return Math.floor(seconds / 60) + "m";
+    if (seconds < 86400) return Math.floor(seconds / 3600) + "h";
+    return Math.floor(seconds / 86400) + "d";
+  }
+
+  function fmtUsd(n) {
+    if (n === undefined || n === null || isNaN(n) || n === 0) return "-";
+    if (n >= 1000000) return "$" + (n / 1000000).toFixed(2) + "M";
+    if (n >= 1000) return "$" + (n / 1000).toFixed(1) + "k";
+    return "$" + n.toFixed(0);
+  }
+
+  function holderLineHtml(payload) {
+    if (payload.holder_count === undefined || payload.holder_count === null) return "";
+    const pct = payload.top_holder_pct;
+    const concentrated = pct !== undefined && pct !== null && pct >= 25;
+    const pctText = (pct !== undefined && pct !== null) ? ` &middot; top ${pct.toFixed(0)}%` : "";
+    const xferCount = payload.holder_transfer_count;
+    const washy = xferCount !== undefined && xferCount !== null && payload.holder_count < 5 && xferCount >= 20;
+    const xferText = (xferCount !== undefined && xferCount !== null) ? ` &middot; ${xferCount} transfers` : "";
+    const sellText = payload.top_holder_selling ? ` &middot; ⚠ top holder selling` : "";
+    return `<span class="token-holders${(concentrated || washy || payload.top_holder_selling) ? " concentrated" : ""}" title="top 10 holders own ${(payload.top10_holder_pct || 0).toFixed(0)}% of supply">${payload.holder_count} holders${pctText}${xferText}${sellText}</span>`;
+  }
+
+  function tokenImageHtml(payload, size) {
+    if (!payload.image_url) return `<span class="token-img-placeholder" style="width:${size}px;height:${size}px"></span>`;
+    return `<img class="token-img" src="${payload.image_url}" width="${size}" height="${size}" loading="lazy" onerror="this.style.visibility='hidden'" alt="">`;
+  }
+
+  function shortAddr(a) {
+    if (!a) return "-";
+    if (a.length <= 12) return a;
+    return a.slice(0, 5) + "…" + a.slice(-4);
+  }
+
+  function clearEmpty(container) {
+    const empty = container.querySelector(".empty-state");
+    if (empty) empty.remove();
+  }
+
+  function severityFor(alert) {
+    if (alert.severity) return alert.severity;
+    return "info";
+  }
+
+  function chainTag(chain) {
+    if (!chain) return "";
+    return `<span class="chain-tag chain-${chain}">${chain}</span>`;
+  }
+
+  function sparklineSvg(points) {
+    if (!points || points.length < 2) return "";
+    const values = points.map(p => p[1]);
+    const min = Math.min(...values);
+    const max = Math.max(...values);
+    const range = (max - min) || 1;
+    const w = 72, h = 22;
+    const step = w / (points.length - 1);
+    const coords = points.map((p, i) => {
+      const x = (i * step).toFixed(1);
+      const y = (h - ((p[1] - min) / range) * h).toFixed(1);
+      return `${x},${y}`;
+    }).join(" ");
+    const trendUp = values[values.length - 1] >= values[0];
+    const color = trendUp ? "var(--green)" : "var(--red)";
+    return `<svg width="${w}" height="${h}" viewBox="0 0 ${w} ${h}"><polyline points="${coords}" fill="none" stroke="${color}" stroke-width="1.5"/></svg>`;
+  }
+
+  function bondingBarHtml(payload) {
+    // Only pump.fun tokens carry this — decoded live from their own on-chain
+    // bonding curve account (free alternative to PumpPortal's paid trade feed).
+    if (payload.bonding_progress_pct === undefined || payload.bonding_progress_pct === null) return "";
+    const pct = Math.max(0, Math.min(100, payload.bonding_progress_pct));
+    const solRaised = payload.bonding_sol_raised !== undefined ? payload.bonding_sol_raised.toFixed(1) : "?";
+    return `<span class="bonding-bar" title="${solRaised} SOL raised on-chain, ${pct.toFixed(0)}% of the ~85 SOL curve target (approximate)">
+      <span class="bonding-bar-fill" style="width:${pct}%"></span>
+    </span>`;
+  }
+
+  const SIGNAL_LABELS = {
+    ELITE_DEV: "\u{1F680} Elite dev",
+    CONVICTION_BUY: "\u{1F525} Conviction buy",
+    HIVE_MIND: "\u{1F451} Hive mind buy-in",
+    THIN_VOLUME: "\u{26A0}\u{FE0F} Hit mcap target but volume/liquidity too thin — withheld",
+  };
+
+  function whySignals(signals) {
+    if (!signals || !signals.length) return "no smart-money signals fired before this — organic";
+    return signals.map(s => SIGNAL_LABELS[s] || s).join(", ");
+  }
+
+  function devBadge(payload) {
+    // Never show a bare wallet address as the headline — what matters is
+    // whether this dev has rugged or graduated something before.
+    if (payload.dev_alias === "shared infra (not a person)") return "infra (not a person)";
+    const moons = payload.dev_moons || 0;
+    const rugs = payload.dev_rugs || 0;
+    const bits = [];
+    if (moons > 0) bits.push(`\u{1F680}${moons}`);
+    if (rugs > 0) bits.push(`\u{1F480}${rugs}`);
+    if (!bits.length) return "new dev, no history";
+    return bits.join(" ");
+  }
+
+  function launchChipsHtml(launches) {
+    if (!launches || !launches.length) return "";
+    const chips = launches.map(l => {
+      const href = (l.links && l.links.dexscreener) || (l.links && l.links.explorer) || "#";
+      const statusCls = "status-" + (l.status || "WATCHING");
+      const leaderCls = l.is_leader ? " leader" : "";
+      const label = (l.ticker && l.ticker !== "UNKNOWN") ? `$${l.ticker}` : "unresolved";
+      const leaderTag = l.is_leader ? "\u{1F525} " : "";
+      return `<a class="launch-chip ${statusCls}${leaderCls}" href="${href}" target="_blank" rel="noopener" title="token: ${l.token_address}\ndev: ${l.dev_wallet}">${leaderTag}${chainTag(l.chain)}${label} &middot; dev ${devBadge(l)} &middot; mcap ${fmtUsd(l.market_cap)} &middot; ${l.status || "WATCHING"}</a>`;
+    }).join("");
+    return `<div class="launch-chips">${chips}</div>`;
+  }
+
+  function priorRugsHtml(rugs) {
+    if (!rugs || !rugs.length) return "";
+    const items = rugs.map(r => {
+      const dd = r.drawdown_pct !== undefined ? r.drawdown_pct.toFixed(0) : "?";
+      return `<a class="launch-chip status-RUGGED" href="https://dexscreener.com/${r.chain === "bnb" ? "bsc" : r.chain}/${r.token_address}" target="_blank" rel="noopener" title="${r.token_address}">${chainTag(r.chain)}$${r.ticker || "?"} &middot; peaked ${fmtUsd(r.peak_market_cap)} &middot; -${dd}%</a>`;
+    }).join("");
+    return `<div class="launch-chips">${items}</div>`;
+  }
+
+  function alertDetail(alert) {
+    switch (alert.type) {
+      case "SKIPPED": {
+        const rugsHtml = priorRugsHtml(alert.prior_rugs);
+        return `Reason: <b>${alert.reason || "-"}</b> — dev is permanently blacklisted, no further checks run.` +
+          (rugsHtml ? ` What they rugged before:${rugsHtml}` : " (no prior rug on record — likely blacklisted via a direct rug of this dev's own history before this session started tracking, or the SERIAL_RUGGER_THRESHOLD path)");
+      }
+      case "ELITE_DEV_LAUNCH":
+        return `Dev has <b>${alert.successful_launches ?? 0}</b> prior graduated launch(es) — bypassed all other filters`;
+      case "GRADUATED": {
+        const stats = `<b>${fmtUsd(alert.market_cap_usd)}</b> mcap, <b>${fmtUsd(alert.volume_24h_usd)}</b> 24h volume, <b>${fmtUsd(alert.liquidity_usd)}</b> liquidity (${alert.buys_24h ?? 0}↑/${alert.sells_24h ?? 0}↓ = ${alert.txns_24h ?? 0} txns)`;
+        const sourceLine = alert.source === "platform_native"
+          ? `Confirmed by the platform's own graduation event — not our heuristic.`
+          : `Our heuristic determined this (mcap + volume/liquidity/txn gates), not a platform-native signal.`;
+        return `${sourceLine} ${stats} — real activity behind it. Dev now has <b>${alert.dev_successful_launches ?? "?"}</b> graduate(s). Why it likely moved: ${whySignals(alert.signals)}`;
+      }
+      case "RUGGED": {
+        const dd = alert.drawdown_pct !== undefined ? alert.drawdown_pct.toFixed(1) : "?";
+        return `Peak <b>${fmtUsd(alert.peak_market_cap_usd)}</b> &rarr; now <b>${fmtUsd(alert.current_market_cap_usd)}</b> (-${dd}%) — dev now blacklisted, even if previously Elite. Signals before it rugged: ${whySignals(alert.signals)}`;
+      }
+      case "MAX_CONVICTION_TRADE": {
+        const mult = alert.avg_trade_size_usd ? (alert.trade_size_usd / alert.avg_trade_size_usd).toFixed(1) : "?";
+        return `${fmtUsd(alert.trade_size_usd)} vs their avg ${fmtUsd(alert.avg_trade_size_usd)} — <b>${mult}x</b> normal size, within 3min of launch`;
+      }
+      case "HIVE_MIND": {
+        const names = (alert.wallet_aliases || alert.wallets || []).join(", ");
+        return `<b>${(alert.wallets || []).length}</b> tracked wallets bought in within 3min: ${names}`;
+      }
+      case "NARRATIVE_CLUSTER": {
+        const d1 = alert.delta_1 !== undefined ? alert.delta_1.toFixed(0) + "s" : "-";
+        const d2 = alert.delta_2 !== undefined ? alert.delta_2.toFixed(0) + "s" : "-";
+        const text = `Gap between copycat launches shrinking: <b>${d1} &rarr; ${d2}</b> across ${(alert.chains_involved || []).length} chain(s), ${alert.unique_dev_count || 0} unique devs. Click a copycat to view it:`;
+        return text + launchChipsHtml(alert.launches);
+      }
+      case "BUNDLE_DETECTED": {
+        // Note: bundling itself is common, legitimate launch practice (e.g.
+        // seeding initial liquidity/conviction) — this alert only fires once
+        // there's an actual track record behind the operator, not for a
+        // plain first-time bundle.
+        const pct = (alert.bundle_supply_pct || 0).toFixed(0);
+        const repeatLine = alert.is_known_bad_operator
+          ? `This operator is already linked to a confirmed rug elsewhere — dev wallet blacklisted on the strength of that.`
+          : `Same operator has bundled at least one other launch before (different dev wallet) — could be a legitimate serial launcher reusing a pattern, or worth extra scrutiny. Not a verdict on its own.`;
+        return `<b>${alert.bundle_wallet_count}</b> wallets funded/distributed by one operator (<span title="${alert.operator}">${shortAddr(alert.operator)}</span>), holding <b>${pct}%</b> of tracked supply between them. ${repeatLine}`;
+      }
+      case "REVIVAL": {
+        return `Was <b>${alert.last_status}</b> and quiet (${fmtUsd(alert.baseline_volume_24h)} 24h vol baseline) — now <b>${fmtUsd(alert.current_volume_24h)}</b> 24h vol, ${fmtUsd(alert.market_cap_usd)} mcap. Re-activated into full tracking — treat this like a fresh launch, not a known quantity.`;
+      }
+      default:
+        return "";
+    }
+  }
+
+  const alertTabCounts = { IMPORTANT: 0, SKIPPED: 0, ALL: 0 };
+  let currentAlertFilter = "IMPORTANT";
+
+  function updateAlertTabCounts() {
+    for (const key of Object.keys(alertTabCounts)) {
+      const el = document.getElementById("alert-tab-count-" + key);
+      if (el) el.textContent = alertTabCounts[key];
+    }
+  }
+
+  document.getElementById("alert-tabs").addEventListener("click", (evt) => {
+    const btn = evt.target.closest(".token-tab");
+    if (!btn) return;
+    currentAlertFilter = btn.dataset.filter;
+    document.querySelectorAll("#alert-tabs .token-tab").forEach(b => b.classList.toggle("active", b === btn));
+    for (const card of alertFeed.children) {
+      const isSkipped = card.dataset.alertType === "SKIPPED";
+      card.hidden = currentAlertFilter === "IMPORTANT" ? isSkipped
+        : currentAlertFilter === "SKIPPED" ? !isSkipped
+        : false;
+    }
+  });
+
+  function renderAlert(alert, opts) {
+    opts = opts || {};
+    clearEmpty(alertFeed);
+    stats.alerts += 1;
+    document.getElementById("stat-alerts").textContent = stats.alerts;
+    document.getElementById("alert-count").textContent = stats.alerts;
+
+    const isSkipped = alert.type === "SKIPPED";
+    alertTabCounts.ALL += 1;
+    alertTabCounts[isSkipped ? "SKIPPED" : "IMPORTANT"] += 1;
+    updateAlertTabCounts();
+
+    const sev = severityFor(alert);
+    const card = document.createElement("div");
+    card.className = "card severity-" + sev;
+    card.dataset.alertType = isSkipped ? "SKIPPED" : "IMPORTANT";
+    card.hidden = currentAlertFilter === "IMPORTANT" ? isSkipped
+      : currentAlertFilter === "SKIPPED" ? !isSkipped
+      : false;
+
+    let metaBits = [];
+    if (alert.chain) metaBits.push(chainTag(alert.chain));
+    if (alert.platform) metaBits.push(`<b>${alert.platform}</b>`);
+    if (alert.ticker) metaBits.push(`$${alert.ticker}`);
+    if (alert.token_address) metaBits.push(shortAddr(alert.token_address));
+    if (alert.dev_wallet) metaBits.push(`<span title="${alert.dev_wallet}">dev ${devBadge(alert)}</span>`);
+    if (alert.wallet_alias) metaBits.push(alert.wallet_alias);
+
+    const detail = alertDetail(alert);
+
+    card.innerHTML = `
+      <div class="title">${alert.title || alert.type || "ALERT"}</div>
+      <div class="meta">${metaBits.join(" &middot; ")}</div>
+      ${detail ? `<div class="meta detail">${detail}</div>` : ""}
+      <div class="meta">${fmtTime(alert.timestamp)}</div>
+    `;
+    alertFeed.prepend(card);
+
+    while (alertFeed.children.length > 250) {
+      alertFeed.removeChild(alertFeed.lastChild);
+    }
+
+    if (sev === "critical" || sev === "high") {
+      flashTicker(alert);
+    }
+
+    if (alert.type === "ELITE_DEV_LAUNCH" && alert.dev_wallet) {
+      stats.elite.add(alert.dev_wallet);
+      document.getElementById("stat-elite").textContent = stats.elite.size;
+    }
+    if (alert.type === "RUGGED" && alert.dev_wallet) {
+      stats.blacklist.add(alert.dev_wallet);
+      document.getElementById("stat-blacklist").textContent = stats.blacklist.size;
+    }
+
+    if (!opts.skipOutcome && (alert.type === "GRADUATED" || alert.type === "RUGGED")) {
+      renderOutcome(alert);
+    }
+    if (!opts.skipOutcome && alert.type === "OPPORTUNITY_FLAGGED") {
+      renderOpportunityHistory(alert);
+    }
+  }
+
+  function opportunityStatusBadgeHtml(status) {
+    if (status === "RUGGED") return ' <span class="opp-status-badge status-rugged">\u{1F534} RUGGED</span>';
+    if (status === "GRADUATED") return ' <span class="opp-status-badge status-graduated">\u{1F7E2} GRADUATED</span>';
+    if (status === "EXPIRED_WATCH") return ' <span class="opp-status-badge status-expired">⚪ EXPIRED</span>';
+    if (status === "WATCHING") return ' <span class="opp-status-badge status-watching">\u{1F535} watching</span>';
+    return "";
+  }
+
+  function opportunityHistoryCardHtml(alert) {
+    const href = (alert.links && alert.links.dexscreener) || (alert.links && alert.links.explorer) || "#";
+    const label = (alert.ticker && alert.ticker !== "UNKNOWN") ? `$${alert.ticker}` : "unresolved";
+    const reasons = (alert.score_reasons || []).join(" &middot; ") || "baseline score";
+    const badge = opportunityStatusBadgeHtml(alert.current_status);
+    return `<a href="${href}" target="_blank" rel="noopener" style="text-decoration:none;color:inherit;">
+        <div class="title">${chainTag(alert.chain)} ${label} <span class="opp-score ${scoreClass(alert.opportunity_score)}">${alert.opportunity_score}</span>${badge}</div>
+        <div class="meta">${fmtUsd(alert.market_cap_usd)} mcap &middot; vol ${fmtUsd(alert.volume_24h_usd)} &middot; ${fmtTime(alert.timestamp)}</div>
+        <div class="meta">Why: ${reasons}</div>
+      </a>`;
+  }
+
+  function renderOpportunityHistory(alert) {
+    const container = document.getElementById("outcome-opportunities");
+    const countEl = document.getElementById("outcome-opportunities-count");
+    clearEmpty(container);
+    countEl.textContent = (parseInt(countEl.textContent, 10) || 0) + 1;
+
+    const card = document.createElement("div");
+    card.className = "card severity-info";
+    card.dataset.tokenAddress = alert.token_address || "";
+    card.innerHTML = opportunityHistoryCardHtml(alert);
+    container.prepend(card);
+    while (container.children.length > 60) {
+      container.removeChild(container.lastChild);
+    }
+  }
+
+  function renderOpportunityHistoryList(alerts) {
+    const container = document.getElementById("outcome-opportunities");
+    const countEl = document.getElementById("outcome-opportunities-count");
+    if (!alerts || !alerts.length) return;
+    countEl.textContent = alerts.length;
+    // Newest first, same order the incremental prepend path builds up.
+    const ordered = [...alerts].reverse();
+    container.innerHTML = ordered.map(a => `<div class="card severity-info">${opportunityHistoryCardHtml(a)}</div>`).join("");
+  }
+
+  function renderOutcome(alert) {
+    const isGrad = alert.type === "GRADUATED";
+    const container = document.getElementById(isGrad ? "outcome-graduated" : "outcome-rugged");
+    const countEl = document.getElementById(isGrad ? "outcome-graduated-count" : "outcome-rugged-count");
+    clearEmpty(container);
+    countEl.textContent = (parseInt(countEl.textContent, 10) || 0) + 1;
+
+    const card = document.createElement("div");
+    card.className = "card severity-" + (isGrad ? "success" : "danger");
+    const mcapLine = isGrad
+      ? `Hit ${fmtUsd(alert.market_cap_usd)}`
+      : `Peak ${fmtUsd(alert.peak_market_cap_usd)} &rarr; ${fmtUsd(alert.current_market_cap_usd)}`;
+    const sourceTag = alert.source === "platform_native" ? `<span class="badge dev-ELITE" title="Confirmed by the platform's own graduation event">native</span>` : "";
+    card.innerHTML = `
+      <div class="title">${chainTag(alert.chain)} $${alert.ticker || "?"} ${sourceTag}</div>
+      <div class="meta">${mcapLine} &middot; ${fmtTime(alert.timestamp)}</div>
+      <div class="meta">Why: ${whySignals(alert.signals)}</div>
+    `;
+    container.prepend(card);
+    while (container.children.length > 40) {
+      container.removeChild(container.lastChild);
+    }
+  }
+
+  function flashTicker(alert) {
+    tickerTape.innerHTML = "";
+    const span = document.createElement("span");
+    span.className = "flash";
+    const label = alert.ticker ? `$${alert.ticker}` : (alert.token_address ? shortAddr(alert.token_address) : "");
+    span.textContent = `${alert.title || alert.type}  ${label}  ${alert.chain ? "[" + alert.chain + "]" : ""}`;
+    tickerTape.appendChild(span);
+  }
+
+  const NARRATIVE_STATUS_PRIORITY = { ACCELERATING: 0, EMERGING_CLUSTER: 1, STABLE: 2, FORMING: 3, DECAYING: 4 };
+
+  function deltaTrendText(payload) {
+    if (payload.delta_1 === undefined || payload.delta_2 === undefined) return "not enough launches yet to judge speed";
+    const d1 = payload.delta_1.toFixed(0), d2 = payload.delta_2.toFixed(0);
+    if (payload.status === "ACCELERATING") return `gap between launches shrinking: ${d1}s &rarr; ${d2}s (speeding up)`;
+    if (payload.status === "DECAYING") return `gap widening: ${d1}s &rarr; ${d2}s (cooling off)`;
+    return `gap steady: ${d1}s &rarr; ${d2}s`;
+  }
+
+  function sortNarrativeFeed() {
+    const cards = Array.from(narrativeFeed.children).filter(c => c.dataset && c.dataset.status);
+    cards.sort((a, b) => (NARRATIVE_STATUS_PRIORITY[a.dataset.status] ?? 9) - (NARRATIVE_STATUS_PRIORITY[b.dataset.status] ?? 9));
+    cards.forEach(c => narrativeFeed.appendChild(c));
+  }
+
+  function renderNarrative(payload) {
+    if (!payload || !payload.ticker) return;
+    clearEmpty(narrativeFeed);
+    stats.narratives.add(payload.ticker);
+    document.getElementById("stat-narratives").textContent = stats.narratives.size;
+
+    let card = narrativeCards.get(payload.ticker);
+    if (!card) {
+      card = document.createElement("div");
+      card.className = "card narrative-card";
+      narrativeFeed.prepend(card);
+      narrativeCards.set(payload.ticker, card);
+      document.getElementById("narrative-count").textContent = narrativeCards.size;
+    }
+
+    card.className = "card narrative-card " + (payload.status || "");
+    card.dataset.status = payload.status || "";
+    const chains = (payload.chains_involved || []).map(chainTag).join("");
+
+    const operatorWarning = payload.same_operator_suspected
+      ? `<div class="meta" style="color: var(--red)">⚠ Looks orchestrated by one bundle operator across dev wallets — not a real independent-dev narrative</div>`
+      : "";
+
+    card.innerHTML = `
+      <div class="title">$${payload.ticker} <span class="badge ${payload.status}">${payload.status}</span></div>
+      <div class="meta">${chains}</div>
+      <div class="meta">devs: <b>${payload.unique_dev_count || 0}</b> &middot; launches: <b>${payload.total_launches || 0}</b></div>
+      <div class="meta">${deltaTrendText(payload)}</div>
+      ${operatorWarning}
+      ${launchChipsHtml(payload.launches)}
+    `;
+    sortNarrativeFeed();
+  }
+
+  function renderSmartMoney(payload) {
+    clearEmpty(smartMoneyFeed);
+    smartMoneyCount += 1;
+    document.getElementById("smartmoney-count").textContent = smartMoneyCount;
+
+    const card = document.createElement("div");
+    card.className = "card severity-info";
+    card.innerHTML = `
+      <div class="title">${payload.alias || shortAddr(payload.wallet)}</div>
+      <div class="meta">${chainTag(payload.chain)} bought ${shortAddr(payload.token_address)}</div>
+      <div class="meta">${fmtUsd(payload.trade_size_usd)} &middot; ${fmtTime(payload.timestamp)}</div>
+    `;
+    smartMoneyFeed.prepend(card);
+    while (smartMoneyFeed.children.length > 150) {
+      smartMoneyFeed.removeChild(smartMoneyFeed.lastChild);
+    }
+  }
+
+  const tokenStatusCounts = { ALL: 0, WATCHING: 0, GRADUATED: 0, RUGGED: 0, SKIPPED: 0, EXPIRED_WATCH: 0 };
+  const tokenStatusOf = new Map(); // token_address -> current status, for tab counts + filtering
+  let currentTokenFilter = "ALL";
+
+  function updateTabCounts() {
+    for (const key of Object.keys(tokenStatusCounts)) {
+      const el = document.getElementById("tab-count-" + key);
+      if (el) el.textContent = tokenStatusCounts[key];
+    }
+  }
+
+  function setTokenStatus(addr, newStatus) {
+    const prev = tokenStatusOf.get(addr);
+    if (prev === newStatus) return;
+    if (prev) {
+      tokenStatusCounts[prev] = Math.max(0, (tokenStatusCounts[prev] || 0) - 1);
+    } else {
+      tokenStatusCounts.ALL += 1;
+    }
+    tokenStatusCounts[newStatus] = (tokenStatusCounts[newStatus] || 0) + 1;
+    tokenStatusOf.set(addr, newStatus);
+    updateTabCounts();
+  }
+
+  function isBonding(status, payload) {
+    // Not a real status — a sub-state of WATCHING, only meaningful for
+    // pump.fun tokens where we decode live progress from their own on-chain
+    // bonding curve account (see bondingBarHtml).
+    return status === "WATCHING" && payload
+      && payload.bonding_sol_raised !== undefined && payload.bonding_sol_raised !== null
+      && !payload.bonding_complete;
+  }
+
+  function applyRowFilter(row, status, payload) {
+    if (currentTokenFilter === "ALL") { row.hidden = false; return; }
+    if (currentTokenFilter === "BONDING") { row.hidden = !isBonding(status, payload); return; }
+    row.hidden = status !== currentTokenFilter;
+  }
+
+  document.getElementById("token-tabs").addEventListener("click", (evt) => {
+    const btn = evt.target.closest(".token-tab");
+    if (!btn) return;
+    currentTokenFilter = btn.dataset.filter;
+    document.querySelectorAll(".token-tab").forEach(b => b.classList.toggle("active", b === btn));
+    for (const [addr, row] of tokenRows) {
+      applyRowFilter(row, tokenStatusOf.get(addr) || "WATCHING", tokenPayloadOf.get(addr));
+    }
+  });
+
+  window.copyTokenAddress = function (btn) {
+    const addr = btn.getAttribute("data-addr");
+    const done = () => { btn.textContent = "✓"; setTimeout(() => { btn.textContent = "\u{1F4CB}"; }, 1000); };
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(addr).then(done).catch(done);
+    } else {
+      done();
+    }
+  };
+
+  function tokenActionsHtml(payload) {
+    const links = payload.links || {};
+    const parts = [];
+    if (links.dexscreener) {
+      parts.push(`<a class="action-btn" href="${links.dexscreener}" target="_blank" rel="noopener" title="Chart on DexScreener">\u{1F4C8}</a>`);
+    }
+    if (links.explorer) {
+      parts.push(`<a class="action-btn" href="${links.explorer}" target="_blank" rel="noopener" title="View on chain explorer">\u{1F50D}</a>`);
+    }
+    parts.push(`<button type="button" class="action-btn" title="Copy contract address" data-addr="${payload.token_address}" onclick="copyTokenAddress(this)">\u{1F4CB}</button>`);
+    return parts.join("");
+  }
+
+  function renderToken(payload) {
+    if (!payload || !payload.token_address) return;
+    clearEmpty(tokenFeed);
+    tokenPayloadOf.set(payload.token_address, payload);
+
+    let row = tokenRows.get(payload.token_address);
+    if (!row) {
+      row = document.createElement("div");
+      tokenFeed.prepend(row);
+      tokenRows.set(payload.token_address, row);
+      stats.tokensSeen.add(payload.token_address);
+      document.getElementById("stat-tokens").textContent = stats.tokensSeen.size;
+      document.getElementById("token-count").textContent = tokenRows.size;
+      while (tokenFeed.children.length > 300) {
+        const last = tokenFeed.lastChild;
+        for (const [addr, node] of tokenRows) {
+          if (node === last) {
+            const evictedStatus = tokenStatusOf.get(addr);
+            if (evictedStatus) {
+              tokenStatusCounts[evictedStatus] = Math.max(0, (tokenStatusCounts[evictedStatus] || 0) - 1);
+              tokenStatusCounts.ALL = Math.max(0, tokenStatusCounts.ALL - 1);
+            }
+            tokenRows.delete(addr);
+            tokenStatusOf.delete(addr);
+            tokenPayloadOf.delete(addr);
+            break;
+          }
+        }
+        tokenFeed.removeChild(last);
+      }
+      updateTabCounts();
+    }
+
+    scheduleTopOpportunitiesRefresh();
+
+    const status = payload.status || "WATCHING";
+    row.className = "token-row status-" + status;
+    setTokenStatus(payload.token_address, status);
+    applyRowFilter(row, status, payload);
+
+    const age = payload.created_at ? fmtAge((Date.now() / 1000) - payload.created_at) : "-";
+    const devDecision = payload.dev_decision || "PENDING";
+    const ticker = (payload.ticker && payload.ticker !== "UNKNOWN") ? payload.ticker.slice(0, 12) : "unresolved";
+    const whyText = (status === "GRADUATED" || status === "RUGGED")
+      ? whySignals(payload.signals)
+      : (payload.signals && payload.signals.length ? whySignals(payload.signals) : "");
+
+    row.innerHTML = `
+      ${chainTag(payload.chain)}
+      <span class="token-identity" style="display:flex;align-items:center;gap:6px;">
+        ${tokenImageHtml(payload, 20)}
+        <span style="overflow:hidden;">
+          <span class="token-ticker" title="${payload.token_address}">$${ticker}</span>
+          <span class="token-platform">${payload.platform || "-"}</span>
+        </span>
+      </span>
+      <span class="badge dev-${devDecision}" title="dev: ${payload.dev_wallet}\ntrack record: ${devBadge(payload)}">${devDecision}</span>
+      ${payload.bundle_detected ? (() => {
+        // Plain bundling at launch is common practice, not inherently bad —
+        // only color/word it as a warning once there's an actual track
+        // record (repeat operator, worse if linked to a confirmed rug).
+        const cls = payload.bundle_known_bad_operator ? "status-RUGGED" : (payload.bundle_repeat_operator ? "status-RUGGED" : "dev-PASS");
+        const label = payload.bundle_known_bad_operator ? "REPEAT BUNDLER" : (payload.bundle_repeat_operator ? "BUNDLE (REPEAT)" : "BUNDLE");
+        const note = payload.bundle_known_bad_operator
+          ? " — this operator is linked to a confirmed rug elsewhere"
+          : payload.bundle_repeat_operator
+            ? " — same operator bundled another launch too (not necessarily bad)"
+            : " — common at launch, not inherently a red flag";
+        return `<span class="badge ${cls}" title="${payload.bundle_wallet_count || 0} wallets, ${(payload.bundle_supply_pct || 0).toFixed(0)}% of supply, one operator${note}">\u{1F3AD} ${label}</span>`;
+      })() : ""}
+      <span class="token-mcap-cell">
+        <span class="mcap-stack">
+          <span class="token-mcap">${fmtUsd(payload.market_cap)}</span>
+          <span class="token-volume" title="24h volume, buys/sells">vol ${fmtUsd(payload.volume_24h)} ${(payload.buys_24h || payload.sells_24h) ? `(${payload.buys_24h || 0}↑${payload.sells_24h || 0}↓)` : ""}</span>
+          ${holderLineHtml(payload)}
+        </span>
+        <span class="token-spark">${sparklineSvg(payload.sparkline)}</span>
+      </span>
+      <span class="status-cell">
+        <span class="badge status-${status}">${status.replace("_", " ")}</span>
+        ${bondingBarHtml(payload)}
+        ${whyText ? `<span class="why-line" title="${whyText}">${whyText}</span>` : ""}
+      </span>
+      <span class="token-age">${age}</span>
+      <span class="token-actions">${tokenActionsHtml(payload)}</span>
+    `;
+  }
+
+  function renderStats(payload) {
+    if (!payload) return;
+    document.getElementById("sum-total").textContent = payload.total_tokens || 0;
+    document.getElementById("sum-elite").textContent = payload.elite_launches || 0;
+    document.getElementById("sum-graduated").textContent = payload.graduated || 0;
+    document.getElementById("sum-rugged").textContent = payload.rugged || 0;
+    document.getElementById("sum-skipped").textContent = payload.skipped || 0;
+    document.getElementById("sum-expired").textContent = payload.expired || 0;
+    if (payload.date) {
+      document.getElementById("today-date").textContent = `${payload.date} UTC — resets at UTC midnight`;
+    }
+  }
+
+  function catmullRomPath(points) {
+    if (points.length < 2) return "";
+    let d = `M ${points[0][0]},${points[0][1]}`;
+    for (let i = 0; i < points.length - 1; i++) {
+      const p0 = points[i === 0 ? i : i - 1];
+      const p1 = points[i];
+      const p2 = points[i + 1];
+      const p3 = points[i + 2 < points.length ? i + 2 : i + 1];
+      const cp1x = p1[0] + (p2[0] - p0[0]) / 6;
+      const cp1y = p1[1] + (p2[1] - p0[1]) / 6;
+      const cp2x = p2[0] - (p3[0] - p1[0]) / 6;
+      const cp2y = p2[1] - (p3[1] - p1[1]) / 6;
+      d += ` C ${cp1x.toFixed(1)},${cp1y.toFixed(1)} ${cp2x.toFixed(1)},${cp2y.toFixed(1)} ${p2[0].toFixed(1)},${p2[1].toFixed(1)}`;
+    }
+    return d;
+  }
+
+  function renderHourlyActivity() {
+    const container = document.getElementById("hourly-activity");
+    if (!container) return;
+    const byHour = new Array(24).fill(0);
+    Object.entries(hourlyLaunchStats).forEach(([key, count]) => {
+      const hour = parseInt(key.slice(-2), 10);
+      if (!isNaN(hour)) byHour[hour] += count;
+    });
+    const totalDays = new Set(Object.keys(hourlyLaunchStats).map(k => k.slice(0, 10))).size;
+    if (!totalDays) {
+      container.innerHTML = '<div class="empty-state">No data yet.</div>';
+      return;
+    }
+
+    const w = 720, h = 130, padTop = 14, padBottom = 22, padX = 10;
+    const innerW = w - padX * 2;
+    const innerH = h - padTop - padBottom;
+    const max = Math.max(1, ...byHour);
+    const points = byHour.map((count, hour) => {
+      const x = padX + (hour / 23) * innerW;
+      const y = padTop + innerH - (count / max) * innerH;
+      return [x, y];
+    });
+
+    const linePath = catmullRomPath(points);
+    const areaPath = `${linePath} L ${points[points.length - 1][0].toFixed(1)},${(padTop + innerH).toFixed(1)} L ${points[0][0].toFixed(1)},${(padTop + innerH).toFixed(1)} Z`;
+
+    const nowHour = new Date().getUTCHours();
+    const nowPoint = points[nowHour];
+
+    const peakHour = byHour.indexOf(max);
+    const dots = points.map((p, hour) => {
+      const isPeak = hour === peakHour && max > 0;
+      const r = isPeak ? 3.5 : 2;
+      return `<circle cx="${p[0].toFixed(1)}" cy="${p[1].toFixed(1)}" r="${r}" fill="${isPeak ? "var(--accent)" : "var(--text-dim)"}"><title>${String(hour).padStart(2, "0")}:00 UTC — ${byHour[hour]} new token(s)</title></circle>`;
+    }).join("");
+
+    const labels = [0, 3, 6, 9, 12, 15, 18, 21].map(hour => {
+      const x = padX + (hour / 23) * innerW;
+      return `<text x="${x.toFixed(1)}" y="${h - 6}" font-size="9" fill="var(--text-dim)" text-anchor="middle">${String(hour).padStart(2, "0")}</text>`;
+    }).join("");
+
+    const nowMarker = `
+      <line x1="${nowPoint[0].toFixed(1)}" y1="${padTop}" x2="${nowPoint[0].toFixed(1)}" y2="${padTop + innerH}" stroke="var(--text-dim)" stroke-width="1" stroke-dasharray="3,3" />
+      <circle cx="${nowPoint[0].toFixed(1)}" cy="${nowPoint[1].toFixed(1)}" r="4.5" fill="var(--accent)" stroke="var(--bg)" stroke-width="1.5" />
+    `;
+
+    container.innerHTML = `
+      <svg width="100%" height="${h}" viewBox="0 0 ${w} ${h}" preserveAspectRatio="none" style="overflow:visible;">
+        <defs>
+          <linearGradient id="hourFillGrad" x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0%" stop-color="var(--accent)" stop-opacity="0.35" />
+            <stop offset="100%" stop-color="var(--accent)" stop-opacity="0" />
+          </linearGradient>
+        </defs>
+        <path d="${areaPath}" fill="url(#hourFillGrad)" stroke="none" />
+        <path d="${linePath}" fill="none" stroke="var(--accent)" stroke-width="2" stroke-linecap="round" />
+        ${dots}
+        ${nowMarker}
+        ${labels}
+      </svg>
+      <div class="meta" style="margin-top:2px;">
+        Peak: ${String(peakHour).padStart(2, "0")}:00 UTC (${max} launch${max === 1 ? "" : "es"}) &middot; now: ${String(nowHour).padStart(2, "0")}:00 UTC (${byHour[nowHour]}) &middot; summed across ${totalDays} tracked day(s), all times UTC
+      </div>
+    `;
+  }
+
+  function renderWeeklyProgress() {
+    const container = document.getElementById("weekly-progress");
+    if (!container) return;
+    const days = Object.keys(dailyStatsHistory).sort().reverse(); // newest first
+    if (!days.length) {
+      container.innerHTML = '<div class="empty-state">No daily history yet.</div>';
+      return;
+    }
+    const rows = days.map(day => {
+      const d = dailyStatsHistory[day] || {};
+      return `<tr>
+        <td>${day}</td>
+        <td>${d.total_tokens || 0}</td>
+        <td>${d.elite_launches || 0}</td>
+        <td>${d.graduated || 0}</td>
+        <td>${d.rugged || 0}</td>
+        <td>${d.opportunities_flagged || 0}</td>
+      </tr>`;
+    }).join("");
+
+    const sumField = (dayList, field) => dayList.reduce((acc, day) => acc + ((dailyStatsHistory[day] || {})[field] || 0), 0);
+    const thisWeekDays = days.slice(0, 7);
+    const lastWeekDays = days.slice(7, 14);
+    const pctChange = (curr, prev) => {
+      if (!prev) return curr ? "new" : "&ndash;";
+      const pct = ((curr - prev) / prev) * 100;
+      const sign = pct >= 0 ? "+" : "";
+      return `${sign}${pct.toFixed(0)}%`;
+    };
+    const weekSummary = lastWeekDays.length ? `
+      <div class="meta" style="margin-top:8px;">
+        This week (${thisWeekDays.length}d): ${sumField(thisWeekDays, "total_tokens")} launches, ${sumField(thisWeekDays, "graduated")} graduated, ${sumField(thisWeekDays, "opportunities_flagged")} opportunities
+        &middot; vs prior week: ${pctChange(sumField(thisWeekDays, "total_tokens"), sumField(lastWeekDays, "total_tokens"))} launches,
+        ${pctChange(sumField(thisWeekDays, "graduated"), sumField(lastWeekDays, "graduated"))} graduated
+      </div>
+    ` : "";
+
+    container.innerHTML = `
+      <table class="weekly-table">
+        <thead><tr><th>Date (UTC)</th><th>Launches</th><th>Elite</th><th>Graduated</th><th>Rugged</th><th>Opportunities</th></tr></thead>
+        <tbody>${rows}</tbody>
+      </table>
+      ${weekSummary}
+    `;
+  }
+
+  function renderMockPortfolio(positions) {
+    const container = document.getElementById("mock-portfolio");
+    if (!container) return;
+    if (!positions || !positions.length) {
+      container.innerHTML = '<div class="empty-state">No simulated positions yet — opens automatically the first time a coin is flagged as an opportunity.</div>';
+      return;
+    }
+    const sorted = [...positions].sort((a, b) => (b.entry_ts || 0) - (a.entry_ts || 0));
+    const totalPnlUsd = sorted.reduce((acc, p) => acc + (p.pnl_usd || 0), 0);
+    const winners = sorted.filter(p => (p.pnl_pct || 0) > 0).length;
+    const winRate = sorted.length ? ((winners / sorted.length) * 100).toFixed(0) : 0;
+    const buySize = sorted[0].buy_size_usd || 100;
+
+    const hintEl = document.getElementById("mock-portfolio-hint");
+    if (hintEl) {
+      hintEl.textContent = `paper trading — simulated $${buySize} buy at flag time · ${sorted.length} position(s) · net ${totalPnlUsd >= 0 ? "+" : ""}$${totalPnlUsd.toFixed(0)} · ${winRate}% currently up`;
+    }
+
+    const rows = sorted.map(p => {
+      const pnlClass = (p.pnl_pct || 0) >= 0 ? "pnl-pos" : "pnl-neg";
+      const href = (p.links && p.links.dexscreener) || (p.links && p.links.explorer) || "#";
+      const label = (p.ticker && p.ticker !== "UNKNOWN") ? `$${p.ticker}` : "unresolved";
+      const peakMultiple = p.peak_multiple || 1;
+      const peakClass = peakMultiple >= 2 ? "pnl-pos" : "";
+      return `<tr>
+        <td style="text-align:left;"><a href="${href}" target="_blank" rel="noopener" style="color:inherit;">${chainTag(p.chain)} ${label}</a></td>
+        <td>${fmtUsd(p.entry_market_cap)}</td>
+        <td>${fmtUsd(p.current_market_cap)}</td>
+        <td class="${pnlClass}">${p.pnl_pct >= 0 ? "+" : ""}${p.pnl_pct.toFixed(1)}%</td>
+        <td class="${pnlClass}">${p.pnl_usd >= 0 ? "+" : ""}$${p.pnl_usd.toFixed(2)}</td>
+        <td>${fmtUsd(p.peak_market_cap)}</td>
+        <td class="${peakClass}" title="Peak mcap since this was flagged, vs entry mcap">${peakMultiple.toFixed(1)}x</td>
+        <td>${p.last_known_status || "-"}</td>
+        <td>${fmtTime(p.entry_ts)}</td>
+      </tr>`;
+    }).join("");
+
+    container.innerHTML = `
+      <table class="weekly-table">
+        <thead><tr><th style="text-align:left;">Coin</th><th>Entry MCap</th><th>Current MCap</th><th>P&amp;L %</th><th>P&amp;L $</th><th>Peak MCap</th><th>Peak (x)</th><th>Status</th><th>Flagged At</th></tr></thead>
+        <tbody>${rows}</tbody>
+      </table>
+    `;
+  }
+
+  let topOppRefreshScheduled = false;
+  function scheduleTopOpportunitiesRefresh() {
+    if (topOppRefreshScheduled) return;
+    topOppRefreshScheduled = true;
+    setTimeout(() => {
+      topOppRefreshScheduled = false;
+      renderTopOpportunities();
+      renderEarlyMomentum();
+    }, 1500);
+  }
+
+  function scoreClass(score) {
+    if (score >= 60) return "score-high";
+    if (score >= 30) return "score-mid";
+    return "score-low";
+  }
+
+  function renderTopOpportunities() {
+    const container = document.getElementById("top-opportunities");
+    if (!container) return;
+    const candidates = [];
+    let bondingCount = 0;
+    for (const [addr, payload] of tokenPayloadOf) {
+      const status = tokenStatusOf.get(addr) || payload.status;
+      if (status === "WATCHING" && (payload.opportunity_score || 0) > 0) {
+        candidates.push(payload);
+      }
+      if (isBonding(status, payload)) bondingCount += 1;
+    }
+    const bondingTabEl = document.getElementById("tab-count-BONDING");
+    if (bondingTabEl) bondingTabEl.textContent = bondingCount;
+    candidates.sort((a, b) => (b.opportunity_score || 0) - (a.opportunity_score || 0));
+    const top = candidates.slice(0, 12);
+
+    if (!top.length) {
+      container.innerHTML = '<div class="empty-state">No scored opportunities yet — scores build up as volume, dev-trust, and smart-money signals come in. This is a heuristic weighting of the same signals shown elsewhere, not a prediction.</div>';
+      return;
+    }
+
+    container.innerHTML = top.map(p => {
+      const href = (p.links && p.links.dexscreener) || (p.links && p.links.explorer) || "#";
+      const label = (p.ticker && p.ticker !== "UNKNOWN") ? `$${p.ticker}` : "unresolved";
+      const reasons = (p.score_reasons || []).join(" &middot; ") || "baseline, no standout signals yet";
+      const txnLine = (p.buys_24h || p.sells_24h) ? ` &middot; ${p.buys_24h || 0}↑${p.sells_24h || 0}↓` : "";
+      const holderLine = holderLineHtml(p);
+      return `<a class="card opp-card" href="${href}" target="_blank" rel="noopener" title="dev: ${p.dev_wallet}">
+        <div class="title" style="display:flex;align-items:center;gap:6px;">${tokenImageHtml(p, 24)}${chainTag(p.chain)} ${label} <span class="opp-score ${scoreClass(p.opportunity_score)}">${p.opportunity_score}</span></div>
+        <div class="meta">${fmtUsd(p.market_cap)} mcap &middot; vol ${fmtUsd(p.volume_24h)}${txnLine} &middot; ${p.platform || "-"}</div>
+        <div class="meta">dev ${devBadge(p)}${holderLine ? " &middot; " + holderLine : ""}</div>
+        <div class="meta">${reasons}</div>
+      </a>`;
+    }).join("");
+  }
+
+  // Deliberately NOT "anything below Top Opportunities' floor" — at
+  // pump.fun's launch-floor mcap (often just a few thousand dollars) almost
+  // any tiny bit of volume produces a "good" ratio, since the denominator
+  // itself is tiny. That's noise, not signal. This band is specifically
+  // "already grew past the noisy launch-floor stage, not yet fully proven
+  // at Top Opportunities' scale" — a deliberate mid-cap window, not "new."
+  const EARLY_MOMENTUM_MIN_MCAP = 50000;
+  const EARLY_MOMENTUM_MAX_MCAP = 200000;
+
+  function renderEarlyMomentum() {
+    const container = document.getElementById("early-momentum");
+    if (!container) return;
+    const candidates = [];
+    for (const [addr, payload] of tokenPayloadOf) {
+      const status = tokenStatusOf.get(addr) || payload.status;
+      const mcap = payload.market_cap || 0;
+      if (
+        status === "WATCHING" &&
+        mcap >= EARLY_MOMENTUM_MIN_MCAP && mcap <= EARLY_MOMENTUM_MAX_MCAP &&
+        (payload.early_momentum_score || 0) > 0
+      ) {
+        candidates.push(payload);
+      }
+    }
+    candidates.sort((a, b) => (b.early_momentum_score || 0) - (a.early_momentum_score || 0));
+    const top = candidates.slice(0, 12);
+
+    if (!top.length) {
+      container.innerHTML = '<div class="empty-state">No early signals yet in the $50k&ndash;$200k range right now — this looks for ratio/narrative/smart-money signals on tokens in that band specifically, not brand-new launches at the noisy launch-floor mcap.</div>';
+      return;
+    }
+
+    container.innerHTML = top.map(p => {
+      const href = (p.links && p.links.dexscreener) || (p.links && p.links.explorer) || "#";
+      const label = (p.ticker && p.ticker !== "UNKNOWN") ? `$${p.ticker}` : "unresolved";
+      const reasons = (p.early_momentum_reasons || []).join(" &middot; ") || "baseline, no standout signals yet";
+      const txnLine = (p.buys_24h || p.sells_24h) ? ` &middot; ${p.buys_24h || 0}↑${p.sells_24h || 0}↓` : "";
+      const holderLine = holderLineHtml(p);
+      return `<a class="card opp-card" href="${href}" target="_blank" rel="noopener" title="dev: ${p.dev_wallet}">
+        <div class="title" style="display:flex;align-items:center;gap:6px;">${tokenImageHtml(p, 24)}${chainTag(p.chain)} ${label} <span class="opp-score ${scoreClass(p.early_momentum_score)}">${p.early_momentum_score}</span></div>
+        <div class="meta">${fmtUsd(p.market_cap)} mcap &middot; vol ${fmtUsd(p.volume_24h)}${txnLine} &middot; ${p.platform || "-"}</div>
+        <div class="meta">dev ${devBadge(p)}${holderLine ? " &middot; " + holderLine : ""}</div>
+        <div class="meta">${reasons}</div>
+      </a>`;
+    }).join("");
+  }
+
+  function applySnapshot(payload) {
+    const devRep = payload.dev_reputation || {};
+    let eliteCount = 0, blacklistCount = 0;
+    Object.values(devRep).forEach(dev => {
+      if (dev.successful_launches >= 1 && !dev.is_blacklisted) eliteCount += 1;
+      if (dev.is_blacklisted) blacklistCount += 1;
+    });
+    document.getElementById("stat-elite").textContent = eliteCount;
+    document.getElementById("stat-blacklist").textContent = blacklistCount;
+
+    renderStats(payload.today_stats);
+    Object.assign(dailyStatsHistory, payload.daily_stats_history || {});
+    Object.assign(hourlyLaunchStats, payload.hourly_launch_stats || {});
+    renderWeeklyProgress();
+    renderHourlyActivity();
+    renderMockPortfolio(payload.mock_portfolio || []);
+
+    // ALERT_HISTORY / TOKEN_FEED arrive oldest-first; each render*() prepends,
+    // so replaying oldest-to-newest (no reverse) leaves the newest on top.
+    // The general alert replay skips outcome-panel rendering: ALERT_HISTORY
+    // is a shared 300-cap buffer across every alert type and gets crowded out
+    // by high-frequency SKIPPED alerts within minutes, so recent_graduations/
+    // recent_rugs (dedicated, persisted, never crowded out) populate those
+    // panels instead.
+    (payload.alerts || []).forEach(a => renderAlert(a, {skipOutcome: true}));
+    (payload.recent_graduations || []).forEach(renderOutcome);
+    (payload.recent_rugs || []).forEach(renderOutcome);
+    renderOpportunityHistoryList(payload.recent_opportunities || []);
+    (payload.tokens || []).forEach(renderToken);
+
+    Object.values(payload.narratives || {}).forEach(renderNarrative);
+  }
+
+  function handleMessage(msg) {
+    switch (msg.kind) {
+      case "snapshot":
+        applySnapshot(msg.payload);
+        break;
+      case "alert":
+        renderAlert(msg.payload);
+        break;
+      case "narrative":
+        renderNarrative(msg.payload);
+        break;
+      case "smart_money":
+        renderSmartMoney(msg.payload);
+        break;
+      case "token":
+        renderToken(msg.payload);
+        break;
+      case "stats":
+        renderStats(msg.payload);
+        dailyStatsHistory[msg.payload.date] = { ...msg.payload };
+        delete dailyStatsHistory[msg.payload.date].date;
+        renderWeeklyProgress();
+        break;
+      case "hourly_stats":
+        hourlyLaunchStats[msg.payload.key] = msg.payload.count;
+        renderHourlyActivity();
+        break;
+      case "mock_portfolio":
+        renderMockPortfolio(msg.payload);
+        break;
+      case "opportunity_history":
+        renderOpportunityHistoryList(msg.payload);
+        break;
+    }
+  }
+
+  function connect() {
+    const proto = location.protocol === "https:" ? "wss:" : "ws:";
+    const ws = new WebSocket(`${proto}//${location.host}/ws/dashboard`);
+
+    ws.onopen = () => {
+      statusEl.classList.add("connected");
+      statusText.textContent = "live";
+    };
+
+    ws.onmessage = (evt) => {
+      try {
+        const msg = JSON.parse(evt.data);
+        handleMessage(msg);
+      } catch (e) {
+        console.error("bad message", e);
+      }
+    };
+
+    ws.onclose = () => {
+      statusEl.classList.remove("connected");
+      statusText.textContent = "reconnecting...";
+      setTimeout(connect, 2000 + Math.random() * 2000);
+    };
+
+    ws.onerror = () => {
+      ws.close();
+    };
+  }
+
+  connect();
+})();
+</script>

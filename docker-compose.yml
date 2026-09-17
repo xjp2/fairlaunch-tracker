@@ -1,0 +1,53 @@
+services:
+  fairlaunch-tracker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: fairlaunch-tracker:latest
+    container_name: fairlaunch-tracker
+    restart: always
+    env_file:
+      - .env
+    environment:
+      - DASHBOARD_HOST=0.0.0.0
+      - DASHBOARD_PORT=8000
+      - DATA_DIR=/app/data
+    volumes:
+      - tracker_data:/app/data
+    networks:
+      - proxy
+    labels:
+      # --- Traefik routing (this repo's traefik container already owns the
+      # `proxy` network and terminates TLS via the mytlschallenge resolver —
+      # see /root/n8n-stack/docker-compose.yml). Update the Host() rule if
+      # you want a different subdomain. ---
+      - "traefik.enable=true"
+      - "traefik.docker.network=proxy"
+      - "traefik.http.routers.tracker.rule=Host(`tracker.xjp2automation.online`)"
+      - "traefik.http.routers.tracker.entrypoints=websecure"
+      - "traefik.http.routers.tracker.tls=true"
+      - "traefik.http.routers.tracker.tls.certresolver=mytlschallenge"
+      - "traefik.http.services.tracker.loadbalancer.server.port=8000"
+      - "traefik.http.middlewares.tracker-headers.headers.SSLRedirect=true"
+      - "traefik.http.middlewares.tracker-headers.headers.STSSeconds=315360000"
+      - "traefik.http.middlewares.tracker-headers.headers.browserXSSFilter=true"
+      - "traefik.http.middlewares.tracker-headers.headers.contentTypeNosniff=true"
+      - "traefik.http.middlewares.tracker-headers.headers.forceSTSHeader=true"
+      - "traefik.http.middlewares.tracker-headers.headers.SSLHost=xjp2automation.online"
+      - "traefik.http.middlewares.tracker-headers.headers.STSIncludeSubdomains=true"
+      - "traefik.http.middlewares.tracker-headers.headers.STSPreload=true"
+      - "traefik.http.routers.tracker.middlewares=tracker-headers@docker"
+    # Standalone fallback: uncomment this and remove the Traefik labels above
+    # if you are NOT running this behind the existing Traefik proxy network,
+    # and instead want to point an external Nginx (or any reverse proxy) at
+    # this container's published port directly.
+    # ports:
+    #   - "127.0.0.1:8000:8000"
+
+networks:
+  proxy:
+    external: true
+
+volumes:
+  tracker_data:
+    driver: local
