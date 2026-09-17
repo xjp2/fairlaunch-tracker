@@ -226,7 +226,7 @@ PLATFORMS_WITH_NATIVE_GRADUATION = {"pump.fun", "ember", "pons"}
 # Hard floor for even being considered in the Top Opportunities panel — no
 # combination of dev-trust/narrative/smart-money signals should outrank basic
 # "does this even have real market activity yet."
-MIN_OPPORTUNITY_MARKET_CAP_USD = float(os.getenv("MIN_OPPORTUNITY_MARKET_CAP_USD", "40000"))
+MIN_OPPORTUNITY_MARKET_CAP_USD = float(os.getenv("MIN_OPPORTUNITY_MARKET_CAP_USD", "28000"))
 MIN_OPPORTUNITY_VOLUME_USD = float(os.getenv("MIN_OPPORTUNITY_VOLUME_USD", "500"))
 
 # Multicall3 — a generic batching contract deployed at this identical address
