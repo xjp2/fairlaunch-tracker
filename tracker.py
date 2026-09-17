@@ -787,6 +787,19 @@ PUMPFUN_BONDING_CURVE_DISCRIMINATOR = bytes([23, 183, 248, 55, 96, 216, 172, 96]
 # `complete` boolean decoded from the account itself is the actual ground
 # truth and doesn't depend on this number being exactly right.
 PUMPFUN_BONDING_CURVE_SOL_TARGET = float(os.getenv("PUMPFUN_BONDING_CURVE_SOL_TARGET", "85"))
+# A token still on pump.fun's bonding curve (status WATCHING, not yet
+# migrated) is mechanically capped near PUMPFUN_BONDING_CURVE_SOL_TARGET
+# worth of SOL raised — nowhere close to hundreds of thousands of dollars.
+# Confirmed empirically this session: several "new token create" events
+# PumpPortal reported turned out to have mints belonging to already-
+# established, unrelated tokens with real six/seven-figure mcap — most
+# visibly a run of real xStocks tokenized-equity tickers (AAPLx, TSLAx,
+# MCDx, COINx, ...) showing up as if freshly launched on pump.fun, bloating
+# the opportunity list with tokens that were never actually new. Root cause
+# on PumpPortal's/parsing side not fully confirmed, but the anomaly itself
+# is unambiguous and mechanically impossible for a real bonding-curve token,
+# so it's used as a data-integrity tripwire rather than left unexplained.
+PUMPFUN_IMPLAUSIBLE_WATCHING_MCAP_USD = float(os.getenv("PUMPFUN_IMPLAUSIBLE_WATCHING_MCAP_USD", "200000"))
 
 
 def _solana_https_rpc_url() -> str:
@@ -3128,6 +3141,22 @@ async def mark_token_graduated(token_address: str, source: str) -> None:
     now = time.time()
     dex_info = await fetch_dexscreener_info(token_address)
     market_cap = dex_info.get("market_cap", 0.0)
+
+    # Trusting the platform's OWN graduation signal (see docstring) still
+    # assumes the event is actually ABOUT this mint — confirmed empirically
+    # this session that's not always true (PumpPortal reporting "migrate" for
+    # a mint that turned out to belong to an already-established, unrelated
+    # token; the $187M "graduation" this caught is nowhere close to anything
+    # a real bonding-curve token could reach). Same tripwire
+    # _process_watchlist_token uses for the WATCHING path, applied here too
+    # so a bogus event can't skip it by graduating before ever being polled.
+    if info["platform"] == "pump.fun" and market_cap > PUMPFUN_IMPLAUSIBLE_WATCHING_MCAP_USD:
+        await _kick_out_watchlist_token(
+            token_address, info, now, "IMPLAUSIBLE_MCAP_FOR_BONDING_CURVE",
+            "SKIPPED - NOT A REAL NEW LAUNCH (implausible mcap for bonding curve)",
+        )
+        return
+
     if market_cap > info["peak_market_cap"]:
         info["peak_market_cap"] = market_cap
     info["status"] = "GRADUATED"
@@ -3561,19 +3590,14 @@ async def _rescore_token_and_maybe_ping(token_address: str) -> None:
 TOP_HOLDER_SELL_DROP_RATIO = 0.9  # same top holder's balance falling below 90% of its last-seen value counts as "selling down"
 
 
-async def _kick_out_mintable_token(token_address: str, info: dict[str, Any], now: float) -> None:
-    """Mint authority still active means the dev can print unlimited new
-    supply at will — the classic "look healthy, then dilute/dump" rug vector,
-    and one dexscreener's own numbers can never reveal (mcap/volume look
-    identical to a real fixed-supply token right up until the mint happens).
-    Solana-only: this is a native SPL Token account field, checked directly
-    on-chain (see fetch_solana_holder_stats), not a heuristic. Kicked out
-    entirely rather than just penalized in scoring — same treatment as a
-    blacklisted dev, since this is a structural rug vector, not a soft signal.
-    Not auto-blacklisting the dev wallet itself: an un-renounced mint alone
-    isn't proof this specific dev has actually rugged anything (some
-    legitimate-looking platforms simply don't renounce by default), so a
-    future launch from the same dev still gets its own fair evaluation."""
+async def _kick_out_watchlist_token(token_address: str, info: dict[str, Any], now: float, reason: str, title: str) -> None:
+    """Shared removal path for a token that should stop being tracked/scored
+    entirely rather than just take a scoring penalty — used for structural
+    disqualifiers (mint authority active, implausible data) where the
+    problem isn't "this looks a bit risky," it's "this shouldn't be
+    evaluated as a live opportunity at all." Same SKIPPED treatment a
+    blacklisted dev gets at launch time, just triggered later once the
+    disqualifying fact becomes known (mid-tracking, not at creation)."""
     info["status"] = "SKIPPED"
     info["dev_decision"] = "SKIPPED"
     token_feed_upsert(token_address, status="SKIPPED", dev_decision="SKIPPED")
@@ -3583,13 +3607,13 @@ async def _kick_out_mintable_token(token_address: str, info: dict[str, Any], now
         {
             "type": "SKIPPED",
             "severity": "info",
-            "title": "SKIPPED - MINT AUTHORITY NOT RENOUNCED",
+            "title": title,
             "chain": info["chain"],
             "platform": info["platform"],
             "token_address": token_address,
             "ticker": info["ticker"],
             "dev_wallet": info["dev_wallet"],
-            "reason": "MINTABLE",
+            "reason": reason,
             **dev_rep_badge_fields(info["dev_wallet"]),
             "timestamp": now,
         }
@@ -3611,7 +3635,7 @@ async def _maybe_refresh_holder_stats(token_address: str, info: dict[str, Any], 
         return
 
     if holder_stats.get("mint_authority_active") and info["status"] == "WATCHING":
-        await _kick_out_mintable_token(token_address, info, now)
+        await _kick_out_watchlist_token(token_address, info, now, "MINTABLE", "SKIPPED - MINT AUTHORITY NOT RENOUNCED")
         return
 
     if holder_stats:
@@ -3919,6 +3943,13 @@ async def _process_watchlist_token(token_address: str, info: dict[str, Any], now
                 RECENT_RUGS.append(rug_alert)
                 await broadcast_alert(rug_alert)
                 await persist_state()
+        return
+
+    if info["platform"] == "pump.fun" and market_cap > PUMPFUN_IMPLAUSIBLE_WATCHING_MCAP_USD:
+        await _kick_out_watchlist_token(
+            token_address, info, now, "IMPLAUSIBLE_MCAP_FOR_BONDING_CURVE",
+            "SKIPPED - NOT A REAL NEW LAUNCH (implausible mcap for bonding curve)",
+        )
         return
 
     # Free alternative to PumpPortal's paid per-trade subscription: poll
