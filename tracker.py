@@ -1180,8 +1180,18 @@ def compute_opportunity_score(entry: dict[str, Any]) -> tuple[int, list[str]]:
             f"— too little real activity to be considered"
         ]
 
-    if _ticker_starts_lowercase(entry.get("ticker")):
-        return 0, [f"Ticker \"{entry.get('ticker')}\" starts lowercase — low-effort naming, not considered"]
+    ticker = entry.get("ticker")
+    if not ticker or ticker == "UNKNOWN":
+        # Some platforms (StonkFun, some Ember events) don't supply a symbol
+        # at creation — DexScreener backfills it once indexed (see
+        # _process_watchlist_token). Surfacing an "opportunity" the viewer
+        # can't even identify by name isn't useful, and unresolved tickers
+        # correlate with exactly the kind of bogus/mislabeled event
+        # PUMPFUN_IMPLAUSIBLE_WATCHING_MCAP_USD was added to catch (that
+        # $187M ghost graduation was also ticker "UNKNOWN").
+        return 0, ["Ticker not yet resolved — not considered until a real name is known"]
+    if _ticker_starts_lowercase(ticker):
+        return 0, [f"Ticker \"{ticker}\" starts lowercase — low-effort naming, not considered"]
 
     # mcap is just price × supply — a $50k mcap with $1k volume (2% ratio) is
     # exactly the "obvious rug, price is fake" pattern: the number looks big
@@ -1457,8 +1467,11 @@ def compute_early_momentum_score(entry: dict[str, Any]) -> tuple[int, list[str]]
     if market_cap <= 0 or (volume_24h <= 0 and txns_24h <= 0):
         return 0, ["No real market data yet — too early to evaluate"]
 
-    if _ticker_starts_lowercase(entry.get("ticker")):
-        return 0, [f"Ticker \"{entry.get('ticker')}\" starts lowercase — low-effort naming, not considered"]
+    ticker = entry.get("ticker")
+    if not ticker or ticker == "UNKNOWN":
+        return 0, ["Ticker not yet resolved — not considered until a real name is known"]
+    if _ticker_starts_lowercase(ticker):
+        return 0, [f"Ticker \"{ticker}\" starts lowercase — low-effort naming, not considered"]
 
     score = 0
     reasons: list[str] = []
