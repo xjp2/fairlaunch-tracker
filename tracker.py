@@ -4185,9 +4185,63 @@ async def _process_watchlist_token(token_address: str, info: dict[str, Any], now
 STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 
 
+def _restore_tracking_from_mock_portfolio() -> int:
+    """TOKEN_WATCHLIST/TOKEN_FEED are in-memory only (never persisted) — every
+    restart silently drops every still-live token out of the hot polling
+    loop, since nothing re-adds an ALREADY-known token back into
+    TOKEN_WATCHLIST (only a genuinely NEW "create" event does that). A
+    WATCHING/GRADUATED token from before the restart then just freezes
+    forever at whatever mcap/peak it last had — confirmed empirically this
+    session (a token's mock-portfolio peak silently stopped moving right at
+    a restart, well below its later real peak). MOCK_PORTFOLIO IS persisted
+    and already has everything needed to rebuild a plausible TOKEN_WATCHLIST
+    entry, so re-seed the hot loop from it on startup instead of losing
+    tracking on every redeploy."""
+    restored = 0
+    for token_address, position in MOCK_PORTFOLIO.items():
+        if token_address in TOKEN_WATCHLIST:
+            continue
+        status = position.get("last_known_status")
+        if status not in ("WATCHING", "GRADUATED", "RUGGED"):
+            continue
+        chain = position.get("chain")
+        platform = position.get("platform")
+        dev_wallet = position.get("dev_wallet")
+        ticker = position.get("ticker")
+        if not chain or not platform or not dev_wallet:
+            continue
+        created_at = position.get("entry_ts") or time.time()
+        peak_market_cap = position.get("peak_market_cap") or 0.0
+        market_cap = position.get("last_known_market_cap") or 0.0
+        TOKEN_WATCHLIST[token_address] = {
+            "chain": chain,
+            "platform": platform,
+            "dev_wallet": dev_wallet,
+            "ticker": ticker,
+            "created_at": created_at,
+            "peak_market_cap": peak_market_cap,
+            "status": status,
+            "dev_decision": "PENDING",
+            "bonding_curve_key": None,
+        }
+        token_feed_upsert(
+            token_address,
+            chain=chain, platform=platform, dev_wallet=dev_wallet, ticker=ticker,
+            created_at=created_at, status=status, market_cap=market_cap,
+            peak_market_cap=peak_market_cap, image_url=position.get("image_url"),
+            links=position.get("links") or {},
+            **dev_rep_badge_fields(dev_wallet),
+        )
+        restored += 1
+    return restored
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     _load_state_sync()
+    restored_count = _restore_tracking_from_mock_portfolio()
+    if restored_count:
+        logger.info(f"Restored {restored_count} token(s) from mock_portfolio into the active hot loop after restart")
 
     tasks_spec = [
         (solana_pumpfun_listener, "solana/pump.fun"),
