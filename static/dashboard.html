@@ -1,215 +1,455 @@
-<title>Fair-Launch Tracker</title>
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Fair-Launch Tracker // Pro Terminal</title>
 <style>
   :root {
-    --bg: #0a0e14;
-    --panel: #10151f;
-    --panel-alt: #141b28;
-    --border: #1f2937;
-    --text: #e5e9f0;
-    --text-dim: #7c8798;
-    --accent: #22d3ee;
-    --green: #34d399;
-    --red: #f87171;
-    --amber: #fbbf24;
-    --purple: #c084fc;
-    --chain-solana: #b48bff;
-    --chain-bnb: #f0b90b;
-    --chain-robinhood: #00c805;
+    --bg: #080c14;
+    --panel: #0e1524;
+    --panel-alt: #131c30;
+    --panel-hover: #18243c;
+    --border: #1e2b42;
+    --border-subtle: #141f32;
+    --text: #f8fafc;
+    --text-dim: #94a3b8;
+    --text-muted: #64748b;
+    --accent: #38bdf8;
+    --accent-hover: #0ea5e9;
+    --accent-subtle: rgba(56, 189, 248, 0.12);
+    --green: #10b981;
+    --green-subtle: rgba(16, 185, 129, 0.12);
+    --red: #f43f5e;
+    --red-subtle: rgba(244, 63, 94, 0.12);
+    --amber: #f59e0b;
+    --amber-subtle: rgba(245, 158, 11, 0.12);
+    --purple: #8b5cf6;
+    --purple-subtle: rgba(139, 92, 246, 0.12);
+    --chain-solana: #c084fc;
+    --chain-bnb: #facc15;
+    --chain-robinhood: #34d399;
   }
   * { box-sizing: border-box; }
   body {
     margin: 0;
     background: var(--bg);
     color: var(--text);
-    font-family: "SF Mono", "Cascadia Code", Consolas, monospace;
-    font-size: 13px;
-    padding: 0 16px 24px;
+    font-family: -apple-system, BlinkMacSystemFont, "Inter", "Segoe UI", Roboto, sans-serif;
+    font-size: 12px;
+    line-height: 1.5;
+    padding: 0 16px 32px;
+    min-width: 360px;
+    -webkit-font-smoothing: antialiased;
   }
+  a { color: inherit; text-decoration: none; }
+  code, pre, .mono, .token-ticker, .token-mcap, .token-volume, .token-age, .token-liq, .token-holders,
+  .opp-score, .kpi-chip .val, .jev-stat-num, .kpi-main-val, .badge {
+    font-family: "JetBrains Mono", "SF Mono", "Roboto Mono", Consolas, monospace;
+  }
+
+  /* Header */
   header {
     display: flex;
     align-items: center;
     justify-content: space-between;
-    padding: 16px 4px 12px;
+    padding: 14px 4px 10px;
     border-bottom: 1px solid var(--border);
     flex-wrap: wrap;
-    gap: 8px;
+    gap: 10px;
   }
-  header h1 {
-    font-size: 16px;
+  .brand {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+  .brand h1 {
+    font-size: 15px;
     margin: 0;
-    letter-spacing: 0.5px;
-    color: var(--accent);
+    font-weight: 700;
+    letter-spacing: -0.2px;
+    color: var(--text);
   }
-  header h1 span { color: var(--text-dim); font-weight: normal; }
-  #status {
+  .brand h1 span.accent-hl { color: var(--accent); }
+  .brand span.sub { color: var(--text-dim); font-weight: normal; font-size: 12px; margin-left: 4px; }
+  .network-pills {
     display: flex;
     align-items: center;
     gap: 6px;
-    font-size: 12px;
-    color: var(--text-dim);
   }
-  #status .dot {
-    width: 8px; height: 8px; border-radius: 50%;
-    background: var(--red);
-  }
-  #status.connected .dot { background: var(--green); }
-
-  #ticker-tape {
-    margin-top: 10px;
-    padding: 8px 12px;
+  .net-pill {
+    font-size: 10px;
+    padding: 2px 7px;
+    border-radius: 999px;
     background: var(--panel-alt);
     border: 1px solid var(--border);
+    color: var(--text-dim);
+  }
+  .net-pill.active {
+    color: var(--green);
+    border-color: rgba(16, 185, 129, 0.3);
+  }
+
+  #status {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 11px;
+    color: var(--text-dim);
+    background: var(--panel-alt);
+    padding: 4px 10px;
     border-radius: 6px;
-    min-height: 34px;
+    border: 1px solid var(--border);
+  }
+  #status .dot {
+    width: 7px; height: 7px; border-radius: 50%;
+    background: var(--red);
+  }
+  #status.connected .dot {
+    background: var(--green);
+    animation: pulseDot 2s infinite;
+  }
+  @keyframes pulseDot {
+    0%, 100% { opacity: 1; transform: scale(1); }
+    50% { opacity: 0.5; transform: scale(0.9); }
+  }
+
+  /* Compact KPI Ribbon */
+  .kpi-ribbon {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 0;
+    overflow-x: auto;
+    border-bottom: 1px solid var(--border-subtle);
+  }
+  .kpi-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 4px 10px;
+    font-size: 11px;
+    white-space: nowrap;
+    flex-shrink: 0;
+  }
+  .kpi-chip .lbl { color: var(--text-dim); font-size: 10px; text-transform: uppercase; }
+  .kpi-chip .val { font-weight: 700; color: var(--text); }
+  .kpi-chip .val.accent { color: var(--accent); }
+  .kpi-chip .val.green { color: var(--green); }
+  .kpi-chip .val.red { color: var(--red); }
+  .kpi-chip .val.purple { color: var(--purple); }
+  .kpi-chip .val.amber { color: var(--amber); }
+
+  /* Ticker Tape */
+  #ticker-tape {
+    margin: 8px 0 10px;
+    padding: 6px 12px;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-left: 3px solid var(--accent);
+    border-radius: 4px;
+    min-height: 30px;
     display: flex;
     align-items: center;
     overflow: hidden;
     white-space: nowrap;
+    font-size: 11px;
   }
   #ticker-tape .flash {
     animation: flashIn 0.6s ease-out;
     font-weight: bold;
+    color: var(--accent);
   }
   @keyframes flashIn {
-    0% { background: rgba(34, 211, 238, 0.35); }
+    0% { background: var(--accent-subtle); }
     100% { background: transparent; }
   }
-  #ticker-tape .empty { color: var(--text-dim); }
+  #ticker-tape .empty { color: var(--text-dim); font-style: italic; }
 
-  .grid {
-    display: grid;
-    grid-template-columns: 1.2fr 1fr 1fr;
-    gap: 14px;
-    margin-top: 14px;
+  /* Main Navigation Tabs */
+  .main-nav {
+    display: flex;
+    gap: 8px;
+    padding: 8px 0 12px;
+    border-bottom: 1px solid var(--border);
+    margin-bottom: 14px;
+    overflow-x: auto;
+    align-items: center;
   }
-  @media (max-width: 900px) {
-    .grid { grid-template-columns: 1fr; }
+  .main-tab-btn {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    color: var(--text-dim);
+    padding: 8px 16px;
+    border-radius: 6px;
+    font-family: inherit;
+    font-size: 12px;
+    font-weight: 600;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    transition: all 0.15s ease;
+    white-space: nowrap;
+  }
+  .main-tab-btn:hover {
+    background: var(--panel-hover);
+    color: var(--text);
+    border-color: #334155;
+  }
+  .main-tab-btn.active {
+    background: var(--panel-alt);
+    border-color: var(--accent);
+    color: #f8fafc;
+    box-shadow: inset 0 -2px 0 var(--accent);
+  }
+  .tab-badge {
+    background: rgba(255, 255, 255, 0.08);
+    color: var(--text-dim);
+    padding: 1px 7px;
+    border-radius: 10px;
+    font-size: 10px;
+    font-family: "JetBrains Mono", monospace;
+    font-weight: 600;
+  }
+  .main-tab-btn.active .tab-badge {
+    background: var(--accent-subtle);
+    color: var(--accent);
+    border-color: transparent;
   }
 
+  /* Main Tab Views */
+  .main-tab-view {
+    display: none;
+    animation: fadeIn 0.15s ease;
+  }
+  .main-tab-view.active {
+    display: block;
+  }
+  @keyframes fadeIn {
+    from { opacity: 0; transform: translateY(2px); }
+    to { opacity: 1; transform: translateY(0); }
+  }
+
+  /* Panels & Cards */
   .panel {
     background: var(--panel);
     border: 1px solid var(--border);
     border-radius: 8px;
     display: flex;
     flex-direction: column;
-    min-height: 200px;
-    max-height: 78vh;
+    margin-bottom: 14px;
+    overflow: hidden;
   }
-  .panel.wide { margin-top: 14px; max-height: 46vh; }
   .panel-header {
-    padding: 10px 12px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 10px 14px;
     border-bottom: 1px solid var(--border);
     font-size: 12px;
-    text-transform: uppercase;
-    letter-spacing: 0.8px;
-    color: var(--text-dim);
-    display: flex;
-    justify-content: space-between;
+    font-weight: 700;
+    background: var(--panel-alt);
+    letter-spacing: 0.3px;
   }
+  .panel-header .hint { font-size: 10px; font-weight: normal; color: var(--text-dim); }
   .panel-body {
     overflow-y: auto;
-    padding: 8px;
-    flex: 1;
+    max-height: 72vh;
+    padding: 10px 12px;
   }
-  .panel-body::-webkit-scrollbar { width: 6px; }
-  .panel-body::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
-
-  .card {
-    background: var(--panel-alt);
-    border: 1px solid var(--border);
-    border-left: 3px solid var(--text-dim);
-    border-radius: 4px;
-    padding: 8px 10px;
-    margin-bottom: 6px;
-    font-size: 12px;
-    line-height: 1.5;
-  }
-  .card.severity-critical { border-left-color: var(--red); animation: flashCard 1.2s ease-out; }
-  .card.severity-high { border-left-color: var(--amber); }
-  .card.severity-success { border-left-color: var(--green); }
-  .card.severity-danger { border-left-color: var(--red); }
-  .card.severity-info { border-left-color: var(--text-dim); }
-  @keyframes flashCard {
-    0% { background: rgba(248, 113, 113, 0.25); }
-    100% { background: var(--panel-alt); }
-  }
-  .card .title { font-weight: bold; margin-bottom: 3px; }
-  .card .meta { color: var(--text-dim); font-size: 11px; }
-  .card .meta b { color: var(--text); }
-
-  .badge {
-    display: inline-block;
-    padding: 1px 6px;
-    border-radius: 3px;
-    font-size: 10px;
-    font-weight: bold;
-    text-transform: uppercase;
-    letter-spacing: 0.5px;
-    white-space: nowrap;
-  }
-  .badge.ACCELERATING { background: rgba(52, 211, 153, 0.15); color: var(--green); }
-  .badge.STABLE { background: rgba(34, 211, 238, 0.15); color: var(--accent); }
-  .badge.DECAYING { background: rgba(124, 135, 152, 0.2); color: var(--text-dim); }
-  .badge.FORMING, .badge.EMERGING_CLUSTER { background: rgba(192, 132, 252, 0.15); color: var(--purple); }
-
-  .badge.dev-ELITE { background: rgba(52, 211, 153, 0.15); color: var(--green); }
-  .badge.dev-SKIP, .badge.dev-SKIPPED { background: rgba(248, 113, 113, 0.15); color: var(--red); }
-  .badge.dev-PASS, .badge.dev-PENDING { background: rgba(124, 135, 152, 0.2); color: var(--text-dim); }
-
-  .badge.status-WATCHING { background: rgba(34, 211, 238, 0.15); color: var(--accent); }
-  .badge.status-GRADUATED { background: rgba(52, 211, 153, 0.15); color: var(--green); }
-  .badge.status-RUGGED { background: rgba(248, 113, 113, 0.15); color: var(--red); }
-  .badge.status-SKIPPED, .badge.status-EXPIRED_WATCH { background: rgba(124, 135, 152, 0.2); color: var(--text-dim); }
-
-  .narrative-card.DECAYING { opacity: 0.45; }
-  .token-row.status-RUGGED { opacity: 0.55; }
-  .token-row.status-SKIPPED { opacity: 0.4; }
-
-  .chain-tag {
-    display: inline-block;
-    font-size: 10px;
-    padding: 1px 5px;
-    border-radius: 3px;
-    background: var(--border);
-    color: var(--text-dim);
-    margin-right: 3px;
-    text-transform: uppercase;
-  }
-  .chain-tag.chain-solana { background: rgba(180, 139, 255, 0.15); color: var(--chain-solana); }
-  .chain-tag.chain-bnb { background: rgba(240, 185, 11, 0.15); color: var(--chain-bnb); }
-  .chain-tag.chain-robinhood { background: rgba(0, 200, 5, 0.15); color: var(--chain-robinhood); }
-
   .empty-state {
     color: var(--text-dim);
     text-align: center;
-    padding: 24px 8px;
-    font-size: 12px;
+    padding: 28px 12px;
+    font-size: 11px;
   }
 
-  .stat-row {
+  /* Badges */
+  .badge {
+    display: inline-block;
+    padding: 2px 6px;
+    border-radius: 4px;
+    font-size: 10px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.4px;
+    white-space: nowrap;
+  }
+  .badge.status-WATCHING { background: var(--accent-subtle); color: var(--accent); border: 1px solid rgba(56, 189, 248, 0.25); }
+  .badge.status-GRADUATED { background: var(--green-subtle); color: var(--green); border: 1px solid rgba(16, 185, 129, 0.3); }
+  .badge.status-RUGGED { background: var(--red-subtle); color: var(--red); border: 1px solid rgba(244, 63, 94, 0.3); }
+  .badge.status-SKIPPED, .badge.status-EXPIRED_WATCH { background: rgba(100, 116, 139, 0.15); color: var(--text-dim); }
+
+  .badge.dev-ELITE { background: var(--green-subtle); color: var(--green); border: 1px solid rgba(16, 185, 129, 0.3); }
+  .badge.dev-SKIP, .badge.dev-SKIPPED { background: var(--red-subtle); color: var(--red); border: 1px solid rgba(244, 63, 94, 0.3); }
+  .badge.dev-PASS, .badge.dev-PENDING { background: rgba(100, 116, 139, 0.15); color: var(--text-dim); }
+
+  .chain-tag {
+    display: inline-block;
+    font-size: 9px;
+    font-weight: 700;
+    padding: 1px 5px;
+    border-radius: 3px;
+    text-transform: uppercase;
+  }
+  .chain-tag.chain-solana { background: rgba(192, 132, 252, 0.15); color: var(--chain-solana); border: 1px solid rgba(192, 132, 252, 0.3); }
+  .chain-tag.chain-bnb { background: rgba(250, 204, 21, 0.15); color: var(--chain-bnb); border: 1px solid rgba(250, 204, 21, 0.3); }
+  .chain-tag.chain-robinhood { background: rgba(52, 211, 153, 0.15); color: var(--chain-robinhood); border: 1px solid rgba(52, 211, 153, 0.3); }
+
+  /* Dev Track Record Pill */
+  .dev-rep {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    font-size: 10px;
+    font-weight: 600;
+    padding: 1px 6px;
+    border-radius: 4px;
+    white-space: nowrap;
+  }
+  .dev-rep.new { color: var(--text-dim); background: rgba(100, 116, 139, 0.12); border: 1px solid rgba(100, 116, 139, 0.2); }
+  .dev-rep.clean { color: var(--accent); background: var(--accent-subtle); border: 1px solid rgba(56, 189, 248, 0.2); }
+  .dev-rep.good { color: var(--green); background: var(--green-subtle); border: 1px solid rgba(16, 185, 129, 0.25); font-weight: 700; }
+  .dev-rep.bad { color: var(--red); background: var(--red-subtle); border: 1px solid rgba(244, 63, 94, 0.25); font-weight: 700; }
+  .dev-rep.infra { color: var(--purple); background: var(--purple-subtle); }
+
+  /* Liquidity & Holder Badges */
+  .token-liq {
+    display: inline-flex;
+    align-items: center;
+    gap: 3px;
+    font-weight: 700;
+    font-size: 11px;
+    color: #38bdf8;
+    background: rgba(56, 189, 248, 0.08);
+    padding: 2px 6px;
+    border-radius: 4px;
+    border: 1px solid rgba(56, 189, 248, 0.2);
+    white-space: nowrap;
+  }
+  .token-liq.curve {
+    color: #c084fc;
+    background: rgba(192, 132, 252, 0.08);
+    border-color: rgba(192, 132, 252, 0.2);
+  }
+  .token-holders {
+    display: inline-flex;
+    align-items: center;
+    gap: 3px;
+    font-size: 11px;
+    color: var(--text);
+    background: var(--panel-alt);
+    padding: 2px 6px;
+    border-radius: 4px;
+    border: 1px solid var(--border);
+    white-space: nowrap;
+  }
+  .token-holders.concentrated {
+    color: var(--amber);
+    border-color: rgba(245, 158, 11, 0.35);
+    background: rgba(245, 158, 11, 0.08);
+  }
+
+  /* Opportunity Grid & Cards */
+  .opp-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+    gap: 12px;
+    padding: 12px;
+  }
+  .opp-card {
     display: flex;
-    gap: 10px;
+    flex-direction: column;
+    background: var(--panel-alt);
+    border: 1px solid var(--border);
+    border-left: 3px solid var(--accent);
+    border-radius: 6px;
     padding: 10px 12px;
-    border-bottom: 1px solid var(--border);
-    flex-wrap: wrap;
+    color: var(--text);
+    font-size: 11px;
+    gap: 6px;
+    transition: all 0.15s ease;
   }
-  .stat {
-    flex: 1;
-    min-width: 70px;
-    text-align: center;
+  .opp-card:hover {
+    border-color: var(--accent);
+    background: var(--panel-hover);
+    transform: translateY(-1px);
   }
-  .stat .num { font-size: 20px; font-weight: bold; color: var(--accent); }
-  .stat .lbl { font-size: 10px; color: var(--text-dim); text-transform: uppercase; }
+  .opp-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 6px;
+  }
+  .opp-score {
+    padding: 1px 7px;
+    border-radius: 4px;
+    font-weight: 800;
+    font-size: 11px;
+    letter-spacing: 0.3px;
+  }
+  .opp-score.score-high { background: rgba(16, 185, 129, 0.2); color: var(--green); border: 1px solid rgba(16, 185, 129, 0.3); }
+  .opp-score.score-mid { background: rgba(245, 158, 11, 0.2); color: var(--amber); border: 1px solid rgba(245, 158, 11, 0.3); }
+  .opp-score.score-low { background: rgba(100, 116, 139, 0.2); color: var(--text-dim); }
 
-  #token-feed { padding: 0; }
+  .opp-metrics-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    font-size: 11px;
+    color: var(--text);
+  }
+  .opp-highlight-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+    background: rgba(0, 0, 0, 0.2);
+    padding: 4px 6px;
+    border-radius: 4px;
+  }
+  .opp-dev-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 11px;
+  }
+  .opp-reasons {
+    font-size: 10px;
+    color: var(--text-dim);
+    line-height: 1.35;
+    border-top: 1px dashed var(--border);
+    padding-top: 5px;
+  }
+
+  /* Live Radar Split Layout */
+  .radar-split {
+    display: flex;
+    gap: 14px;
+    align-items: stretch;
+  }
+  .radar-main { flex: 1 1 75%; min-width: 0; }
+  .radar-side { flex: 0 0 25%; min-width: 260px; }
+  @media (max-width: 1024px) {
+    .radar-split { flex-direction: column; }
+    .radar-side { min-width: 100%; }
+  }
+
+  /* Token Feed Table */
   .token-tabs {
     display: flex;
-    gap: 4px;
-    padding: 8px 10px 0;
-    flex-wrap: wrap;
+    gap: 6px;
+    padding: 10px 12px;
+    background: var(--panel-alt);
+    border-bottom: 1px solid var(--border);
+    overflow-x: auto;
   }
   .token-tab {
-    background: var(--panel-alt);
+    background: var(--panel);
     border: 1px solid var(--border);
     color: var(--text-dim);
     border-radius: 5px;
@@ -217,177 +457,704 @@
     font-size: 11px;
     font-family: inherit;
     cursor: pointer;
+    font-weight: 600;
+    white-space: nowrap;
   }
-  .token-tab:hover { color: var(--text); }
-  .token-tab.active { color: var(--bg); background: var(--accent); border-color: var(--accent); font-weight: bold; }
+  .token-tab:hover { color: var(--text); border-color: #334155; background: var(--panel-hover); }
+  .token-tab.active { color: var(--accent); background: var(--accent-subtle); border-color: var(--accent); font-weight: 700; }
 
-  .token-row {
-    display: grid;
-    grid-template-columns: 58px 1fr 58px 155px 140px 44px 96px;
-    align-items: center;
-    gap: 8px;
-    padding: 7px 10px;
-    border-bottom: 1px solid var(--border);
-    font-size: 11px;
-  }
-  .token-row:hover { background: var(--panel-alt); }
-  .token-row .token-identity { overflow: hidden; }
-  .token-row .token-ticker { font-weight: bold; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; display: block; }
-  .token-row .token-platform { color: var(--text-dim); font-size: 10px; }
-  .token-row .token-addr { color: var(--text-dim); }
-  .token-row .token-mcap-cell { display: flex; align-items: center; justify-content: flex-end; gap: 6px; }
-  .token-row .mcap-stack { display: flex; flex-direction: column; align-items: flex-end; }
-  .token-row .token-mcap { text-align: right; }
-  .token-row .token-volume { font-size: 9px; color: var(--text-dim); }
-  .token-row .token-holders { font-size: 9px; color: var(--text-dim); }
-  .token-row .token-holders.concentrated { color: var(--amber); }
-  .token-img { border-radius: 4px; object-fit: cover; flex-shrink: 0; background: var(--panel-alt); }
-  .token-img-placeholder { border-radius: 4px; flex-shrink: 0; background: var(--panel-alt); display: inline-block; }
-  .token-row .token-age { color: var(--text-dim); text-align: right; }
-  .token-row .token-spark { display: flex; justify-content: center; flex-shrink: 0; }
-  .token-row .status-cell { display: flex; flex-direction: column; gap: 2px; }
-  .token-row .why-line { font-size: 9px; color: var(--text-dim); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .bonding-bar {
-    display: block;
+  .token-table-wrap {
+    overflow-x: auto;
     width: 100%;
-    height: 4px;
-    border-radius: 2px;
-    background: var(--border);
-    overflow: hidden;
-    margin: 2px 0;
   }
-  .bonding-bar-fill { display: block; height: 100%; background: var(--chain-solana); }
-  .token-row .token-actions { display: flex; gap: 4px; justify-content: flex-end; }
-  .token-row .action-btn {
-    width: 22px; height: 22px;
-    display: flex; align-items: center; justify-content: center;
-    border: 1px solid var(--border);
-    border-radius: 4px;
-    color: var(--text-dim);
-    text-decoration: none;
-    font-size: 11px;
-    cursor: pointer;
-    background: var(--panel-alt);
-  }
-  .token-row .action-btn:hover { color: var(--accent); border-color: var(--accent); }
-  /* .token-row sets display:grid, which (author CSS) overrides the browser's
-     default [hidden]{display:none} UA rule — without this, tab filtering
-     via row.hidden silently does nothing. */
-  .token-row[hidden] { display: none; }
   .token-row-header {
     display: grid;
-    grid-template-columns: 58px 1fr 58px 155px 140px 44px 96px;
+    grid-template-columns: 80px 170px 190px 110px 140px 140px 110px 120px;
     gap: 8px;
-    padding: 6px 10px;
+    padding: 8px 12px;
+    background: var(--panel-alt);
+    border-bottom: 1px solid var(--border);
     font-size: 10px;
     text-transform: uppercase;
+    letter-spacing: 0.5px;
     color: var(--text-dim);
-    border-bottom: 1px solid var(--border);
-    position: sticky;
-    top: 0;
-    background: var(--panel);
+    font-weight: 700;
+    align-items: center;
+    min-width: 960px;
   }
-  @media (max-width: 900px) {
-    .token-row, .token-row-header { grid-template-columns: 50px 1fr 90px 110px 76px; }
-    .token-row > *:nth-child(3), .token-row > *:nth-child(6),
-    .token-row-header > *:nth-child(3), .token-row-header > *:nth-child(6) {
-      display: none;
-    }
+  #token-feed {
+    padding: 0;
+    max-height: 75vh;
+    min-width: 960px;
+  }
+  .token-row {
+    display: grid;
+    grid-template-columns: 80px 170px 190px 110px 140px 140px 110px 120px;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 12px;
+    border-bottom: 1px solid var(--border-subtle);
+    font-size: 11px;
+    transition: background 0.1s ease;
+    min-width: 960px;
+  }
+  .token-row:hover { background: var(--panel-hover); }
+  .token-row.status-RUGGED { opacity: 0.6; }
+  .token-row.status-SKIPPED { opacity: 0.4; }
+
+  .cell-chain-age {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+  }
+  .token-age { color: var(--text-dim); font-size: 10px; }
+
+  .token-identity {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    overflow: hidden;
+  }
+  .token-img-wrap { flex-shrink: 0; }
+  .token-img { border-radius: 4px; object-fit: cover; background: var(--panel-alt); }
+  .token-img-placeholder { border-radius: 4px; background: var(--panel-alt); display: inline-block; }
+  .token-name-col { overflow: hidden; }
+  .token-ticker { font-weight: 800; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; display: block; color: var(--text); }
+  .token-platform { color: var(--text-dim); font-size: 10px; }
+
+  .dev-cell {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+    align-items: flex-start;
+  }
+  .cell-liq { display: flex; align-items: center; }
+  .cell-holders { display: flex; align-items: center; }
+
+  .token-mcap-cell {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 6px;
+  }
+  .mcap-stack {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+  }
+  .token-mcap { font-weight: 700; color: var(--text); }
+  .token-volume { font-size: 10px; color: var(--text-dim); }
+  .token-spark { display: flex; flex-shrink: 0; }
+
+  .status-cell {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+    align-items: flex-start;
   }
 
-  .summary-panel {
+  .token-actions {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    justify-content: flex-end;
+  }
+  .action-btn {
+    background: var(--panel-alt);
+    border: 1px solid var(--border);
+    color: var(--text);
+    border-radius: 4px;
+    padding: 3px 6px;
+    font-size: 11px;
+    cursor: pointer;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    transition: all 0.1s;
+  }
+  .action-btn:hover {
+    background: var(--panel-hover);
+    border-color: var(--accent);
+    color: var(--accent);
+  }
+
+  /* Trending Words & Descriptions */
+  .trending-words {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 5px;
+    padding: 8px 10px;
+    border-bottom: 1px solid var(--border);
+    background: var(--panel-alt);
+  }
+  .trending-words:empty { display: none; }
+  .trending-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    padding: 2px 7px;
+    font-size: 10px;
+    color: var(--text);
+  }
+  .trending-pill .tp-count { color: var(--accent); font-weight: 700; }
+  .desc-card {
+    background: var(--panel-alt);
+    border: 1px solid var(--border);
+    border-left: 3px solid var(--green);
+    border-radius: 4px;
+    padding: 6px 8px;
+    margin-bottom: 6px;
+    font-size: 11px;
+    line-height: 1.4;
+  }
+  .desc-card .dc-ticker { color: var(--green); font-weight: 700; }
+  .desc-card .dc-plat { color: var(--text-dim); font-size: 10px; margin-left: 6px; }
+  .desc-card .dc-text { color: var(--text-dim); margin-top: 3px; }
+
+  /* ======================================================================== */
+  /* Jev Intelligence Terminal Styling                                        */
+  /* ======================================================================== */
+  .jev-container {
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+  }
+
+  /* Executive KPI 4-Card Ribbon */
+  .jev-kpi-grid {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 12px;
+    margin-bottom: 4px;
+  }
+  @media (max-width: 1200px) {
+    .jev-kpi-grid { grid-template-columns: repeat(2, 1fr); }
+  }
+  @media (max-width: 650px) {
+    .jev-kpi-grid { grid-template-columns: 1fr; }
+  }
+  .jev-kpi-card {
     background: var(--panel);
     border: 1px solid var(--border);
     border-radius: 8px;
-    margin-top: 14px;
-    padding: 4px 0 10px;
+    padding: 12px 14px;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    transition: border-color 0.15s ease;
   }
-  .summary-panel .panel-header { justify-content: flex-start; gap: 8px; }
-  .summary-panel .panel-header .hint { font-size: 10px; text-transform: none; color: var(--text-dim); }
+  .jev-kpi-card:hover {
+    border-color: #2e3f5e;
+  }
+  .jev-kpi-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    font-size: 11px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: var(--text-dim);
+  }
+  .jev-kpi-title {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .jev-status-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    font-size: 10px;
+    padding: 1px 6px;
+    border-radius: 4px;
+    font-weight: 700;
+  }
+  .jev-status-badge.live {
+    background: var(--green-subtle);
+    color: var(--green);
+    border: 1px solid rgba(16, 185, 129, 0.3);
+  }
+  .jev-status-badge.paused {
+    background: var(--amber-subtle);
+    color: var(--amber);
+    border: 1px solid rgba(245, 158, 11, 0.3);
+  }
+  .jev-kpi-main-val {
+    font-size: 20px;
+    font-weight: 800;
+    color: var(--text);
+    display: flex;
+    align-items: baseline;
+    gap: 6px;
+    font-family: "JetBrains Mono", monospace;
+  }
+  .jev-kpi-main-val .unit {
+    font-size: 11px;
+    font-weight: 500;
+    color: var(--text-dim);
+  }
+  .jev-kpi-stats-list {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+    font-size: 11px;
+    color: var(--text-dim);
+    margin-top: 4px;
+    border-top: 1px solid var(--border-subtle);
+    padding-top: 6px;
+  }
+  .jev-kpi-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+  }
+  .jev-kpi-row b {
+    color: var(--text);
+    font-weight: 600;
+  }
+
+  /* Jev Sub-Navigation Tabs */
+  .jev-subnav {
+    display: flex;
+    gap: 6px;
+    padding: 4px 0 10px;
+    border-bottom: 1px solid var(--border);
+    overflow-x: auto;
+    align-items: center;
+  }
+  .jev-subnav-btn {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    color: var(--text-dim);
+    border-radius: 6px;
+    padding: 6px 12px;
+    font-size: 11px;
+    font-family: inherit;
+    cursor: pointer;
+    font-weight: 600;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    transition: all 0.12s ease;
+    white-space: nowrap;
+  }
+  .jev-subnav-btn:hover {
+    color: var(--text);
+    background: var(--panel-hover);
+    border-color: #334155;
+  }
+  .jev-subnav-btn.active {
+    color: #fff;
+    background: var(--panel-alt);
+    border-color: var(--accent);
+    box-shadow: inset 0 -2px 0 var(--accent);
+  }
+  .jev-subnav-btn .sub-badge {
+    font-size: 10px;
+    padding: 1px 6px;
+    border-radius: 999px;
+    background: rgba(255, 255, 255, 0.08);
+    color: var(--text-dim);
+    font-family: "JetBrains Mono", monospace;
+  }
+  .jev-subnav-btn.active .sub-badge {
+    background: var(--accent-subtle);
+    color: var(--accent);
+  }
+
+  /* Sub-Panel Switching */
+  .jev-sub-panel {
+    display: none;
+    animation: fadeIn 0.12s ease;
+  }
+  .jev-sub-panel.active {
+    display: block;
+  }
+
+  /* Modern Jev Tables */
+  .jev-table-wrap {
+    overflow-x: auto;
+    width: 100%;
+    border-radius: 6px;
+    border: 1px solid var(--border);
+  }
+  .jev-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 11px;
+    text-align: left;
+    background: var(--panel);
+  }
+  .jev-table th {
+    background: var(--panel-alt);
+    padding: 8px 12px;
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: var(--text-dim);
+    border-bottom: 1px solid var(--border);
+    font-weight: 700;
+  }
+  .jev-table td {
+    padding: 7px 12px;
+    border-bottom: 1px solid var(--border-subtle);
+    color: var(--text);
+  }
+  .jev-table tr:last-child td {
+    border-bottom: none;
+  }
+  .jev-table tr:hover td {
+    background: var(--panel-hover);
+  }
+  .jev-edge-good {
+    background: rgba(16, 185, 129, 0.06);
+  }
+  .jev-edge-good td {
+    color: #34d399 !important;
+    font-weight: 600;
+  }
+  .jev-edge-bad {
+    background: rgba(244, 63, 94, 0.06);
+  }
+  .jev-edge-bad td {
+    color: #fb7185 !important;
+  }
+
+  /* Gate Funnel Visualizer */
+  .jev-funnel-card {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 12px 14px;
+    margin-bottom: 12px;
+  }
+  .jev-funnel-flow {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+    margin-top: 8px;
+  }
+  .jev-funnel-node {
+    background: var(--panel-alt);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 6px 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    min-width: 110px;
+  }
+  .jev-funnel-node.qualify {
+    border-color: rgba(16, 185, 129, 0.4);
+    background: var(--green-subtle);
+  }
+  .jev-funnel-val {
+    font-size: 14px;
+    font-weight: 800;
+    color: var(--text);
+    font-family: "JetBrains Mono", monospace;
+  }
+  .jev-funnel-node.qualify .jev-funnel-val {
+    color: var(--green);
+  }
+  .jev-funnel-lbl {
+    font-size: 10px;
+    color: var(--text-dim);
+    text-transform: uppercase;
+  }
+  .jev-funnel-arrow {
+    color: var(--text-muted);
+    font-size: 14px;
+  }
+
+  /* Evaluation Cards */
+  .jev-judgment {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-left: 3px solid var(--accent);
+    border-radius: 6px;
+    padding: 12px 14px;
+    margin-bottom: 10px;
+    transition: border-color 0.15s ease;
+  }
+  .jev-judgment:hover {
+    border-color: #2e3f5e;
+  }
+  .jev-j-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    flex-wrap: wrap;
+    margin-bottom: 8px;
+  }
+  .jev-j-tick {
+    font-size: 14px;
+    font-weight: 800;
+    color: var(--accent);
+  }
+  .jev-j-verdict {
+    font-size: 11px;
+    font-weight: 700;
+    padding: 2px 8px;
+    border-radius: 4px;
+  }
+  .jev-verdict-pos { background: var(--green-subtle); color: var(--green); border: 1px solid rgba(16, 185, 129, 0.3); }
+  .jev-verdict-neg { background: var(--red-subtle); color: var(--red); border: 1px solid rgba(244, 63, 94, 0.3); }
+  .jev-verdict-neutral { background: rgba(100, 116, 139, 0.15); color: var(--text-dim); }
+  .jev-verdict-veto { background: rgba(244, 63, 94, 0.25); color: #fecdd3; border: 1px solid var(--red); font-weight: 800; }
+  
+  .jev-oc {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    font-size: 10px;
+    font-weight: 700;
+    padding: 2px 7px;
+    border-radius: 4px;
+    text-transform: uppercase;
+  }
+  .jev-oc-moon { background: var(--green-subtle); color: var(--green); border: 1px solid rgba(16, 185, 129, 0.3); }
+  .jev-oc-rug { background: var(--red-subtle); color: var(--red); border: 1px solid rgba(244, 63, 94, 0.3); }
+  .jev-oc-dying { background: var(--amber-subtle); color: var(--amber); border: 1px solid rgba(245, 158, 11, 0.3); }
+  .jev-oc-flat { background: rgba(100, 116, 139, 0.15); color: var(--text-dim); }
+  .jev-oc-pending { background: rgba(56, 189, 248, 0.08); color: var(--accent); }
+
+  .jev-dims {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+    gap: 8px;
+    margin: 8px 0;
+  }
+  .jev-dim {
+    background: var(--panel-alt);
+    border: 1px solid var(--border);
+    border-radius: 5px;
+    padding: 6px 10px;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+  .jev-dim-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    font-size: 10px;
+  }
+  .jev-dim-head b { color: var(--text-dim); text-transform: capitalize; }
+  .jev-dim-val { font-weight: 700; font-family: "JetBrains Mono", monospace; }
+  .jev-dim-conf { color: var(--text-muted); font-size: 9px; }
+  .jev-dist-row {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    font-size: 9px;
+  }
+  .jev-dist-bar {
+    flex: 1;
+    height: 4px;
+    background: var(--border);
+    border-radius: 2px;
+    overflow: hidden;
+  }
+  .jev-dist-bar span {
+    display: block;
+    height: 100%;
+    background: var(--accent);
+  }
+  .jev-j-reasons {
+    margin: 6px 0 0 14px;
+    padding: 0;
+    font-size: 11px;
+    color: var(--text);
+    line-height: 1.45;
+  }
+  .jev-j-reasons li { margin-bottom: 2px; }
+
+  /* PvP Head to Head */
+  .jev-pvp-card {
+    border-left-color: var(--purple);
+  }
+  .jev-pvp-reason {
+    font-size: 11px;
+    color: var(--text);
+    background: var(--panel-alt);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 6px 10px;
+    margin-bottom: 8px;
+    line-height: 1.4;
+  }
+  .jev-pvp-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 10px;
+  }
+  .jev-pvp-table th, .jev-pvp-table td {
+    padding: 6px 8px;
+    text-align: left;
+    border-bottom: 1px solid var(--border-subtle);
+  }
+  .jev-pvp-table th { color: var(--text-dim); background: var(--panel-alt); text-transform: uppercase; font-size: 9px; }
+  .jev-pvp-row-pick {
+    background: rgba(16, 185, 129, 0.08);
+    font-weight: 700;
+    color: var(--green);
+  }
+  .badge.jev-pvp-pick { background: var(--green-subtle); color: var(--green); border: 1px solid rgba(16, 185, 129, 0.4); }
+  .badge.jev-pvp-lose { background: rgba(100, 116, 139, 0.15); color: var(--text-dim); }
+
+  /* Audit Log Rows */
+  .jev-ev-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 10px;
+    border-bottom: 1px solid var(--border-subtle);
+    font-size: 11px;
+  }
+  .jev-ev-row:hover { background: var(--panel-hover); }
+  .jev-ev-icon { font-size: 12px; }
+  .jev-ev-label {
+    font-size: 9px;
+    font-weight: 700;
+    padding: 1px 5px;
+    border-radius: 3px;
+    text-transform: uppercase;
+  }
+  .jev-ev-eval .jev-ev-label { background: var(--accent-subtle); color: var(--accent); }
+  .jev-ev-veto .jev-ev-label { background: var(--red-subtle); color: var(--red); }
+  .jev-ev-skip .jev-ev-label { background: rgba(100, 116, 139, 0.15); color: var(--text-dim); }
+  .jev-ev-pvp .jev-ev-label { background: var(--purple-subtle); color: var(--purple); }
+  .jev-ev-err .jev-ev-label { background: var(--red-subtle); color: var(--red); }
+  .jev-ev-tick { font-weight: 700; min-width: 60px; }
+  .jev-ev-reason { flex: 1; color: var(--text-dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .jev-ev-when { font-size: 10px; color: var(--text-muted); }
+
+  .jev-q {
+    background: var(--panel-alt);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    margin-bottom: 6px;
+    font-size: 11px;
+    overflow: hidden;
+  }
+  .jev-q summary {
+    padding: 8px 12px;
+    cursor: pointer;
+    font-weight: 600;
+    color: var(--text);
+    background: var(--panel);
+    list-style: none;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+  }
+  .jev-q-body {
+    padding: 8px 12px;
+    border-top: 1px solid var(--border-subtle);
+    color: var(--text-dim);
+    line-height: 1.4;
+  }
+  .jev-q-crit {
+    margin-top: 4px;
+    font-size: 10px;
+    color: var(--text-muted);
+  }
+  .jev-q-tag {
+    font-size: 9px;
+    padding: 1px 5px;
+    border-radius: 3px;
+    background: var(--purple-subtle);
+    color: var(--purple);
+    font-weight: 700;
+  }
+
+  /* Market & Alpha Grids */
+  .grid-2 {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 12px;
+  }
+  .grid-3 {
+    display: grid;
+    grid-template-columns: 1fr 1fr 1fr;
+    gap: 12px;
+  }
+  @media (max-width: 900px) {
+    .grid-2, .grid-3 { grid-template-columns: 1fr; }
+  }
+
+  .card {
+    background: var(--panel-alt);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 8px 10px;
+    margin-bottom: 8px;
+    font-size: 11px;
+  }
+  .card .title { font-weight: 700; margin-bottom: 3px; }
+  .card .meta { color: var(--text-dim); font-size: 10px; }
+  .card.severity-danger { border-left: 3px solid var(--red); }
+  .card.severity-warning { border-left: 3px solid var(--amber); }
+  .card.severity-success { border-left: 3px solid var(--green); }
+  .card.severity-info { border-left: 3px solid var(--accent); }
+
+  .bonding-bar {
+    display: inline-block;
+    width: 50px;
+    height: 4px;
+    background: var(--border);
+    border-radius: 2px;
+    overflow: hidden;
+  }
+  .bonding-bar-fill {
+    display: block;
+    height: 100%;
+    background: var(--purple);
+  }
+  .weekly-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 11px;
+  }
+  .weekly-table th, .weekly-table td {
+    padding: 5px 8px;
+    text-align: right;
+    border-bottom: 1px solid var(--border-subtle);
+  }
+  .weekly-table th:first-child, .weekly-table td:first-child { text-align: left; }
+  .pnl-pos { color: var(--green); font-weight: 700; }
+  .pnl-neg { color: var(--red); font-weight: 700; }
+
   .summary-grid {
     display: flex;
     flex-wrap: wrap;
-    gap: 10px;
-    padding: 10px 12px 0;
+    gap: 8px;
+    padding: 10px;
   }
   .summary-stat {
     flex: 1;
-    min-width: 90px;
+    min-width: 80px;
     text-align: center;
     background: var(--panel-alt);
     border: 1px solid var(--border);
     border-radius: 6px;
-    padding: 8px 4px;
+    padding: 6px 4px;
   }
-  .summary-stat .num { font-size: 18px; font-weight: bold; }
-  .summary-stat .lbl { font-size: 10px; color: var(--text-dim); text-transform: uppercase; margin-top: 2px; }
+  .summary-stat .num { font-size: 16px; font-weight: 700; }
+  .summary-stat .lbl { font-size: 9px; color: var(--text-dim); text-transform: uppercase; margin-top: 2px; }
   .summary-stat.c-total .num { color: var(--accent); }
   .summary-stat.c-elite .num { color: var(--purple); }
   .summary-stat.c-graduated .num { color: var(--green); }
   .summary-stat.c-rugged .num { color: var(--red); }
   .summary-stat.c-skipped .num { color: var(--text-dim); }
   .summary-stat.c-expired .num { color: var(--text-dim); }
-
-  .card .meta.detail { color: var(--text); }
-
-  .outcomes-grid {
-    display: grid;
-    grid-template-columns: 1fr 1fr;
-    gap: 14px;
-    margin-top: 14px;
-  }
-  @media (max-width: 700px) {
-    .outcomes-grid { grid-template-columns: 1fr; }
-  }
-
-  .opp-history-grid {
-    display: grid;
-    grid-template-columns: 3fr 1fr;
-    gap: 14px;
-  }
-  @media (max-width: 800px) {
-    .opp-history-grid { grid-template-columns: 1fr; }
-  }
-  .opp-history-grid .panel-body { max-height: 420px; }
-  .outcomes-col { max-height: 260px; }
-  .outcomes-col .panel-body { padding: 8px; }
-
-  .duo-grid {
-    display: grid;
-    grid-template-columns: 1fr 1fr;
-    gap: 14px;
-    margin-top: 14px;
-  }
-  @media (max-width: 700px) {
-    .duo-grid { grid-template-columns: 1fr; }
-  }
-
-  .weekly-table {
-    width: 100%;
-    border-collapse: collapse;
-    font-size: 12px;
-  }
-  .weekly-table th, .weekly-table td {
-    padding: 4px 8px;
-    text-align: right;
-    border-bottom: 1px solid var(--border, rgba(255,255,255,0.08));
-  }
-  .weekly-table th:first-child, .weekly-table td:first-child { text-align: left; }
-  .pnl-pos { color: var(--green); }
-  .pnl-neg { color: var(--red); }
-
-  .opp-status-badge {
-    display: inline-block;
-    font-size: 10px;
-    font-weight: 600;
-    padding: 1px 6px;
-    border-radius: 10px;
-    vertical-align: middle;
-  }
-  .opp-status-badge.status-rugged { background: rgba(248, 113, 113, 0.15); color: var(--red); }
-  .opp-status-badge.status-graduated { background: rgba(52, 211, 153, 0.15); color: var(--green); }
-  .opp-status-badge.status-expired { background: rgba(124, 135, 152, 0.15); color: var(--text-dim); }
-  .opp-status-badge.status-watching { background: rgba(34, 211, 238, 0.15); color: var(--accent); }
 
   .launch-chip {
     display: inline-flex;
@@ -399,164 +1166,424 @@
     padding: 2px 6px;
     margin: 2px 3px 2px 0;
     font-size: 10px;
-    text-decoration: none;
     color: var(--text);
   }
-  .launch-chip:hover { border-color: var(--accent); }
-  .launch-chip.leader { border-color: var(--amber); box-shadow: 0 0 0 1px var(--amber); font-weight: bold; }
-  .launch-chips { margin-top: 4px; }
-
-  .opp-panel .panel-header { flex-wrap: wrap; gap: 4px; }
-  .opp-panel .hint { font-size: 10px; text-transform: none; color: var(--text-dim); }
-  .hint { font-size: 10px; color: var(--text-dim); }
-  .opp-grid {
-    display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
-    gap: 8px;
-    padding: 10px 12px;
-  }
-  .opp-card {
-    display: block;
-    background: var(--panel-alt);
-    border: 1px solid var(--border);
-    border-left: 3px solid var(--accent);
-    border-radius: 4px;
-    padding: 8px 10px;
-    text-decoration: none;
-    color: var(--text);
-    font-size: 11px;
-  }
-  .opp-card:hover { border-color: var(--accent); }
-  .opp-score {
-    display: inline-block;
-    padding: 0 6px;
-    border-radius: 3px;
-    font-weight: bold;
-    font-size: 11px;
-  }
-  .opp-score.score-high { background: rgba(52, 211, 153, 0.2); color: var(--green); }
-  .opp-score.score-mid { background: rgba(251, 191, 36, 0.2); color: var(--amber); }
-  .opp-score.score-low { background: rgba(124, 135, 152, 0.2); color: var(--text-dim); }
+  .launch-chip.status-RUGGED { border-color: rgba(239, 68, 68, 0.4); color: var(--red); }
+  .launch-chip.status-GRADUATED { border-color: rgba(16, 185, 129, 0.4); color: var(--green); }
 </style>
+</head>
+<body>
 
+<!-- Top Header -->
 <header>
-  <h1>FAIR-LAUNCH TRACKER <span>// xjp2automation.online</span></h1>
-  <div id="status"><span class="dot"></span><span id="status-text">connecting...</span></div>
+  <div class="brand">
+    <h1>FAIRLAUNCH TERMINAL <span>// v2.4</span></h1>
+    <div class="network-pills">
+      <span class="net-pill active">Solana</span>
+      <span class="net-pill active">BNB Chain</span>
+      <span class="net-pill">Robinhood</span>
+    </div>
+  </div>
+  <div id="status">
+    <span class="dot"></span>
+    <span id="status-text">connecting...</span>
+  </div>
 </header>
 
-<div id="ticker-tape"><span class="empty">Waiting for high-priority alerts...</span></div>
-
-<div class="stat-row">
-  <div class="stat"><div class="num" id="stat-alerts">0</div><div class="lbl">Alerts</div></div>
-  <div class="stat"><div class="num" id="stat-tokens">0</div><div class="lbl">Tokens Seen</div></div>
-  <div class="stat"><div class="num" id="stat-narratives">0</div><div class="lbl">Active Narratives</div></div>
-  <div class="stat"><div class="num" id="stat-elite">0</div><div class="lbl">Elite Devs</div></div>
-  <div class="stat"><div class="num" id="stat-blacklist">0</div><div class="lbl">Blacklisted Devs</div></div>
-</div>
-
-<div class="summary-panel">
-  <div class="panel-header"><span>Today's Summary</span><span class="hint" id="today-date">tracked server-side, resets at UTC midnight</span></div>
-  <div class="summary-grid">
-    <div class="summary-stat c-total"><div class="num" id="sum-total">0</div><div class="lbl">Total Launches</div></div>
-    <div class="summary-stat c-elite"><div class="num" id="sum-elite">0</div><div class="lbl">Elite Launches</div></div>
-    <div class="summary-stat c-graduated"><div class="num" id="sum-graduated">0</div><div class="lbl">Graduated</div></div>
-    <div class="summary-stat c-rugged"><div class="num" id="sum-rugged">0</div><div class="lbl">Rugged</div></div>
-    <div class="summary-stat c-skipped"><div class="num" id="sum-skipped">0</div><div class="lbl">Skipped (Blacklisted)</div></div>
-    <div class="summary-stat c-expired"><div class="num" id="sum-expired">0</div><div class="lbl">Expired (No Verdict)</div></div>
+<!-- Consolidated KPI Metric Ribbon -->
+<div class="kpi-ribbon">
+  <div class="kpi-chip"><span class="lbl">Watching</span><span class="val accent" id="stat-tokens">0</span></div>
+  <div class="kpi-chip"><span class="lbl">Opportunities</span><span class="val green" id="stat-opps-active">0</span></div>
+  <div class="kpi-chip"><span class="lbl">Alerts</span><span class="val" id="stat-alerts">0</span></div>
+  <div class="kpi-chip"><span class="lbl">Graduated</span><span class="val green" id="sum-graduated">0</span></div>
+  <div class="kpi-chip"><span class="lbl">Rugged</span><span class="val red" id="sum-rugged">0</span></div>
+  <div class="kpi-chip"><span class="lbl">Elite Devs</span><span class="val purple" id="stat-elite">0</span></div>
+  <div class="kpi-chip"><span class="lbl">Blacklisted</span><span class="val red" id="stat-blacklist">0</span></div>
+  <div class="kpi-chip"><span class="lbl">Narratives</span><span class="val" id="stat-narratives">0</span></div>
+  <div class="kpi-chip"><span class="lbl">Total Today</span><span class="val" id="sum-total">0</span></div>
+  <!-- Hidden elements kept for JS updates -->
+  <div style="display:none;">
+    <span id="sum-elite">0</span>
+    <span id="sum-skipped">0</span>
+    <span id="sum-expired">0</span>
+    <span id="today-date"></span>
   </div>
 </div>
 
-<div class="duo-grid">
+<!-- Ticker Tape Alert Strip -->
+<div id="ticker-tape"><span class="empty">Waiting for high-conviction market alerts...</span></div>
+
+<!-- Main Navigation Tabs -->
+<nav class="main-nav">
+  <button class="main-tab-btn active" data-tab="tab-snipes">
+    🎯 OPPORTUNITY CALLS <span class="tab-badge" id="badge-opps">0</span>
+  </button>
+  <button class="main-tab-btn" data-tab="tab-radar">
+    ⚡ LIVE TOKEN RADAR <span class="tab-badge" id="badge-radar">0</span>
+  </button>
+  <button class="main-tab-btn" data-tab="tab-ai">
+    🧠 TYPESAFE AI (JEV) <span class="tab-badge" id="badge-ai">0</span>
+  </button>
+  <button class="main-tab-btn" data-tab="tab-market">
+    📊 MARKET INTEL &amp; ALERTS <span class="tab-badge" id="badge-alerts">0</span>
+  </button>
+</nav>
+
+<!-- ======================================================================== -->
+<!-- TAB 1: OPPORTUNITY CALLS -->
+<!-- ======================================================================== -->
+<section class="main-tab-view active" id="tab-snipes">
+  <!-- Top Opportunities -->
   <div class="panel">
-    <div class="panel-header"><span>🕒 Launch Activity by Hour</span><span class="hint">when the market deploys the most contracts</span></div>
-    <div class="panel-body" id="hourly-activity"><div class="empty-state">No data yet.</div></div>
-  </div>
-  <div class="panel">
-    <div class="panel-header"><span>📅 Weekly Progress</span><span class="hint">day-by-day, up to 14 days</span></div>
-    <div class="panel-body" id="weekly-progress"><div class="empty-state">No daily history yet.</div></div>
-  </div>
-</div>
-
-<div class="opp-history-grid">
-  <div class="summary-panel opp-panel">
     <div class="panel-header">
-      <span>🎯 Top Opportunities</span>
-      <span class="hint">heuristic score (0-100) from dev-trust + smart-money + volume + narrative signals — not financial advice</span>
+      <span>🎯 Top Scored Opportunities (Live Candidates)</span>
+      <span class="hint">Real-time composite scoring: Dev Trust + Liquidity + Holder Distribution + Smart Money + Momentum</span>
     </div>
-    <div class="opp-grid" id="top-opportunities"><div class="empty-state">No scored opportunities yet.</div></div>
+    <div class="opp-grid" id="top-opportunities"><div class="empty-state">Scanning live fair-launches for high-conviction breakout signals...</div></div>
   </div>
-  <div class="panel outcomes-col" style="max-height:none;">
-    <div class="panel-header"><span>🎯 Opportunity History</span><span id="outcome-opportunities-count">0</span></div>
-    <div class="panel-body" id="outcome-opportunities"><div class="empty-state">None yet today.</div></div>
-  </div>
-</div>
 
-<div class="summary-panel opp-panel">
-  <div class="panel-header">
-    <span>⚡ Early Momentum</span>
-    <span class="hint">$50k–$200k mcap band — past the noisy launch-floor stage, not yet fully proven. Ratio, narrative &amp; smart-money signals only, not a prediction.</span>
-  </div>
-  <div class="opp-grid" id="early-momentum"><div class="empty-state">No early signals yet.</div></div>
-</div>
-
-<div class="panel wide">
-  <div class="panel-header">
-    <span>💰 Mock Portfolio</span>
-    <span class="hint" id="mock-portfolio-hint">paper trading — simulated $100 buy the instant each coin is flagged as an opportunity, not real funds</span>
-  </div>
-  <div class="panel-body" id="mock-portfolio"><div class="empty-state">No simulated positions yet — opens automatically the first time a coin is flagged as an opportunity.</div></div>
-</div>
-
-<div class="outcomes-grid">
-  <div class="panel outcomes-col">
-    <div class="panel-header"><span>🟢 Recent Graduations</span><span id="outcome-graduated-count">0</span></div>
-    <div class="panel-body" id="outcome-graduated"><div class="empty-state">None yet today.</div></div>
-  </div>
-  <div class="panel outcomes-col">
-    <div class="panel-header"><span>🔴 Recent Rugs</span><span id="outcome-rugged-count">0</span></div>
-    <div class="panel-body" id="outcome-rugged"><div class="empty-state">None yet today.</div></div>
-  </div>
-</div>
-
-<div class="panel wide">
-  <div class="panel-header"><span>Live Tokens</span><span id="token-count">0</span></div>
-  <div class="token-tabs" id="token-tabs">
-    <button class="token-tab active" data-filter="ALL">All <span id="tab-count-ALL">0</span></button>
-    <button class="token-tab" data-filter="WATCHING">Watching <span id="tab-count-WATCHING">0</span></button>
-    <button class="token-tab" data-filter="BONDING" title="Pump.fun tokens still on their bonding curve, not yet graduated">Bonding <span id="tab-count-BONDING">0</span></button>
-    <button class="token-tab" data-filter="GRADUATED">Graduated <span id="tab-count-GRADUATED">0</span></button>
-    <button class="token-tab" data-filter="RUGGED">Rugged <span id="tab-count-RUGGED">0</span></button>
-    <button class="token-tab" data-filter="SKIPPED">Skipped <span id="tab-count-SKIPPED">0</span></button>
-    <button class="token-tab" data-filter="EXPIRED_WATCH">Expired <span id="tab-count-EXPIRED_WATCH">0</span></button>
-  </div>
-  <div class="token-row-header">
-    <span>Chain</span><span>Token</span><span>Dev</span><span>Mcap</span><span>Status / Why</span><span>Age</span><span>Actions</span>
-  </div>
-  <div class="panel-body" id="token-feed"><div class="empty-state">No tokens seen yet.</div></div>
-</div>
-
-<div class="grid">
+  <!-- Stage-1 Early Momentum Watchlist -->
   <div class="panel">
-    <div class="panel-header"><span>Live Alert Feed</span><span id="alert-count">0</span></div>
-    <div class="token-tabs" id="alert-tabs">
-      <button class="token-tab active" data-filter="IMPORTANT">Important <span id="alert-tab-count-IMPORTANT">0</span></button>
-      <button class="token-tab" data-filter="SKIPPED">Skipped <span id="alert-tab-count-SKIPPED">0</span></button>
-      <button class="token-tab" data-filter="ALL">All <span id="alert-tab-count-ALL">0</span></button>
+    <div class="panel-header">
+      <span>⚡ Stage-1 Early Momentum Watchlist ($15k–$100k Micro-Caps)</span>
+      <span class="hint">Early traction coins screened via lightweight TypeSafe cascade before full eval</span>
     </div>
-    <div class="panel-body" id="alert-feed"><div class="empty-state">No alerts yet.</div></div>
+    <div class="opp-grid" id="early-momentum"><div class="empty-state">No early momentum micro-caps passing cascade screening right now.</div></div>
   </div>
 
-  <div class="panel">
-    <div class="panel-header"><span>Narrative Velocity</span><span id="narrative-count">0</span></div>
-    <div class="hint" style="padding:4px 12px 0;">sorted hottest first &middot; decaying narratives collapsed at the bottom</div>
-    <div class="panel-body" id="narrative-feed"><div class="empty-state">No narrative clusters yet.</div></div>
+  <!-- Mock Portfolio & Opportunity History Grid -->
+  <div class="grid-2">
+    <!-- Mock Portfolio -->
+    <div class="panel">
+      <div class="panel-header">
+        <span>🎯 Opportunity Calls Tracker</span>
+        <span class="hint" id="mock-portfolio-hint">Tracks peak multiples and performance of vetted calls</span>
+      </div>
+      <div class="panel-body" id="mock-portfolio"><div class="empty-state">No opportunity calls tracked yet — records automatically when a coin passes quality screening.</div></div>
+    </div>
+
+    <!-- Opportunity History -->
+    <div class="panel">
+      <div class="panel-header">
+        <span>📜 Opportunity Outcome Log</span>
+        <span class="hint"><span id="outcome-opportunities-count">0</span> tracked</span>
+      </div>
+      <div class="panel-body" id="outcome-opportunities"><div class="empty-state">No historical opportunity logs yet today.</div></div>
+    </div>
+  </div>
+</section>
+
+<!-- ======================================================================== -->
+<!-- TAB 2: LIVE TOKEN RADAR -->
+<!-- ======================================================================== -->
+<section class="main-tab-view" id="tab-radar">
+  <div class="radar-split">
+    <!-- Left Main Feed (75%) -->
+    <div class="radar-main panel">
+      <div class="panel-header">
+        <span>Live Token Radar</span>
+        <span class="hint"><span id="token-count">0</span> tokens active in pipeline</span>
+      </div>
+
+      <!-- Filter Tabs -->
+      <div class="token-tabs" id="token-tabs">
+        <button class="token-tab active" data-filter="ALL">All <span id="tab-count-ALL">0</span></button>
+        <button class="token-tab" data-filter="WATCHING">Watching <span id="tab-count-WATCHING">0</span></button>
+        <button class="token-tab" data-filter="BONDING" title="Tokens on bonding curve">Bonding <span id="tab-count-BONDING">0</span></button>
+        <button class="token-tab" data-filter="GRADUATED">Graduated <span id="tab-count-GRADUATED">0</span></button>
+        <button class="token-tab" data-filter="RUGGED">Rugged <span id="tab-count-RUGGED">0</span></button>
+        <button class="token-tab" data-filter="SKIPPED">Skipped <span id="tab-count-SKIPPED">0</span></button>
+        <button class="token-tab" data-filter="EXPIRED_WATCH">Expired <span id="tab-count-EXPIRED_WATCH">0</span></button>
+      </div>
+
+      <!-- Token Row Table Header -->
+      <div class="token-table-wrap">
+        <div class="token-row-header">
+          <span>Chain &amp; Age</span>
+          <span>Token</span>
+          <span>Dev Record</span>
+          <span>Liquidity</span>
+          <span>Holders</span>
+          <span>Mcap / Vol</span>
+          <span>Status &amp; AI</span>
+          <span style="text-align:right;">Actions</span>
+        </div>
+        <div class="panel-body" id="token-feed"><div class="empty-state">Connecting to live token streams...</div></div>
+      </div>
+    </div>
+
+    <!-- Right Sidebar (25%): Pump.fun Descriptions & Trending Words -->
+    <div class="radar-side panel">
+      <div class="panel-header">
+        <span>Pump.fun Trending Words</span>
+        <span class="hint"><span id="desc-count">0</span> feeds</span>
+      </div>
+      <div class="trending-words" id="trending-words"></div>
+      <div class="panel-body" id="description-feed"><div class="empty-state">Waiting for Pump.fun coin descriptions...</div></div>
+    </div>
+  </div>
+</section>
+
+<!-- ======================================================================== -->
+<!-- TAB 3: TYPESAFE AI (JEV) -->
+<!-- ======================================================================== -->
+<section class="main-tab-view" id="tab-ai">
+  <div class="jev-container">
+
+    <!-- Executive KPI Ribbon (4 Institutional Cards) -->
+    <div class="jev-kpi-grid">
+      <!-- Card 1: System-One Engine & Quotas -->
+      <div class="jev-kpi-card" id="jev-card-engine">
+        <div class="jev-kpi-header">
+          <span class="jev-kpi-title">🧠 Reasoning Engine</span>
+          <span class="jev-status-badge live" id="jev-kpi-status-badge">● LIVE</span>
+        </div>
+        <div class="jev-kpi-body">
+          <div class="jev-kpi-main-val" id="jev-kpi-calls-today">0 <span class="unit">calls today</span></div>
+          <div class="jev-kpi-stats-list">
+            <div class="jev-kpi-row"><span>Quota:</span> <b id="jev-kpi-quota">0 / 500</b></div>
+            <div class="jev-kpi-row"><span>Tokens Consumed:</span> <b id="jev-kpi-tokens">0</b></div>
+            <div class="jev-kpi-row"><span>API Reliability:</span> <b id="jev-kpi-errors">0 errors</b></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Card 2: Screening Gate Funnel -->
+      <div class="jev-kpi-card" id="jev-card-funnel">
+        <div class="jev-kpi-header">
+          <span class="jev-kpi-title">🎯 Screening Funnel</span>
+          <span class="hint" id="jev-kpi-funnel-hint">≥$20k mcap</span>
+        </div>
+        <div class="jev-kpi-body">
+          <div class="jev-kpi-main-val" id="jev-kpi-funnel-qualify" style="color:var(--green)">0 <span class="unit">evaluating</span></div>
+          <div class="jev-kpi-stats-list">
+            <div class="jev-kpi-row"><span>Live Pipeline:</span> <b id="jev-kpi-funnel-watching">0 tokens</b></div>
+            <div class="jev-kpi-row"><span>Mcap Screen (≥$20k):</span> <b id="jev-kpi-funnel-mcap">0 passed</b></div>
+            <div class="jev-kpi-row"><span>Filtered Noise:</span> <b id="jev-kpi-funnel-skips">0 unready</b></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Card 3: Predictive Alpha & Outcomes -->
+      <div class="jev-kpi-card" id="jev-card-alpha">
+        <div class="jev-kpi-header">
+          <span class="jev-kpi-title">🚀 Predictive Alpha</span>
+          <span class="hint">Graduated vs Rug</span>
+        </div>
+        <div class="jev-kpi-body">
+          <div class="jev-kpi-main-val" id="jev-kpi-best-move" style="color:var(--green)">- <span class="unit">peak multiple</span></div>
+          <div class="jev-kpi-stats-list">
+            <div class="jev-kpi-row"><span>Total Scored:</span> <b id="jev-kpi-scored-total">0 coins</b></div>
+            <div class="jev-kpi-row"><span>Resolved Outcomes:</span> <b id="jev-kpi-outcomes-split">0 moon / 0 rug</b></div>
+            <div class="jev-kpi-row"><span>Pending Tracking:</span> <b id="jev-kpi-pending">0 active</b></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Card 4: Level C Learning & PvP -->
+      <div class="jev-kpi-card" id="jev-card-learning">
+        <div class="jev-kpi-header">
+          <span class="jev-kpi-title">⚖️ Adaptive Calibration</span>
+          <span class="jev-status-badge live" id="jev-kpi-autotune-badge">ACTIVE</span>
+        </div>
+        <div class="jev-kpi-body">
+          <div class="jev-kpi-main-val" id="jev-kpi-pvp-winrate" style="color:var(--accent)">- <span class="unit">PvP win rate</span></div>
+          <div class="jev-kpi-stats-list">
+            <div class="jev-kpi-row"><span>PvP Matches:</span> <b id="jev-kpi-pvp-matches">0 resolved</b></div>
+            <div class="jev-kpi-row"><span>Calibrated Outcomes:</span> <b id="jev-kpi-autotune-labeled">0 labeled</b></div>
+            <div class="jev-kpi-row"><span>Discovery Hypotheses:</span> <b id="jev-kpi-proposals">0 testing</b></div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Jev Sub-Navigation Tabs -->
+    <div class="jev-subnav" id="jev-subnav">
+      <button class="jev-subnav-btn active" data-subtab="jev-view-evals">
+        🔎 Live Evaluations <span class="sub-badge" id="jev-subtab-count-evals">0</span>
+      </button>
+      <button class="jev-subnav-btn" data-subtab="jev-view-pvp">
+        ⚔️ PvP Arena <span class="sub-badge" id="jev-subtab-count-pvp">0</span>
+      </button>
+      <button class="jev-subnav-btn" data-subtab="jev-view-weights">
+        ⚖️ Weights &amp; Correlation
+      </button>
+      <button class="jev-subnav-btn" data-subtab="jev-view-outcomes">
+        📊 Scored Coins Outcomes <span class="sub-badge" id="jev-subtab-count-outcomes">0</span>
+      </button>
+      <button class="jev-subnav-btn" data-subtab="jev-view-proposals">
+        🧪 Hypothesis Discovery <span class="sub-badge" id="jev-subtab-count-proposals">0</span>
+      </button>
+      <button class="jev-subnav-btn" data-subtab="jev-view-audit">
+        📜 Decision Audit Log <span class="sub-badge" id="jev-subtab-count-audit">0</span>
+      </button>
+    </div>
+
+    <!-- SUB-PANEL 1: Live Evaluations -->
+    <div class="jev-sub-panel active" id="jev-view-evals">
+      <div class="panel">
+        <div class="panel-header">
+          <span>🔎 Live Coin Qualitative Evaluations</span>
+          <span class="hint" id="jev-activity-hint">Detailed semantic score breakdown &amp; rationales, newest first</span>
+        </div>
+        <div class="panel-body" id="jev-activity">
+          <div class="empty-state">Scanning live candidates — evaluations appear when tokens clear the candidate gate ($20k+ mcap, score ≥ 20).</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- SUB-PANEL 2: PvP Arena -->
+    <div class="jev-sub-panel" id="jev-view-pvp">
+      <div class="panel">
+        <div class="panel-header">
+          <span>⚔️ PvP Head-to-Head Arena (Cross-Platform Copycat Resolution)</span>
+          <span class="hint" id="jev-pvp-hint">AI compares same-name coins across Pump.fun / Ember / Moonshot</span>
+        </div>
+        <div class="panel-body" id="jev-pvp-feed">
+          <div class="empty-state">No active PvP comparisons right now — triggered when multiple tokens launch with matching names or tickers.</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- SUB-PANEL 3: Learned Weights & Correlation -->
+    <div class="jev-sub-panel" id="jev-view-weights">
+      <div class="panel">
+        <div class="panel-header">
+          <span>⚖️ Level C Auto-Tune Learned Weights</span>
+          <span class="hint">Dynamically upweights signals correlated with graduated winners vs rugs</span>
+        </div>
+        <div class="panel-body" id="jev-weights-content">
+          <div class="empty-state">Loading learned weights calibration...</div>
+        </div>
+      </div>
+      <div class="panel">
+        <div class="panel-header">
+          <span>📈 Empirical Dimension Divergence (Alpha Tracking)</span>
+          <span class="hint">Average scores on tokens that mooned vs tokens that rugged</span>
+        </div>
+        <div class="panel-body" id="jev-corr-content">
+          <div class="empty-state">Loading correlation stats...</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- SUB-PANEL 4: Scored Coins Outcomes -->
+    <div class="jev-sub-panel" id="jev-view-outcomes">
+      <div class="panel">
+        <div class="panel-header">
+          <span>📊 Historical Token Outcomes Evaluated by Jev</span>
+          <span class="hint">Ranked by peak multiple reached from flag price</span>
+        </div>
+        <div class="panel-body" id="jev-outcomes-content">
+          <div class="empty-state">Loading evaluated coin outcomes...</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- SUB-PANEL 5: Hypothesis Discovery Loop -->
+    <div class="jev-sub-panel" id="jev-view-proposals">
+      <div class="panel">
+        <div class="panel-header">
+          <span>🧪 Question-Discovery &amp; Auto-Research Hypotheses</span>
+          <span class="hint" id="jev-proposals-hint">Empirical evaluation of candidate scoring questions</span>
+        </div>
+        <div class="panel-body" id="jev-proposals-content">
+          <div class="empty-state">Loading hypothesis loop...</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- SUB-PANEL 6: Audit Log -->
+    <div class="jev-sub-panel" id="jev-view-audit">
+      <div class="panel">
+        <div class="panel-header">
+          <span>📜 Real-Time Decision &amp; Audit Stream</span>
+          <span class="hint" id="jev-eventlog-hint">Chronological event log of all Jev actions (evaluated, vetoed, skipped, pvp)</span>
+        </div>
+        <div class="panel-body" id="jev-eventlog" style="padding:0;">
+          <div class="empty-state">No Jev events recorded yet.</div>
+        </div>
+      </div>
+    </div>
+
+  </div>
+</section>
+
+<!-- ======================================================================== -->
+<!-- TAB 4: MARKET ALPHA & ALERTS -->
+<!-- ======================================================================== -->
+<section class="main-tab-view" id="tab-market">
+  <!-- Live Alert Feed + Narratives + Smart Money -->
+  <div class="grid-3">
+    <!-- Live Alerts -->
+    <div class="panel">
+      <div class="panel-header">
+        <span>Live Alert Stream</span>
+        <span class="hint"><span id="alert-count">0</span> alerts</span>
+      </div>
+      <div class="token-tabs" id="alert-tabs">
+        <button class="token-tab active" data-filter="IMPORTANT">Important <span id="alert-tab-count-IMPORTANT">0</span></button>
+        <button class="token-tab" data-filter="SKIPPED">Skipped <span id="alert-tab-count-SKIPPED">0</span></button>
+        <button class="token-tab" data-filter="ALL">All <span id="alert-tab-count-ALL">0</span></button>
+      </div>
+      <div class="panel-body" id="alert-feed"><div class="empty-state">No alerts recorded yet.</div></div>
+    </div>
+
+    <!-- Narrative Velocity -->
+    <div class="panel">
+      <div class="panel-header">
+        <span>Cross-Chain Narratives</span>
+        <span class="hint"><span id="narrative-count">0</span> active</span>
+      </div>
+      <div class="panel-body" id="narrative-feed"><div class="empty-state">No emerging narrative clusters detected yet.</div></div>
+    </div>
+
+    <!-- Smart Money Activity -->
+    <div class="panel">
+      <div class="panel-header">
+        <span>Tracked Smart Money</span>
+        <span class="hint"><span id="smartmoney-count">0</span> transactions</span>
+      </div>
+      <div class="panel-body" id="smartmoney-feed"><div class="empty-state">No tracked smart money trades yet.</div></div>
+    </div>
   </div>
 
-  <div class="panel">
-    <div class="panel-header"><span>Smart Money Activity</span><span id="smartmoney-count">0</span></div>
-    <div class="panel-body" id="smartmoney-feed"><div class="empty-state">No tracked-wallet activity yet.</div></div>
+  <!-- Outcomes: Graduations & Rugs -->
+  <div class="grid-2">
+    <div class="panel">
+      <div class="panel-header">
+        <span>🟢 Recent Graduations</span>
+        <span class="hint"><span id="outcome-graduated-count">0</span> graduated</span>
+      </div>
+      <div class="panel-body" id="outcome-graduated"><div class="empty-state">No graduations yet today.</div></div>
+    </div>
+    <div class="panel">
+      <div class="panel-header">
+        <span>🔴 Recent Rugs (Dev Blacklisted)</span>
+        <span class="hint"><span id="outcome-rugged-count">0</span> rugged</span>
+      </div>
+      <div class="panel-body" id="outcome-rugged"><div class="empty-state">No rugs detected yet today.</div></div>
+    </div>
   </div>
-</div>
+
+  <!-- Analytics: Weekly Progress & Hourly Launch Curve -->
+  <div class="grid-2">
+    <div class="panel">
+      <div class="panel-header">
+        <span>📅 Weekly Launch Performance</span>
+        <span class="hint">Daily track record up to 14 days</span>
+      </div>
+      <div class="panel-body" id="weekly-progress"><div class="empty-state">No daily history yet.</div></div>
+    </div>
+    <div class="panel">
+      <div class="panel-header">
+        <span>🕒 Launch Activity by Hour</span>
+        <span class="hint">Peak market deployment volume (UTC)</span>
+      </div>
+      <div class="panel-body" id="hourly-activity"><div class="empty-state">No data yet.</div></div>
+    </div>
+  </div>
+</section>
 
 <script>
 (function () {
@@ -566,6 +1593,9 @@
   const narrativeFeed = document.getElementById("narrative-feed");
   const smartMoneyFeed = document.getElementById("smartmoney-feed");
   const tokenFeed = document.getElementById("token-feed");
+  const descriptionFeed = document.getElementById("description-feed");
+  const trendingWords = document.getElementById("trending-words");
+  const descCount = document.getElementById("desc-count");
   const tickerTape = document.getElementById("ticker-tape");
   const statusEl = document.getElementById("status");
   const statusText = document.getElementById("status-text");
@@ -607,20 +1637,107 @@
     return "$" + n.toFixed(0);
   }
 
-  function holderLineHtml(payload) {
-    if (payload.holder_count === undefined || payload.holder_count === null) return "";
-    const pct = payload.top_holder_pct;
-    const concentrated = pct !== undefined && pct !== null && pct >= 25;
-    const pctText = (pct !== undefined && pct !== null) ? ` &middot; top ${pct.toFixed(0)}%` : "";
-    const xferCount = payload.holder_transfer_count;
-    const washy = xferCount !== undefined && xferCount !== null && payload.holder_count < 5 && xferCount >= 20;
-    const xferText = (xferCount !== undefined && xferCount !== null) ? ` &middot; ${xferCount} transfers` : "";
-    const sellText = payload.top_holder_selling ? ` &middot; ⚠ top holder selling` : "";
-    return `<span class="token-holders${(concentrated || washy || payload.top_holder_selling) ? " concentrated" : ""}" title="top 10 holders own ${(payload.top10_holder_pct || 0).toFixed(0)}% of supply">${payload.holder_count} holders${pctText}${xferText}${sellText}</span>`;
+  function liquidityHtml(payload) {
+    const liq = payload.liquidity_usd;
+    const sol = payload.bonding_sol_raised;
+    const pct = payload.bonding_progress_pct;
+    if (liq !== undefined && liq !== null && liq > 0) {
+      return `<span class="token-liq" title="Pool Liquidity: $${Math.round(liq).toLocaleString()}">💧 ${fmtUsd(liq)} liq</span>`;
+    }
+    if (sol !== undefined && sol !== null && sol > 0) {
+      const pctStr = (pct !== undefined && pct !== null) ? ` (${pct.toFixed(0)}%)` : "";
+      return `<span class="token-liq curve" title="Bonding Curve SOL: ${sol.toFixed(1)} SOL">💧 ${sol.toFixed(1)} SOL${pctStr}</span>`;
+    }
+    return `<span class="token-liq text-dim" title="Liquidity indexing in progress">💧 --</span>`;
   }
 
-  function tokenImageHtml(payload, size) {
-    if (!payload.image_url) return `<span class="token-img-placeholder" style="width:${size}px;height:${size}px"></span>`;
+  function holderLineHtml(payload) {
+    if (payload.holder_count === undefined || payload.holder_count === null) {
+      return `<span class="token-holders text-dim" title="Holder scan in progress">👥 scanning...</span>`;
+    }
+    const pct = payload.top_holder_pct;
+    const concentrated = pct !== undefined && pct !== null && pct >= 25;
+    const pctText = (pct !== undefined && pct !== null) ? ` · top ${pct.toFixed(0)}%` : "";
+    const xferCount = payload.holder_transfer_count;
+    const washy = xferCount !== undefined && xferCount !== null && payload.holder_count < 5 && xferCount >= 20;
+    const xferText = (xferCount !== undefined && xferCount !== null) ? ` · ${xferCount} xfers` : "";
+    const sellText = payload.top_holder_selling ? ` ⚠️ sell` : "";
+    const subText = (payload.substantial_holders_1k !== undefined && payload.substantial_holders_1k !== null)
+      ? ` · 💵 ${payload.substantial_holders_1k} ≥$1k`
+      : "";
+    return `<span class="token-holders${(concentrated || washy || payload.top_holder_selling) ? " concentrated" : ""}" title="Top 10 holders own ${(payload.top10_holder_pct || 0).toFixed(0)}% of supply">👥 ${payload.holder_count}${pctText}${xferText}${sellText}${subText}</span>`;
+  }
+
+  // --- Jev (TypeSafe semantic reasoner) per-token display -------------------
+  function jevDimLabel(id) {
+    return {
+      moon_potential: "🚀 moon potential",
+      narrative_quality: "quality",
+      narrative_durability: "durability",
+      legitimacy: "legit",
+      impersonation_risk: "impersonation",
+      trap_risk: "trap risk",
+    }[id] || id;
+  }
+  // A compact badge next to the dev badge: shows Jev has judged this token and
+  // whether it flagged impersonation.
+  function jevBadgeHtml(payload) {
+    const jev = payload.jev;
+    if (!jev || !jev.dimensions) return "";
+    const dims = jev.dimensions;
+    const imp = dims.impersonation_risk && dims.impersonation_risk.noul;
+    const flagged = imp !== undefined && imp !== null && imp >= 0.8;
+    const cls = flagged ? "status-RUGGED" : "dev-PASS";
+    const label = flagged ? "JEV ⚠ IMPERSONATION" : "JEV";
+    // build a rich tooltip of every dimension
+    const parts = [];
+    for (const [id, d] of Object.entries(dims)) {
+      if (d.type === "score" && d.score !== undefined && d.score !== null) {
+        const n = (d.n_levels || Object.keys(d.legend || {}).length || 1) - 1;
+        const conf = (d.confidence !== undefined && d.confidence !== null) ? ` conf ${(d.confidence * 100).toFixed(0)}%` : "";
+        parts.push(`${jevDimLabel(id)}: ${d.score.toFixed(1)}/${n}${conf}`);
+      } else if (d.type === "noul" && d.noul !== undefined && d.noul !== null) {
+        parts.push(`${jevDimLabel(id)}: ${(d.noul * 100).toFixed(0)}%`);
+      }
+    }
+    return `<span class="badge jev-badge ${cls}" title="Jev (${jev.model || "?"}) — ${parts.join("\n")}">${label}</span>`;
+  }
+  // A full reasoning line (mini score bars) shown under the status cell.
+  function jevLineHtml(payload) {
+    const jev = payload.jev;
+    if (!jev || !jev.dimensions) return "";
+    const dims = jev.dimensions;
+    const chips = [];
+    for (const [id, d] of Object.entries(dims)) {
+      let frac = null, txt = "";
+      if (d.type === "score" && d.score !== undefined && d.score !== null) {
+        const n = (d.n_levels || Object.keys(d.legend || {}).length || 1) - 1;
+        frac = n > 0 ? d.score / n : 0;
+        txt = `${jevDimLabel(id)} ${d.score.toFixed(1)}/${n}`;
+      } else if (d.type === "noul" && d.noul !== undefined && d.noul !== null) {
+        frac = d.noul;
+        txt = `${jevDimLabel(id)} ${(d.noul * 100).toFixed(0)}%`;
+      }
+      if (frac === null) continue;
+      // impersonation is "bad when high" — color it red as it rises; others green
+      const bad = (id === "impersonation_risk");
+      const hue = bad ? (120 - frac * 120) : (frac * 120); // 0=red,120=green
+      chips.push(`<span class="jev-chip" title="${txt}"><span class="jev-chip-label">${jevDimLabel(id)}</span><span class="jev-bar"><span class="jev-bar-fill" style="width:${(frac*100).toFixed(0)}%;background:hsl(${hue},70%,45%)"></span></span></span>`);
+    }
+    if (!chips.length) return "";
+    return `<span class="jev-line" title="TypeSafe Jev semantic judgment (${jev.model || "?"})">🧠 ${chips.join("")}</span>`;
+  }
+
+  function jevPvpBadgeHtml(payload) {
+    const p = payload.jev_pvp;
+    if (!p || !p.cohort_size || p.cohort_size < 2) return "";
+    if (p.is_pick) {
+      return `<span class="badge jev-pvp-pick" title="Jev PvP: best pick of ${p.cohort_size} same-name coins across platforms (conf ${((p.confidence||0)*100).toFixed(0)}%)">🏆 PvP PICK</span>`;
+    }
+    return `<span class="badge jev-pvp-lose" title="Jev PvP: NOT the pick — ${p.picked_platform||'another platform'} coin favored for this name (${p.cohort_size} in cohort)">PvP: not pick</span>`;
+  }
+
+  function tokenImageHtml(payload, size) {    if (!payload.image_url) return `<span class="token-img-placeholder" style="width:${size}px;height:${size}px"></span>`;
     return `<img class="token-img" src="${payload.image_url}" width="${size}" height="${size}" loading="lazy" onerror="this.style.visibility='hidden'" alt="">`;
   }
 
@@ -687,16 +1804,21 @@
   }
 
   function devBadge(payload) {
-    // Never show a bare wallet address as the headline — what matters is
-    // whether this dev has rugged or graduated something before.
-    if (payload.dev_alias === "shared infra (not a person)") return "infra (not a person)";
+    if (payload.dev_alias === "shared infra (not a person)") return '<span class="dev-rep infra">🏢 Infra</span>';
+    const total = payload.dev_total_launches || 1;
     const moons = payload.dev_moons || 0;
     const rugs = payload.dev_rugs || 0;
-    const bits = [];
-    if (moons > 0) bits.push(`\u{1F680}${moons}`);
-    if (rugs > 0) bits.push(`\u{1F480}${rugs}`);
-    if (!bits.length) return "new dev, no history";
-    return bits.join(" ");
+    const isBl = payload.dev_blacklisted;
+    if (rugs > 0 || isBl) {
+      return `<span class="dev-rep bad" title="Dev track record: ${total} launched, ${rugs} rugged — DISCARDED">💀 Rugger (${rugs} rug${rugs > 1 ? 's' : ''}${moons > 0 ? ', ' + moons + ' 🚀' : ''})</span>`;
+    }
+    if (total > 1) {
+      return `<span class="dev-rep bad" title="Dev track record: ${total} launches (repeat dev) — DISCARDED">⚠️ Multi-Dev (${total} launches)</span>`;
+    }
+    if (moons > 0) {
+      return `<span class="dev-rep good" title="Dev track record: 1st launch, ${moons} graduated">🚀 1st launch (${moons} moon)</span>`;
+    }
+    return `<span class="dev-rep good" title="First launch seen from this dev wallet (clean)">✨ 1st launch (Clean)</span>`;
   }
 
   function launchChipsHtml(launches) {
@@ -868,17 +1990,56 @@
     return "";
   }
 
+  function goPlusBadgeHtml(p) {
+    const gp = (p && p.goplus) ? p.goplus : ((p && p.summary && (p.checked_at || p.ts)) ? p : null);
+    if (gp) {
+      if (gp.is_honeypot || gp.sell_whitelist) {
+        const txt = descEscape(gp.reason || "Honeypot / Sell Whitelist");
+        return `<span class="badge" style="background:rgba(244,63,94,0.18); color:var(--red); font-weight:700; border:1px solid rgba(244,63,94,0.4);" title="${txt}">🚨 Honeypot</span>`;
+      }
+      if (gp.freezable || gp.mintable) {
+        const txt = descEscape(gp.reason || (gp.freezable ? "Freezable" : "Mintable"));
+        return `<span class="badge" style="background:rgba(245,158,11,0.18); color:var(--yellow); font-weight:700; border:1px solid rgba(245,158,11,0.4);" title="${txt}">⚠️ ${txt}</span>`;
+      }
+      const buyTax = Number(gp.buy_tax || 0);
+      const sellTax = Number(gp.sell_tax || 0);
+      if (buyTax > 0 || sellTax > 0) {
+        return `<span class="badge" style="background:rgba(59,130,246,0.15); color:var(--accent); font-weight:600; border:1px solid rgba(59,130,246,0.35);" title="Buy Tax: ${buyTax}% | Sell Tax: ${sellTax}%">💸 Buy ${buyTax}% / Sell ${sellTax}% Tax</span>`;
+      }
+      return `<span class="badge" style="background:rgba(34,197,94,0.15); color:var(--green); font-weight:600; border:1px solid rgba(34,197,94,0.35);" title="GoPlus: Clean (0% Tax, Renounced, No Transfer Hook)">🛡️ Clean · 0% Tax</span>`;
+    }
+    if (p && p.freeze_authority_active === false) {
+      return `<span class="badge" style="background:rgba(34,197,94,0.1); color:var(--text-dim); border:1px solid rgba(34,197,94,0.2);" title="Freeze authority renounced">🛡️ Freeze Renounced</span>`;
+    }
+    return `<span class="badge" style="background:rgba(148,163,184,0.1); color:var(--text-dim);" title="GoPlus Security: Clean/Pending">🛡️ Safe</span>`;
+  }
+
   function opportunityHistoryCardHtml(alert) {
     const href = (alert.links && alert.links.dexscreener) || (alert.links && alert.links.explorer) || "#";
     const label = (alert.ticker && alert.ticker !== "UNKNOWN") ? `$${alert.ticker}` : "unresolved";
     const reasons = (alert.score_reasons || []).join(" &middot; ") || "baseline score";
     const badge = opportunityStatusBadgeHtml(alert.current_status);
+    const secBadge = goPlusBadgeHtml(alert);
+    const ca = alert.token_address || "";
+    const caShort = ca.length > 12 ? (ca.slice(0, 6) + "..." + ca.slice(-4)) : ca;
+    const caRow = ca ? `<div class="meta" style="font-family:monospace;font-size:10px;display:flex;align-items:center;gap:6px;margin:2px 0;"><span>CA:</span> <code style="background:rgba(255,255,255,0.06);padding:1px 5px;border-radius:3px;cursor:pointer;color:var(--text-bright);" onclick="navigator.clipboard.writeText('${ca}');this.textContent='Copied!';setTimeout(()=>this.textContent='${caShort}',1000);event.preventDefault();" title="Click to copy full CA: ${ca}">${caShort} 📋</code></div>` : "";
+    const fomoUrl = (alert.links && alert.links.fomo) || (ca ? `https://fomo.family/tokens/${alert.chain || 'solana'}/${ca}` : "");
+    const stonkUrl = (alert.links && alert.links.stonkboard) || (alert.is_stonkboard && ca ? `https://thestonkboard.com/coin/${ca}` : "");
     return `<a href="${href}" target="_blank" rel="noopener" style="text-decoration:none;color:inherit;">
-        <div class="title">${chainTag(alert.chain)} ${label} <span class="opp-score ${scoreClass(alert.opportunity_score)}">${alert.opportunity_score}</span>${badge}</div>
+        <div class="title">${chainTag(alert.chain)} ${label} <span class="opp-score ${scoreClass(alert.opportunity_score)}">${alert.opportunity_score}</span>${badge} ${secBadge}</div>
+        ${caRow}
         <div class="meta">${fmtUsd(alert.market_cap_usd)} mcap &middot; vol ${fmtUsd(alert.volume_24h_usd)} &middot; ${fmtTime(alert.timestamp)}</div>
-        <div class="meta">Why: ${reasons}</div>
+        <div class="meta" style="margin-top:4px;display:flex;gap:8px;font-size:11px;flex-wrap:wrap;align-items:center;">
+          ${fomoUrl ? `<span style="color:#c084fc;font-weight:700;cursor:pointer;" onclick="window.open('${fomoUrl}','_blank','noopener');event.preventDefault();event.stopPropagation();">🦄 FOMO.family &rarr;</span>` : ""}
+          <span style="color:var(--accent);cursor:pointer;" onclick="window.open('${href}','_blank','noopener');event.preventDefault();event.stopPropagation();">📊 DexScreener</span>
+          ${stonkUrl ? `<span style="color:#38bdf8;font-weight:700;cursor:pointer;" onclick="window.open('${stonkUrl}','_blank','noopener');event.preventDefault();event.stopPropagation();">📈 StonkBoard &rarr;</span>` : ""}
+          ${(alert.socials && alert.socials.twitter) ? `<span style="color:#38bdf8;font-weight:600;cursor:pointer;" onclick="window.open('${alert.socials.twitter}','_blank','noopener');event.preventDefault();event.stopPropagation();">🐦 X</span>` : ""}
+          ${(alert.socials && alert.socials.telegram) ? `<span style="color:#22d3ee;font-weight:600;cursor:pointer;" onclick="window.open('${alert.socials.telegram}','_blank','noopener');event.preventDefault();event.stopPropagation();">✈️ TG</span>` : ""}
+          ${(alert.socials && alert.socials.website) ? `<span style="color:#34d399;font-weight:600;cursor:pointer;" onclick="window.open('${alert.socials.website}','_blank','noopener');event.preventDefault();event.stopPropagation();">🌐 Web</span>` : ""}
+        </div>
       </a>`;
   }
+
 
   function renderOpportunityHistory(alert) {
     const container = document.getElementById("outcome-opportunities");
@@ -1070,12 +2231,18 @@
     const links = payload.links || {};
     const parts = [];
     if (links.dexscreener) {
-      parts.push(`<a class="action-btn" href="${links.dexscreener}" target="_blank" rel="noopener" title="Chart on DexScreener">\u{1F4C8}</a>`);
+      parts.push(`<a class="action-btn" href="${links.dexscreener}" target="_blank" rel="noopener" title="DexScreener">📊</a>`);
+    }
+    if (links.pumpfun) {
+      parts.push(`<a class="action-btn" href="${links.pumpfun}" target="_blank" rel="noopener" title="Pump.fun">💊</a>`);
+    }
+    if (links.birdeye) {
+      parts.push(`<a class="action-btn" href="${links.birdeye}" target="_blank" rel="noopener" title="Birdeye">🦅</a>`);
     }
     if (links.explorer) {
-      parts.push(`<a class="action-btn" href="${links.explorer}" target="_blank" rel="noopener" title="View on chain explorer">\u{1F50D}</a>`);
+      parts.push(`<a class="action-btn" href="${links.explorer}" target="_blank" rel="noopener" title="Explorer">🔍</a>`);
     }
-    parts.push(`<button type="button" class="action-btn" title="Copy contract address" data-addr="${payload.token_address}" onclick="copyTokenAddress(this)">\u{1F4CB}</button>`);
+    parts.push(`<button type="button" class="action-btn" title="Copy CA" data-addr="${payload.token_address}" onclick="copyTokenAddress(this)">📋</button>`);
     return parts.join("");
   }
 
@@ -1126,45 +2293,61 @@
       ? whySignals(payload.signals)
       : (payload.signals && payload.signals.length ? whySignals(payload.signals) : "");
 
+    const isInfra = (payload.dev_wallet || '').toLowerCase().includes('multicall') || (payload.dev_alias && payload.dev_alias.includes('shared'));
+    const isMultiDev = !isInfra && ((payload.dev_total_launches || 0) > 1);
+    const buys = payload.buys_24h || 0;
+    const sells = payload.sells_24h || 0;
+    const isHoneypot = payload.freeze_authority_active || (buys >= 4 && sells === 0) || (buys >= 15 && sells <= 1);
+
     row.innerHTML = `
-      ${chainTag(payload.chain)}
-      <span class="token-identity" style="display:flex;align-items:center;gap:6px;">
-        ${tokenImageHtml(payload, 20)}
-        <span style="overflow:hidden;">
+      <div class="cell-chain-age">
+        ${chainTag(payload.chain)}
+        <span class="token-age">${age}</span>
+      </div>
+      <div class="token-identity">
+        <span class="token-img-wrap">${tokenImageHtml(payload, 22)}</span>
+        <div class="token-name-col">
           <span class="token-ticker" title="${payload.token_address}">$${ticker}</span>
           <span class="token-platform">${payload.platform || "-"}</span>
-        </span>
-      </span>
-      <span class="badge dev-${devDecision}" title="dev: ${payload.dev_wallet}\ntrack record: ${devBadge(payload)}">${devDecision}</span>
-      ${payload.bundle_detected ? (() => {
-        // Plain bundling at launch is common practice, not inherently bad —
-        // only color/word it as a warning once there's an actual track
-        // record (repeat operator, worse if linked to a confirmed rug).
-        const cls = payload.bundle_known_bad_operator ? "status-RUGGED" : (payload.bundle_repeat_operator ? "status-RUGGED" : "dev-PASS");
-        const label = payload.bundle_known_bad_operator ? "REPEAT BUNDLER" : (payload.bundle_repeat_operator ? "BUNDLE (REPEAT)" : "BUNDLE");
-        const note = payload.bundle_known_bad_operator
-          ? " — this operator is linked to a confirmed rug elsewhere"
-          : payload.bundle_repeat_operator
-            ? " — same operator bundled another launch too (not necessarily bad)"
-            : " — common at launch, not inherently a red flag";
-        return `<span class="badge ${cls}" title="${payload.bundle_wallet_count || 0} wallets, ${(payload.bundle_supply_pct || 0).toFixed(0)}% of supply, one operator${note}">\u{1F3AD} ${label}</span>`;
-      })() : ""}
-      <span class="token-mcap-cell">
-        <span class="mcap-stack">
+        </div>
+      </div>
+      <div class="dev-cell">
+        <div style="display:flex;align-items:center;gap:4px;flex-wrap:wrap;">
+          <span class="badge dev-${devDecision}" title="dev: ${payload.dev_wallet}">${devDecision}</span>
+          ${payload.bundle_detected ? `<span class="badge ${payload.bundle_known_bad_operator ? 'status-RUGGED' : 'dev-PASS'}" title="Bundled: ${payload.bundle_wallet_count||0} wallets, ${(payload.bundle_supply_pct||0).toFixed(0)}% supply">🎭 BUNDLE</span>` : ''}
+          ${isHoneypot ? `<span class="badge status-RUGGED" title="Honeypot chart: 0 sells or freeze authority active — DISCARDED">🍯 HONEYPOT</span>` : ''}
+          ${isMultiDev ? `<span class="badge status-SKIPPED" title="Discarded: Dev has launched multiple tokens (${payload.dev_total_launches})">⚠️ MULTI-DEV</span>` : ''}
+        </div>
+        ${devBadge(payload)}
+      </div>
+      <div class="cell-liq">
+        ${liquidityHtml(payload)}
+      </div>
+      <div class="cell-holders">
+        ${holderLineHtml(payload)}
+      </div>
+      <div class="token-mcap-cell">
+        <div class="mcap-stack">
           <span class="token-mcap">${fmtUsd(payload.market_cap)}</span>
           <span class="token-volume" title="24h volume, buys/sells">vol ${fmtUsd(payload.volume_24h)} ${(payload.buys_24h || payload.sells_24h) ? `(${payload.buys_24h || 0}↑${payload.sells_24h || 0}↓)` : ""}</span>
-          ${holderLineHtml(payload)}
-        </span>
+        </div>
         <span class="token-spark">${sparklineSvg(payload.sparkline)}</span>
-      </span>
-      <span class="status-cell">
-        <span class="badge status-${status}">${status.replace("_", " ")}</span>
+      </div>
+      <div class="status-cell">
+        <div style="display:flex;align-items:center;gap:4px;">
+          <span class="badge status-${status}">${status.replace("_", " ")}</span>
+          ${jevBadgeHtml(payload)}
+          ${jevPvpBadgeHtml(payload)}
+        </div>
         ${bondingBarHtml(payload)}
-        ${whyText ? `<span class="why-line" title="${whyText}">${whyText}</span>` : ""}
-      </span>
-      <span class="token-age">${age}</span>
-      <span class="token-actions">${tokenActionsHtml(payload)}</span>
+        ${whyText ? `<span class="why-line" title="${whyText}" style="font-size:9px;color:var(--text-dim);">${whyText}</span>` : ""}
+      </div>
+      <div class="token-actions">
+        ${tokenActionsHtml(payload)}
+      </div>
     `;
+    const bRadar = document.getElementById("badge-radar");
+    if (bRadar) bRadar.textContent = tokenRows.size;
   }
 
   function renderStats(payload) {
@@ -1310,50 +2493,504 @@
     `;
   }
 
+  function renderJevStats(stats) {
+    if (!stats) return;
+    const u = stats.usage || {};
+    const caps = stats.caps || {};
+    const corr = stats.correlation || {};
+    const dims = corr.per_dimension || {};
+    const at = stats.autotune || {};
+    const pl = stats.pvp_learning || {};
+    const g = stats.gate_funnel || {};
+    const props = stats.proposals || [];
+    const qs = stats.questions || [];
+    const ec = stats.evaluated_coins || [];
+
+    // Executive Card 1: Engine Status & Quota
+    const statusBadge = document.getElementById("jev-kpi-status-badge");
+    if (statusBadge) {
+      statusBadge.textContent = stats.enabled ? (stats.can_call ? "● LIVE" : "● PAUSED") : "○ OFF";
+      statusBadge.className = "jev-status-badge " + (stats.enabled ? (stats.can_call ? "live" : "paused") : "paused");
+    }
+    const callsTodayEl = document.getElementById("jev-kpi-calls-today");
+    if (callsTodayEl) callsTodayEl.innerHTML = `${u.calls_today || 0} <span class="unit">calls today</span>`;
+    const quotaEl = document.getElementById("jev-kpi-quota");
+    if (quotaEl) quotaEl.textContent = `${u.calls_today || 0} / ${caps.per_day || 500} (${u.calls_total || 0} lifetime)`;
+    const tokensEl = document.getElementById("jev-kpi-tokens");
+    if (tokensEl) tokensEl.textContent = `${((u.input_tokens_total || 0) + (u.output_tokens_total || 0)).toLocaleString()}`;
+    const errorsEl = document.getElementById("jev-kpi-errors");
+    if (errorsEl) errorsEl.textContent = `${u.errors || 0} errors`;
+
+    // Executive Card 2: Screening Gate Funnel
+    const funnelQualifyEl = document.getElementById("jev-kpi-funnel-qualify");
+    if (funnelQualifyEl) funnelQualifyEl.innerHTML = `${g.qualifies_for_jev || 0} <span class="unit">evaluating</span>`;
+    const funnelWatchingEl = document.getElementById("jev-kpi-funnel-watching");
+    if (funnelWatchingEl) funnelWatchingEl.textContent = `${g.watching || 0} tokens`;
+    const funnelMcapEl = document.getElementById("jev-kpi-funnel-mcap");
+    if (funnelMcapEl) funnelMcapEl.textContent = `${g.over_mcap_gate || 0} passed (≥$${Math.round(g.mcap_gate || 20000).toLocaleString()})`;
+    const funnelSkipsEl = document.getElementById("jev-kpi-funnel-skips");
+    if (funnelSkipsEl) funnelSkipsEl.textContent = `${(g.skipped_not_ready_total || 0).toLocaleString()} unready`;
+
+    // Executive Card 3: Predictive Alpha & Outcomes
+    const bestMoveEl = document.getElementById("jev-kpi-best-move");
+    if (bestMoveEl) bestMoveEl.innerHTML = `${corr.best_multiple ? corr.best_multiple.toFixed(1) + 'x' : '-'} <span class="unit">peak multiple</span>`;
+    const scoredTotalEl = document.getElementById("jev-kpi-scored-total");
+    if (scoredTotalEl) scoredTotalEl.textContent = `${corr.judgments_total || ec.length || 0} coins`;
+    const outcomesSplitEl = document.getElementById("jev-kpi-outcomes-split");
+    if (outcomesSplitEl) outcomesSplitEl.textContent = `${corr.winners || 0} 🚀 / ${corr.losers || 0} 💀 / ${corr.flat || 0} 😐`;
+    const pendingEl = document.getElementById("jev-kpi-pending");
+    if (pendingEl) pendingEl.textContent = `${Math.max(0, (corr.judgments_total || 0) - (corr.labeled || 0))} active`;
+
+    // Executive Card 4: Learning Loops & PvP
+    const autotuneBadge = document.getElementById("jev-kpi-autotune-badge");
+    if (autotuneBadge) {
+      autotuneBadge.textContent = at.active ? "ACTIVE" : "CALIBRATING";
+      autotuneBadge.className = "jev-status-badge " + (at.active ? "live" : "paused");
+    }
+    const pvpWinrateEl = document.getElementById("jev-kpi-pvp-winrate");
+    if (pvpWinrateEl) {
+      const hrStr = (pl.hit_rate !== null && pl.hit_rate !== undefined) ? (pl.hit_rate * 100).toFixed(0) + '%' : '-';
+      pvpWinrateEl.innerHTML = `${hrStr} <span class="unit">PvP win rate</span>`;
+    }
+    const pvpMatchesEl = document.getElementById("jev-kpi-pvp-matches");
+    if (pvpMatchesEl) pvpMatchesEl.textContent = `${pl.resolved || 0} of ${pl.picks_total || 0}`;
+    const autotuneLabeledEl = document.getElementById("jev-kpi-autotune-labeled");
+    if (autotuneLabeledEl) autotuneLabeledEl.textContent = `${at.labeled || 0} labeled (${at.winners || 0} moons)`;
+    const proposalsEl = document.getElementById("jev-kpi-proposals");
+    if (proposalsEl) proposalsEl.textContent = `${props.length || 0} hypotheses`;
+
+    // Global Nav Badge
+    const badgeAi = document.getElementById("badge-ai");
+    if (badgeAi) badgeAi.textContent = corr.judgments_total || ec.length || 0;
+
+    // Sub-Tab Badges
+    const subtabOutcomes = document.getElementById("jev-subtab-count-outcomes");
+    if (subtabOutcomes) subtabOutcomes.textContent = ec.length;
+    const subtabProposals = document.getElementById("jev-subtab-count-proposals");
+    if (subtabProposals) subtabProposals.textContent = props.length;
+    const subtabAudit = document.getElementById("jev-subtab-count-audit");
+    if (subtabAudit && stats.recent_events) subtabAudit.textContent = stats.recent_events.length;
+
+    // Sub-Panel 3: Learned Weights Table
+    const weightsContainer = document.getElementById("jev-weights-content");
+    if (weightsContainer) {
+      if (!at.active) {
+        weightsContainer.innerHTML = `<div class="empty-state">Auto-tune calibration in progress — ${at.reason || 'accumulating labeled outcomes'}. Base weights active.</div>`;
+      } else {
+        const lw = at.learned_weights || {};
+        const weightRows = Object.entries(lw).map(([k, v]) => {
+          const cls = v > 1.05 ? 'jev-edge-good' : (v < 0.95 ? 'jev-edge-bad' : '');
+          const arrow = v > 1.05 ? '↑' : (v < 0.95 ? '↓' : '=');
+          const effect = v > 1.05 ? 'upweighted (predicts moon breakouts)' : (v < 0.95 ? 'downweighted (weak / noisy signal)' : 'baseline / unchanged');
+          return `<tr class="${cls}"><td><b>${k.replace(/_/g, ' ')}</b></td><td style="font-family:monospace;font-weight:700;">×${v}</td><td>${arrow} ${effect}</td></tr>`;
+        }).join("");
+        weightsContainer.innerHTML = `
+          <div class="jev-table-wrap">
+            <table class="jev-table">
+              <thead><tr><th>Dimension</th><th>Learned Multiplier</th><th>Empirical Calibration Effect</th></tr></thead>
+              <tbody>${weightRows}</tbody>
+            </table>
+          </div>
+          <div class="meta" style="margin-top:8px;color:var(--text-dim);font-size:10px;">Calibrated live from ${at.labeled} verified coin outcomes (${at.winners} graduated moons). Applied dynamically to opportunity scores.</div>
+        `;
+      }
+    }
+
+    // Sub-Panel 3: Correlation Divergence Table
+    const corrContainer = document.getElementById("jev-corr-content");
+    if (corrContainer) {
+      if (!corr.labeled) {
+        corrContainer.innerHTML = `<div class="empty-state">No labeled outcomes yet — statistics will populate as tokens graduate or rug.</div>`;
+      } else {
+        const dimLabel = { moon_potential: "🚀 moon potential", narrative_quality: "narrative quality", narrative_durability: "durability", legitimacy: "legitimacy", impersonation_risk: "impersonation risk", trap_risk: "trap risk" };
+        let corrRows = "";
+        for (const [id, d] of Object.entries(dims)) {
+          const w = (d.winner_avg !== null && d.winner_avg !== undefined) ? d.winner_avg.toFixed(2) : "–";
+          const l = (d.loser_avg !== null && d.loser_avg !== undefined) ? d.loser_avg.toFixed(2) : "–";
+          const o = (d.overall_avg !== null && d.overall_avg !== undefined) ? d.overall_avg.toFixed(2) : "–";
+          let edge = "";
+          if (d.winner_avg !== null && d.loser_avg !== null && typeof d.winner_avg === "number" && typeof d.loser_avg === "number") {
+            const diff = d.winner_avg - d.loser_avg;
+            if (Math.abs(diff) >= 0.1) edge = diff > 0 ? "jev-edge-good" : "jev-edge-bad";
+          }
+          corrRows += `<tr class="${edge}"><td><b>${dimLabel[id] || id.replace(/_/g, ' ')}</b></td><td>${w}</td><td>${l}</td><td>${o}</td></tr>`;
+        }
+        corrContainer.innerHTML = `
+          <div class="jev-table-wrap">
+            <table class="jev-table">
+              <thead><tr><th>Dimension</th><th>Mooned Avg</th><th>Rugged Avg</th><th>Overall Avg</th></tr></thead>
+              <tbody>${corrRows}</tbody>
+            </table>
+          </div>
+        `;
+      }
+    }
+
+    // Sub-Panel 4: Evaluated Coins Outcomes
+    const outcomesContainer = document.getElementById("jev-outcomes-content");
+    if (outcomesContainer) {
+      if (!ec.length) {
+        outcomesContainer.innerHTML = `<div class="empty-state">No evaluated coins recorded yet.</div>`;
+      } else {
+        const ocBadge = { mooned: ['🚀 MOONED', 'jev-oc-moon'], rugged: ['💀 RUGGED', 'jev-oc-rug'], dying: ['📉 DYING', 'jev-oc-dying'], flat: ['😐 FADED', 'jev-oc-flat'], tracking: ['⏳ TRACKING', 'jev-oc-pending'] };
+        const rows = ec.map(c => {
+          const [lbl, cls] = ocBadge[c.outcome] || ['·', ''];
+          const mult = (c.peak_multiple || 1).toFixed(1) + 'x';
+          const multStyle = c.peak_multiple >= 3 ? 'color:var(--green);font-weight:800;' : (c.peak_multiple >= 1.5 ? 'color:var(--accent);font-weight:700;' : 'color:var(--text);');
+          const held = c.tier_sustained > 0 ? ` <span style="font-size:10px;color:var(--text-dim);">(held ${c.tier_sustained}x)</span>` : '';
+          const link = c.token_address ? `https://dexscreener.com/${c.chain === 'bnb' ? 'bsc' : 'solana'}/${c.token_address}` : '#';
+          return `<tr>
+            <td><a href="${link}" target="_blank" rel="noopener" style="font-weight:700;color:var(--accent);">$${c.ticker || '?'}</a></td>
+            <td style="${multStyle}">${mult}${held}</td>
+            <td><span class="jev-oc ${cls}">${lbl}</span></td>
+            <td style="font-family:monospace;color:var(--text-dim);">$${Math.round(c.flag_mcap || 0).toLocaleString()} → $${Math.round(c.peak_mcap || 0).toLocaleString()}</td>
+          </tr>`;
+        }).join("");
+        outcomesContainer.innerHTML = `
+          <div class="jev-table-wrap">
+            <table class="jev-table">
+              <thead><tr><th>Coin</th><th>Peak Move</th><th>Outcome</th><th>Flag → Peak Mcap</th></tr></thead>
+              <tbody>${rows}</tbody>
+            </table>
+          </div>
+        `;
+      }
+    }
+
+    // Sub-Panel 5: Hypothesis Discovery Loop
+    const proposalsContainer = document.getElementById("jev-proposals-content");
+    if (proposalsContainer) {
+      const auto = stats.proposer_llm;
+      const qRows = qs.map(q => {
+        const crit = Array.isArray(q.criteria) ? q.criteria.join(" · ") : (q.criteria ? Object.entries(q.criteria).map(([k, v]) => `${k}: ${v}`).join(" · ") : "");
+        const tag = q.source === "proposed" ? `<span class="jev-q-tag">PROPOSED</span>` : "";
+        return `<details class="jev-q"><summary><b>${q.id}</b> <span style="color:var(--accent);font-size:10px;">${q.type}</span> ${tag}</summary><div class="jev-q-body"><div>${descEscape(q.instructions || "")}</div><div class="jev-q-crit">${descEscape(crit)}</div></div></details>`;
+      }).join("");
+
+      let pBody = "";
+      if (!props.length) {
+        pBody = `<div class="empty-state">No candidate questions being tested. ${auto ? "Autonomous proposer is enabled — new ones generate automatically." : ""}</div>`;
+      } else {
+        const propRows = props.map(p => `<tr>
+          <td title="${descEscape(p.instructions || '')}"><b>${descEscape(p.id)}</b></td>
+          <td><span class="badge ${p.status === 'testing' ? 'status-WATCHING' : ''}">${p.status}</span></td>
+          <td>${p.labeled}</td>
+          <td style="font-weight:700;">${p.separation !== null && p.separation !== undefined ? p.separation.toFixed(3) : '–'}</td>
+        </tr>`).join("");
+        pBody = `<div class="jev-table-wrap"><table class="jev-table"><thead><tr><th>Hypothesis Dimension</th><th>Status</th><th>Labeled</th><th>Separation Score</th></tr></thead><tbody>${propRows}</tbody></table></div>`;
+      }
+
+      proposalsContainer.innerHTML = `
+        <div class="grid-2">
+          <div>
+            <div style="font-weight:700;font-size:11px;margin-bottom:8px;color:var(--text-dim);text-transform:uppercase;">Active Scored Dimensions (${qs.length})</div>
+            ${qRows || '<div class="empty-state">No dimensions configured.</div>'}
+          </div>
+          <div>
+            <div style="font-weight:700;font-size:11px;margin-bottom:8px;color:var(--text-dim);text-transform:uppercase;">Empirical Discovery Loop (${props.length} testing)</div>
+            ${pBody}
+          </div>
+        </div>
+      `;
+    }
+
+    // Populate recent judgments & events if present in snapshot/API
+    if (stats.recent_judgments) renderJevActivity(stats.recent_judgments);
+    if (stats.recent_events) renderJevEvents(stats.recent_events);
+  }
+
+  // --- Jev Event Log: every action, including skips ---
+  const JEV_EVENT_STYLE = {
+    evaluated: { icon: "🧠", cls: "jev-ev-eval", label: "EVALUATED" },
+    vetoed:    { icon: "🚫", cls: "jev-ev-veto", label: "VETOED" },
+    skipped:   { icon: "⏭️", cls: "jev-ev-skip", label: "SKIPPED" },
+    error:     { icon: "⚠️", cls: "jev-ev-err", label: "ERROR" },
+    pvp_pick:  { icon: "⚔️", cls: "jev-ev-pvp", label: "PvP PICK" },
+    proposed:  { icon: "🧪", cls: "jev-ev-pvp", label: "PROPOSED" },
+  };
+  function jevEventRowHtml(e) {
+    const s = JEV_EVENT_STYLE[e.type] || { icon: "•", cls: "", label: (e.type||"").toUpperCase() };
+    const when = e.ts ? new Date(e.ts * 1000).toLocaleTimeString() : "";
+    const tickTxt = e.ticker ? `$${e.ticker}` : (e.token_address ? e.token_address.slice(0,8) : "");
+    const link = e.detail && e.detail.links && (e.detail.links.dexscreener || e.detail.links.explorer);
+    const tick = link ? `<a href="${link}" target="_blank" rel="noopener">${tickTxt}</a>` : tickTxt;
+    // 'proposed' events carry the full question text(s) — make them expandable
+    // so the history shows exactly WHAT was proposed, not just an id.
+    const qs = (e.detail && e.detail.questions) || [];
+    if (e.type === "proposed" && qs.length) {
+      const qhtml = qs.map(q => `<div class="jev-ev-q"><b>${q.id}</b> <span class="jev-q-type">${q.type}</span><div>${(q.instructions||"").replace(/</g,"&lt;")}</div></div>`).join("");
+      return `<details class="jev-ev-row ${s.cls} jev-ev-expandable"><summary><span class="jev-ev-icon">${s.icon}</span><span class="jev-ev-label">${s.label}</span><span class="jev-ev-reason">${(e.reason||"").replace(/</g,"&lt;")}</span><span class="jev-ev-when">${when}</span></summary><div class="jev-ev-qwrap">${qhtml}</div></details>`;
+    }
+    return `<div class="jev-ev-row ${s.cls}"><span class="jev-ev-icon">${s.icon}</span><span class="jev-ev-label">${s.label}</span><span class="jev-ev-tick">${tick}</span><span class="jev-ev-reason">${(e.reason||"").replace(/</g,"&lt;")}</span><span class="jev-ev-when">${when}</span></div>`;
+  }
+  function renderJevEvents(list) {
+    const c = document.getElementById("jev-eventlog");
+    if (!c || !list || !list.length) return;
+    const sorted = [...list].sort((a, b) => (b.ts || 0) - (a.ts || 0));
+    c.innerHTML = sorted.map(jevEventRowHtml).join("");
+    const hint = document.getElementById("jev-eventlog-hint");
+    if (hint) {
+      const counts = {};
+      list.forEach(e => counts[e.type] = (counts[e.type]||0)+1);
+      hint.textContent = Object.entries(counts).map(([k,v]) => `${v} ${k}`).join(" · ");
+    }
+  }
+  function renderJevEvent(e) {
+    const c = document.getElementById("jev-eventlog");
+    if (!c || !e) return;
+    if (c.querySelector(".empty-state")) c.innerHTML = "";
+    c.insertAdjacentHTML("afterbegin", jevEventRowHtml(e));
+    while (c.children.length > 200) c.removeChild(c.lastChild);
+  }
+
+  // One expandable card per judgment showing the FULL detail: what Jev saw,
+  // each dimension's value + confidence + probability distribution, the points
+  // it contributed, and the verdict.
+  function jevDimDetailHtml(id, d, qLookup) {
+    const coreLabel = { moon_potential: "🚀 moon potential", narrative_quality: "narrative quality", narrative_durability: "durability", legitimacy: "legitimacy", impersonation_risk: "impersonation risk", trap_risk: "trap risk", sufficient_info: "had enough info?" }[id];
+    // Proposed (prop_*) questions: humanize the id and expose the real question text.
+    const isProp = id.startsWith("prop_");
+    const label = coreLabel || (isProp ? "🧪 " + id.replace(/^prop_/, "").replace(/_/g, " ") : id.replace(/_/g," "));
+    const qText = (qLookup && qLookup[id]) ? qLookup[id] : "";
+    const titleAttr = qText ? ` title="${qText.replace(/"/g,'&quot;')}"` : "";
+    if (d.type === "score" && d.score !== undefined && d.score !== null) {
+      const n = (d.n_levels || Object.keys(d.legend || {}).length || 1) - 1;
+      const conf = (d.confidence !== undefined && d.confidence !== null) ? `${(d.confidence * 100).toFixed(0)}%` : "–";
+      // probability distribution across levels
+      let dist = "";
+      const probs = d.probabilities || {};
+      const legend = d.legend || {};
+      Object.keys(probs).sort((a, b) => (+a) - (+b)).forEach(k => {
+        const p = probs[k];
+        dist += `<div class="jev-dist-row"><span class="jev-dist-lbl" title="${(legend[k]||'').replace(/"/g,'')}">L${k}</span><span class="jev-dist-bar"><span style="width:${(p*100).toFixed(0)}%"></span></span><span class="jev-dist-pct">${(p*100).toFixed(0)}%</span></div>`;
+      });
+      const frac = n > 0 ? d.score / n : 0;
+      const hue = frac * 120;
+      return `<div class="jev-dim"${titleAttr}><div class="jev-dim-head"><b>${label}</b> <span class="jev-dim-val" style="color:hsl(${hue},70%,50%)">${d.score.toFixed(1)} of ${n}</span> <span class="jev-dim-conf">${conf} sure</span></div><div class="jev-dist">${dist}</div></div>`;
+    } else if (d.type === "noul" && d.noul !== undefined && d.noul !== null) {
+      const bad = (id === "impersonation_risk" || id === "trap_risk");
+      const hue = bad ? (120 - d.noul * 120) : (d.noul * 120);
+      const yn = bad ? "risk" : "yes";
+      return `<div class="jev-dim"${titleAttr}><div class="jev-dim-head"><b>${label}</b> <span class="jev-dim-val" style="color:hsl(${hue},70%,50%)">${(d.noul*100).toFixed(0)}% ${yn}</span></div><div class="jev-dist"><div class="jev-dist-row"><span class="jev-dist-bar"><span style="width:${(d.noul*100).toFixed(0)}%;background:hsl(${hue},70%,45%)"></span></span></div></div></div>`;
+    }
+    return "";
+  }
+
+  function jevJudgmentCardHtml(j) {
+    const when = j.evaluated_at ? new Date(j.evaluated_at * 1000).toLocaleTimeString() : "";
+    const contrib = j.contribution || 0;
+    const contribCls = j.veto ? "jev-verdict-veto" : (contrib > 0 ? "jev-verdict-pos" : (contrib < 0 ? "jev-verdict-neg" : "jev-verdict-neutral"));
+    // Plain-English verdict: Jev's net effect on this coin's opportunity score.
+    const contribTxt = j.veto ? "❌ VETOED (score forced to 0)"
+      : (contrib > 0 ? `👍 Jev boosted score +${contrib}`
+      : (contrib < 0 ? `👎 Jev cut score ${contrib}` : "neutral (0)"));
+    // Outcome so far — answers "which one rugged / mooned".
+    const oc = j.outcome;
+    const ocMap = { mooned: ["🚀 MOONED","jev-oc-moon"], rugged: ["💀 RUGGED","jev-oc-rug"], dying: ["📉 dying","jev-oc-dying"], flat: ["😐 faded","jev-oc-flat"] };
+    const ocBadge = oc && ocMap[oc] ? `<span class="jev-oc ${ocMap[oc][1]}">${ocMap[oc][0]}</span>` : `<span class="jev-oc jev-oc-pending">⏳ awaiting outcome</span>`;
+    const state = j.state_seen || {};
+    const stateLine = [state.name, state.description].filter(Boolean).join(" · ");
+    // question-text lookup so proposed (prop_*) dims show what they actually ask
+    const qLookup = {};
+    if (j.raw_request && j.raw_request.questions) {
+      for (const [qid, q] of Object.entries(j.raw_request.questions)) qLookup[qid] = q.instructions || "";
+    }
+    const dimsHtml = Object.entries(j.dimensions || {}).map(([id, d]) => jevDimDetailHtml(id, d, qLookup)).join("");
+    const reasons = (j.reasons || []).map(r => `<li>${r.replace(/</g,"&lt;")}</li>`).join("");
+    const link = (j.links && (j.links.dexscreener || j.links.explorer)) || "";
+    const tokensUsed = (j.usage && (j.usage.input_tokens || 0) + (j.usage.output_tokens || 0)) || 0;
+    return `
+      <div class="jev-judgment">
+        <div class="jev-j-head">
+          <span class="jev-j-tick">${link ? `<a href="${link}" target="_blank" rel="noopener">$${(j.ticker||"?")}</a>` : `$${(j.ticker||"?")}`}</span>
+          ${ocBadge}
+          <span class="jev-j-meta">${(j.chain||"")}/${(j.platform||"")} · mcap $${Math.round(j.mcap_at_eval||0).toLocaleString()}</span>
+          <span class="jev-j-verdict ${contribCls}" title="How much Jev's judgment moved this coin's 0-100 opportunity score.">${contribTxt}</span>
+          <span class="jev-j-when">${when} · ${tokensUsed} tok</span>
+        </div>
+        ${stateLine ? `<div class="jev-j-state" title="exactly what Jev was shown">Jev saw: “${stateLine.replace(/</g,"&lt;").slice(0,180)}”</div>` : ""}
+        <div class="jev-dims">${dimsHtml}</div>
+        ${reasons ? `<div class="jev-reasons-title">Why this score:</div><ul class="jev-j-reasons">${reasons}</ul>` : ""}
+        ${j.raw_request ? `<details class="jev-raw"><summary>raw request sent to Jev</summary><pre>${JSON.stringify(j.raw_request, null, 2).replace(/</g,"&lt;")}</pre></details>` : ""}
+      </div>`;
+  }
+
+  function renderJevActivity(list) {
+    const evalC = document.getElementById("jev-activity");
+    const pvpC = document.getElementById("jev-pvp-feed");
+    if (!list || !list.length) return;
+    const sorted = [...list].sort((a, b) => (b.evaluated_at || 0) - (a.evaluated_at || 0));
+    const evals = sorted.filter(j => j.kind !== "pvp" && j.type !== "pvp");
+    const pvps = sorted.filter(j => j.kind === "pvp" || j.type === "pvp");
+    if (evalC && evals.length) evalC.innerHTML = evals.map(jevJudgmentCardHtml).join("");
+    if (pvpC && pvps.length) pvpC.innerHTML = pvps.map(jevPvpCardHtml).join("");
+    const ah = document.getElementById("jev-activity-hint");
+    if (ah) ah.textContent = `${evals.length} coin evaluation(s), newest first`;
+    const ph = document.getElementById("jev-pvp-hint");
+    if (ph) ph.textContent = `${pvps.length} PvP comparison(s), newest first`;
+    const countEvals = document.getElementById("jev-subtab-count-evals");
+    if (countEvals) countEvals.textContent = evals.length;
+    const countPvp = document.getElementById("jev-subtab-count-pvp");
+    if (countPvp) countPvp.textContent = pvps.length;
+  }
+
+  // Live push: prepend a single new judgment as it happens.
+  function renderJevJudgment(j) {
+    const c = document.getElementById("jev-activity");
+    if (!c || !j) return;
+    if (c.querySelector(".empty-state")) c.innerHTML = "";
+    c.insertAdjacentHTML("afterbegin", jevJudgmentCardHtml(j));
+    while (c.children.length > 60) c.removeChild(c.lastChild);
+    const countEvals = document.getElementById("jev-subtab-count-evals");
+    if (countEvals) countEvals.textContent = c.children.length;
+  }
+
+  // A PvP comparison card: shows the same-name cohort and which coin Jev picked.
+  function jevPvpCardHtml(p) {
+    const when = p.evaluated_at ? new Date(p.evaluated_at * 1000).toLocaleTimeString() : "";
+    const cohort = p.cohort || [];
+    const probs = p.probabilities || {};
+    const rows = cohort.map((c, i) => {
+      const prob = probs["opt_" + i];
+      const isPick = (p.picked_address && c.token_address === p.picked_address);
+      const ageMin = Math.round((c.age_seconds || 0) / 60);
+      const pct = (prob !== undefined && prob !== null) ? (prob * 100).toFixed(0) + "%" : "–";
+      const link = c.links && (c.links.dexscreener || c.links.explorer);
+      const addr = c.token_address ? c.token_address.slice(0, 4) + "…" + c.token_address.slice(-4) : "";
+      const coinCell = link
+        ? `<a href="${link}" target="_blank" rel="noopener">${c.platform}/${c.chain} <span class="jev-addr">${addr}</span></a>`
+        : `${c.platform}/${c.chain} <span class="jev-addr">${addr}</span>`;
+      return `<tr class="${isPick ? 'jev-pvp-row-pick' : ''}"><td>${isPick ? '🏆 ' : ''}${coinCell}</td><td>${ageMin}m old</td><td>$${Math.round(c.market_cap||0).toLocaleString()}</td><td>$${Math.round(c.volume_24h||0).toLocaleString()}</td><td>${pct}</td></tr>`;
+    }).join("");
+    const pickedCoin = cohort.find(c => c.token_address === p.picked_address);
+    const pickLink = pickedCoin && pickedCoin.links && (pickedCoin.links.dexscreener || pickedCoin.links.explorer);
+    const tickHtml = pickLink ? `<a href="${pickLink}" target="_blank" rel="noopener">$${p.ticker||"?"}</a>` : `$${p.ticker||"?"}`;
+    return `
+      <div class="jev-judgment jev-pvp-card">
+        <div class="jev-j-head">
+          <span class="jev-j-tick">⚔️ PvP: ${tickHtml}</span>
+          <span class="jev-j-meta">${cohort.length} same-name coins · picked <b>${p.picked_platform||"none"}</b> · conf ${((p.confidence||0)*100).toFixed(0)}% · ${p.history_count||0} past &gt;$500k runner(s) as context</span>
+          <span class="jev-j-when">${when} · ${p.model||""}</span>
+        </div>
+        ${p.reasoning ? `<div class="jev-pvp-reason">🧠 ${p.reasoning.replace(/</g,"&lt;")}</div>` : ""}
+        <table class="jev-pvp-table"><thead><tr><th>coin (click to open)</th><th>age</th><th>mcap</th><th>vol</th><th>Jev pick %</th></tr></thead><tbody>${rows}</tbody></table>
+      </div>`;
+  }
+
+  function renderJevPvp(p) {
+    const c = document.getElementById("jev-pvp-feed");
+    if (!c || !p) return;
+    if (c.querySelector(".empty-state")) c.innerHTML = "";
+    c.insertAdjacentHTML("afterbegin", jevPvpCardHtml(p));
+    while (c.children.length > 40) c.removeChild(c.lastChild);
+    const countPvp = document.getElementById("jev-subtab-count-pvp");
+    if (countPvp) countPvp.textContent = c.children.length;
+  }
+
   function renderMockPortfolio(positions) {
     const container = document.getElementById("mock-portfolio");
     if (!container) return;
     if (!positions || !positions.length) {
-      container.innerHTML = '<div class="empty-state">No simulated positions yet — opens automatically the first time a coin is flagged as an opportunity.</div>';
+      container.innerHTML = '<div class="empty-state">No opportunity calls tracked yet — records automatically when an opportunity is called.</div>';
       return;
     }
-    const sorted = [...positions].sort((a, b) => (b.entry_ts || 0) - (a.entry_ts || 0));
-    const totalPnlUsd = sorted.reduce((acc, p) => acc + (p.pnl_usd || 0), 0);
-    const winners = sorted.filter(p => (p.pnl_pct || 0) > 0).length;
-    const winRate = sorted.length ? ((winners / sorted.length) * 100).toFixed(0) : 0;
-    const buySize = sorted[0].buy_size_usd || 100;
+    const filtered = (positions || []).filter(p => {
+      const addrLower = (p.token_address || "").toLowerCase();
+      const endsTarget = addrLower.endsWith("7777") || addrLower.endsWith("pump") || addrLower.endsWith("4444");
+      const platLower = (p.platform || "").toLowerCase();
+      const isLaunchpad = ["pump.fun", "stonkfun", "four.meme", "flap.sh", "pons", "ember", "long.xyz"].some(lp => platLower.includes(lp));
+      const qualifiesLaunch = isLaunchpad || endsTarget;
+      const isStonkboard = platLower === "stonkfun" || Boolean(p.is_stonkboard) || Boolean(p.links && p.links.stonkboard);
+      const mcapQualifies = isStonkboard ? ((p.entry_market_cap || 0) <= 100000) : ((p.entry_market_cap || 0) <= 1000000);
+      return qualifiesLaunch && mcapQualifies;
+    });
+    const sorted = [...filtered].sort((a, b) => (b.entry_ts || 0) - (a.entry_ts || 0));
+    const totalCalls = sorted.length;
+    const activeCount = sorted.filter(p => p.last_known_status === "WATCHING" || !p.last_known_status).length;
+    const graduatedCount = sorted.filter(p => p.last_known_status === "GRADUATED").length;
+    const runners = sorted.filter(p => (p.peak_multiple || 1) >= 2.0).length;
+    const winRate = totalCalls > 0 ? ((runners / totalCalls) * 100).toFixed(0) : 0;
+    const maxPeakMultiple = sorted.reduce((max, p) => Math.max(max, p.peak_multiple || 1), 1);
 
     const hintEl = document.getElementById("mock-portfolio-hint");
     if (hintEl) {
-      hintEl.textContent = `paper trading — simulated $${buySize} buy at flag time · ${sorted.length} position(s) · net ${totalPnlUsd >= 0 ? "+" : ""}$${totalPnlUsd.toFixed(0)} · ${winRate}% currently up`;
+      hintEl.innerHTML = `
+        <span style="font-weight:600; color:var(--text-bright);">${totalCalls}</span> Calls Tracked (&lt;$100k on StonkBoard &middot; Launchpads / 7777 / pump / 4444) &middot; 
+        <span style="color:var(--accent); font-weight:600;">${activeCount}</span> Active &middot; 
+        <span style="color:var(--green); font-weight:600;">${graduatedCount}</span> Graduated &middot; 
+        <span>Win Rate (&ge;2x): <b>${winRate}%</b></span> &middot; 
+        <span>Max Peak: <b style="color:var(--green);">${maxPeakMultiple.toFixed(1)}x</b></span>
+      `;
     }
 
     const rows = sorted.map(p => {
-      const pnlClass = (p.pnl_pct || 0) >= 0 ? "pnl-pos" : "pnl-neg";
+      const pnlPct = p.pnl_pct || 0;
+      const pnlClass = pnlPct >= 0 ? "pnl-pos" : "pnl-neg";
       const href = (p.links && p.links.dexscreener) || (p.links && p.links.explorer) || "#";
       const label = (p.ticker && p.ticker !== "UNKNOWN") ? `$${p.ticker}` : "unresolved";
       const peakMultiple = p.peak_multiple || 1;
-      const peakClass = peakMultiple >= 2 ? "pnl-pos" : "";
+      const peakBadge = peakMultiple >= 2
+        ? `<span class="badge" style="background:rgba(34, 197, 94, 0.15); color:var(--green); font-weight:700; border:1px solid rgba(34, 197, 94, 0.35);">${peakMultiple.toFixed(1)}x</span>`
+        : `<span style="color:var(--text-dim);">${peakMultiple.toFixed(1)}x</span>`;
+
+      const status = p.last_known_status || "WATCHING";
+      let statusBadge = `<span class="badge" style="background:rgba(56, 189, 248, 0.15); color:var(--accent);">${status}</span>`;
+      if (status === "GRADUATED") {
+        statusBadge = `<span class="badge" style="background:rgba(34, 197, 94, 0.15); color:var(--green);">🚀 GRADUATED</span>`;
+      } else if (status === "RUGGED") {
+        statusBadge = `<span class="badge" style="background:rgba(244, 63, 94, 0.15); color:var(--red);">💀 RUGGED</span>`;
+      } else if (status === "SKIPPED") {
+        statusBadge = `<span class="badge" style="background:rgba(148, 163, 184, 0.15); color:var(--text-dim);">SKIPPED</span>`;
+      }
+
+      const ca = p.token_address || "";
+      const caShort = ca.length > 10 ? (ca.slice(0, 4) + "..." + ca.slice(-4)) : ca;
+      const fomoUrl = (p.links && p.links.fomo) || (ca ? `https://fomo.family/tokens/${p.chain || 'solana'}/${ca}` : "");
+      const isStonk = (p.platform || "").toLowerCase() === "stonkfun" || Boolean(p.is_stonkboard) || Boolean(p.links && p.links.stonkboard);
+      const stonkUrl = (p.links && p.links.stonkboard) || (isStonk && ca ? `https://thestonkboard.com/coin/${ca}` : "");
+      const caHtml = ca ? `<div style="font-family:monospace;font-size:9px;color:var(--text-dim);cursor:pointer;margin-top:2px;" onclick="navigator.clipboard.writeText('${ca}');this.textContent='Copied!';setTimeout(()=>this.textContent='${caShort}',1000);" title="Click to copy CA: ${ca}">CA: ${caShort} 📋</div>` : "";
+      const secBadge = goPlusBadgeHtml(p);
+
       return `<tr>
-        <td style="text-align:left;"><a href="${href}" target="_blank" rel="noopener" style="color:inherit;">${chainTag(p.chain)} ${label}</a></td>
+        <td style="text-align:left; white-space:nowrap;">
+          <a href="${href}" target="_blank" rel="noopener" style="color:inherit; font-weight:600;">${chainTag(p.chain)} ${label}</a>
+          ${fomoUrl ? `<a href="${fomoUrl}" target="_blank" rel="noopener" style="font-size:10px;color:#c084fc;text-decoration:none;font-weight:700;margin-left:6px;" title="Research on FOMO.family">🦄 FOMO</a>` : ""}
+          ${stonkUrl ? `<a href="${stonkUrl}" target="_blank" rel="noopener" style="font-size:10px;color:#38bdf8;text-decoration:none;font-weight:700;margin-left:4px;" title="Research on The Stonk Board">📈 Stonk</a>` : ""}
+          ${caHtml}
+        </td>
         <td>${fmtUsd(p.entry_market_cap)}</td>
         <td>${fmtUsd(p.current_market_cap)}</td>
-        <td class="${pnlClass}">${p.pnl_pct >= 0 ? "+" : ""}${p.pnl_pct.toFixed(1)}%</td>
-        <td class="${pnlClass}">${p.pnl_usd >= 0 ? "+" : ""}$${p.pnl_usd.toFixed(2)}</td>
         <td>${fmtUsd(p.peak_market_cap)}</td>
-        <td class="${peakClass}" title="Peak mcap since this was flagged, vs entry mcap">${peakMultiple.toFixed(1)}x</td>
-        <td>${p.last_known_status || "-"}</td>
-        <td>${fmtTime(p.entry_ts)}</td>
+        <td style="text-align:center;">${peakBadge}</td>
+        <td class="${pnlClass}">${pnlPct >= 0 ? "+" : ""}${pnlPct.toFixed(1)}%</td>
+        <td style="text-align:center;">${secBadge}</td>
+        <td style="text-align:center;">${statusBadge}</td>
+        <td style="white-space:nowrap; font-size:10px; color:var(--text-dim);">${fmtTime(p.entry_ts)}</td>
       </tr>`;
     }).join("");
 
     container.innerHTML = `
-      <table class="weekly-table">
-        <thead><tr><th style="text-align:left;">Coin</th><th>Entry MCap</th><th>Current MCap</th><th>P&amp;L %</th><th>P&amp;L $</th><th>Peak MCap</th><th>Peak (x)</th><th>Status</th><th>Flagged At</th></tr></thead>
-        <tbody>${rows}</tbody>
-      </table>
+      <div style="overflow-x:auto;">
+        <table class="weekly-table">
+          <thead>
+            <tr>
+              <th style="text-align:left;">Coin</th>
+              <th>Entry MCap</th>
+              <th>Current MCap</th>
+              <th>Peak MCap</th>
+              <th style="text-align:center;">Peak Multiple</th>
+              <th>Current P&amp;L</th>
+              <th style="text-align:center;">Security</th>
+              <th style="text-align:center;">Status</th>
+              <th>Called At</th>
+            </tr>
+          </thead>
+          <tbody>${rows}</tbody>
+        </table>
+      </div>
     `;
   }
+
 
   let topOppRefreshScheduled = false;
   function scheduleTopOpportunitiesRefresh() {
@@ -1379,7 +3016,23 @@
     let bondingCount = 0;
     for (const [addr, payload] of tokenPayloadOf) {
       const status = tokenStatusOf.get(addr) || payload.status;
-      if (status === "WATCHING" && (payload.opportunity_score || 0) > 0) {
+      const isInfra = (payload.dev_wallet || '').toLowerCase().includes('multicall') || (payload.dev_alias && payload.dev_alias.includes('shared'));
+      const devMultiLaunch = !isInfra && ((payload.dev_total_launches || 0) > 1);
+      const devRugger = !isInfra && ((payload.dev_rugs || 0) > 0 || payload.dev_blacklisted);
+      const buys = payload.buys_24h || 0;
+      const sells = payload.sells_24h || 0;
+      const isHoneypot = payload.freeze_authority_active || payload.is_honeypot || payload.sell_whitelist || (buys >= 4 && sells === 0) || (buys >= 15 && sells <= 1);
+      const mcap = payload.market_cap || 0;
+      const platLower = (payload.platform || "").toLowerCase();
+      const isStonkboard = platLower === "stonkfun" || Boolean(payload.is_stonkboard) || Boolean(payload.links && payload.links.stonkboard);
+      const mcapQualifies = isStonkboard ? (mcap <= 100000) : (mcap <= 1000000);
+
+      const addrLower = (addr || "").toLowerCase();
+      const endsTarget = addrLower.endsWith("7777") || addrLower.endsWith("pump") || addrLower.endsWith("4444");
+      const isLaunchpad = ["pump.fun", "stonkfun", "four.meme", "flap.sh", "pons", "ember", "long.xyz"].some(lp => platLower.includes(lp));
+      const qualifiesLaunch = isLaunchpad || endsTarget;
+
+      if (status === "WATCHING" && (payload.opportunity_score || 0) > 0 && !devMultiLaunch && !devRugger && !isHoneypot && mcapQualifies && qualifiesLaunch) {
         candidates.push(payload);
       }
       if (isBonding(status, payload)) bondingCount += 1;
@@ -1390,21 +3043,64 @@
     const top = candidates.slice(0, 12);
 
     if (!top.length) {
-      container.innerHTML = '<div class="empty-state">No scored opportunities yet — scores build up as volume, dev-trust, and smart-money signals come in. This is a heuristic weighting of the same signals shown elsewhere, not a prediction.</div>';
+      container.innerHTML = '<div class="empty-state">No clean scored opportunities yet (&lt;$100k MC on StonkBoard, launchpad/7777/pump/4444, honeypots &amp; serial ruggers discarded).</div>';
       return;
     }
+
+    const statOpps = document.getElementById("stat-opps-active");
+    if (statOpps) statOpps.textContent = candidates.length;
+    const badgeOpps = document.getElementById("badge-opps");
+    if (badgeOpps) badgeOpps.textContent = top.length;
 
     container.innerHTML = top.map(p => {
       const href = (p.links && p.links.dexscreener) || (p.links && p.links.explorer) || "#";
       const label = (p.ticker && p.ticker !== "UNKNOWN") ? `$${p.ticker}` : "unresolved";
-      const reasons = (p.score_reasons || []).join(" &middot; ") || "baseline, no standout signals yet";
-      const txnLine = (p.buys_24h || p.sells_24h) ? ` &middot; ${p.buys_24h || 0}↑${p.sells_24h || 0}↓` : "";
+      const reasons = (p.score_reasons || []).join(" · ") || "baseline signals";
+      const txnLine = (p.buys_24h || p.sells_24h) ? ` · ${p.buys_24h || 0}↑${p.sells_24h || 0}↓` : "";
       const holderLine = holderLineHtml(p);
-      return `<a class="card opp-card" href="${href}" target="_blank" rel="noopener" title="dev: ${p.dev_wallet}">
-        <div class="title" style="display:flex;align-items:center;gap:6px;">${tokenImageHtml(p, 24)}${chainTag(p.chain)} ${label} <span class="opp-score ${scoreClass(p.opportunity_score)}">${p.opportunity_score}</span></div>
-        <div class="meta">${fmtUsd(p.market_cap)} mcap &middot; vol ${fmtUsd(p.volume_24h)}${txnLine} &middot; ${p.platform || "-"}</div>
-        <div class="meta">dev ${devBadge(p)}${holderLine ? " &middot; " + holderLine : ""}</div>
-        <div class="meta">${reasons}</div>
+      const liqLine = liquidityHtml(p);
+      const devLine = devBadge(p);
+      const ca = p.token_address || "";
+      const caShort = ca.length > 12 ? (ca.slice(0, 6) + "..." + ca.slice(-4)) : ca;
+      const caRow = ca ? `<div style="font-family:monospace;font-size:10px;color:var(--text-bright);background:rgba(255,255,255,0.04);padding:2px 6px;border-radius:4px;display:flex;justify-content:space-between;align-items:center;margin:3px 0;" onclick="navigator.clipboard.writeText('${ca}');const s=this.querySelector('.ca-val');s.textContent='Copied!';setTimeout(()=>s.textContent='${caShort}',1000);event.preventDefault();" title="Click to copy full CA: ${ca}"><span style="color:var(--text-dim);">CA:</span> <span class="ca-val" style="color:var(--text-bright);font-weight:600;cursor:pointer;">${caShort} 📋</span></div>` : "";
+      const fomoUrl = (p.links && p.links.fomo) || (ca ? `https://fomo.family/tokens/${p.chain || 'solana'}/${ca}` : "");
+      const isStonk = (p.platform || "").toLowerCase() === "stonkfun" || Boolean(p.is_stonkboard) || Boolean(p.links && p.links.stonkboard);
+      const stonkUrl = (p.links && p.links.stonkboard) || (isStonk && ca ? `https://thestonkboard.com/coin/${ca}` : "");
+      const goplusBadge = goPlusBadgeHtml(p);
+      return `<a class="opp-card" href="${href}" target="_blank" rel="noopener" title="Contract: ${p.token_address}
+Dev: ${p.dev_wallet}">
+        <div class="opp-head">
+          <div style="display:flex;align-items:center;gap:6px;">
+            ${tokenImageHtml(p, 24)}
+            ${chainTag(p.chain)}
+            <span style="font-size:12px;font-weight:800;">${label}</span>
+            <span style="color:var(--text-dim);font-size:10px;">${p.platform || "-"}</span>
+          </div>
+          <span class="opp-score ${scoreClass(p.opportunity_score)}">${p.opportunity_score} pts</span>
+        </div>
+        ${caRow}
+        <div class="opp-metrics-row">
+          <span><b>${fmtUsd(p.market_cap)}</b> mcap</span>
+          <span style="color:var(--text-dim);">vol ${fmtUsd(p.volume_24h)}${txnLine}</span>
+        </div>
+        <div class="opp-highlight-row">
+          ${liqLine}
+          ${holderLine}
+        </div>
+        <div style="font-size:10px; margin:3px 0; display:flex; align-items:center; gap:5px;">
+          <span style="color:var(--text-dim);">🛡️ Security:</span> ${goplusBadge}
+        </div>
+        <div class="opp-dev-row">
+          <span style="color:var(--text-dim);font-size:10px;">👨‍💻 Dev:</span> ${devLine}
+        </div>
+        <div class="opp-reasons">${reasons}</div>
+        <div style="margin-top:6px;display:flex;gap:6px;flex-wrap:wrap;align-items:center;">
+          ${fomoUrl ? `<span style="font-size:10px;font-weight:700;color:#c084fc;background:rgba(192,132,252,0.12);padding:2px 6px;border-radius:4px;border:1px solid rgba(192,132,252,0.25);cursor:pointer;" onclick="window.open('${fomoUrl}','_blank','noopener');event.preventDefault();event.stopPropagation();">🦄 FOMO.family &rarr;</span>` : ""}
+          ${stonkUrl ? `<span style="font-size:10px;font-weight:700;color:#38bdf8;background:rgba(56,189,248,0.12);padding:2px 6px;border-radius:4px;border:1px solid rgba(56,189,248,0.25);cursor:pointer;" onclick="window.open('${stonkUrl}','_blank','noopener');event.preventDefault();event.stopPropagation();">📈 StonkBoard &rarr;</span>` : ""}
+          ${(p.socials && p.socials.twitter) ? `<span style="font-size:10px;font-weight:600;color:#38bdf8;background:rgba(56,189,248,0.1);padding:2px 6px;border-radius:4px;border:1px solid rgba(56,189,248,0.25);cursor:pointer;" onclick="window.open('${p.socials.twitter}','_blank','noopener');event.preventDefault();event.stopPropagation();" title="Twitter/X">🐦 X</span>` : ""}
+          ${(p.socials && p.socials.telegram) ? `<span style="font-size:10px;font-weight:600;color:#22d3ee;background:rgba(34,211,238,0.1);padding:2px 6px;border-radius:4px;border:1px solid rgba(34,211,238,0.25);cursor:pointer;" onclick="window.open('${p.socials.telegram}','_blank','noopener');event.preventDefault();event.stopPropagation();" title="Telegram">✈️ TG</span>` : ""}
+          ${(p.socials && p.socials.website) ? `<span style="font-size:10px;font-weight:600;color:#34d399;background:rgba(52,211,153,0.1);padding:2px 6px;border-radius:4px;border:1px solid rgba(52,211,153,0.25);cursor:pointer;" onclick="window.open('${p.socials.website}','_blank','noopener');event.preventDefault();event.stopPropagation();" title="Website">🌐 Web</span>` : ""}
+        </div>
       </a>`;
     }).join("");
   }
@@ -1415,8 +3111,8 @@
   // itself is tiny. That's noise, not signal. This band is specifically
   // "already grew past the noisy launch-floor stage, not yet fully proven
   // at Top Opportunities' scale" — a deliberate mid-cap window, not "new."
-  const EARLY_MOMENTUM_MIN_MCAP = 50000;
-  const EARLY_MOMENTUM_MAX_MCAP = 200000;
+  const EARLY_MOMENTUM_MIN_MCAP = 15000;
+  const EARLY_MOMENTUM_MAX_MCAP = 100000;
 
   function renderEarlyMomentum() {
     const container = document.getElementById("early-momentum");
@@ -1425,10 +3121,29 @@
     for (const [addr, payload] of tokenPayloadOf) {
       const status = tokenStatusOf.get(addr) || payload.status;
       const mcap = payload.market_cap || 0;
+      const isInfra = (payload.dev_wallet || '').toLowerCase().includes('multicall') || (payload.dev_alias && payload.dev_alias.includes('shared'));
+      const devMultiLaunch = !isInfra && ((payload.dev_total_launches || 0) > 1);
+      const devRugger = !isInfra && ((payload.dev_rugs || 0) > 0 || payload.dev_blacklisted);
+      const buys = payload.buys_24h || 0;
+      const sells = payload.sells_24h || 0;
+      const isHoneypot = payload.freeze_authority_active || payload.is_honeypot || payload.sell_whitelist || (buys >= 4 && sells === 0) || (buys >= 15 && sells <= 1);
+      const addrLower = (addr || "").toLowerCase();
+      const endsTarget = addrLower.endsWith("7777") || addrLower.endsWith("pump") || addrLower.endsWith("4444");
+      const platLower = (payload.platform || "").toLowerCase();
+      const isLaunchpad = ["pump.fun", "stonkfun", "four.meme", "flap.sh", "pons", "ember", "long.xyz"].some(lp => platLower.includes(lp));
+      const qualifiesLaunch = isLaunchpad || endsTarget;
+      const isStonkboard = platLower === "stonkfun" || Boolean(payload.is_stonkboard) || Boolean(payload.links && payload.links.stonkboard);
+      const maxEarlyMcap = isStonkboard ? 100000 : 250000;
+
       if (
         status === "WATCHING" &&
-        mcap >= EARLY_MOMENTUM_MIN_MCAP && mcap <= EARLY_MOMENTUM_MAX_MCAP &&
-        (payload.early_momentum_score || 0) > 0
+        mcap >= EARLY_MOMENTUM_MIN_MCAP &&
+        mcap <= maxEarlyMcap &&
+        (payload.early_momentum_score || 0) > 0 &&
+        !devMultiLaunch &&
+        !devRugger &&
+        !isHoneypot &&
+        qualifiesLaunch
       ) {
         candidates.push(payload);
       }
@@ -1437,32 +3152,109 @@
     const top = candidates.slice(0, 12);
 
     if (!top.length) {
-      container.innerHTML = '<div class="empty-state">No early signals yet in the $50k&ndash;$200k range right now — this looks for ratio/narrative/smart-money signals on tokens in that band specifically, not brand-new launches at the noisy launch-floor mcap.</div>';
+      container.innerHTML = '<div class="empty-state">No micro-caps ($15k–$100k) from launchpads/7777/pump/4444 clearing Stage-1 momentum screening right now.</div>';
       return;
     }
 
     container.innerHTML = top.map(p => {
       const href = (p.links && p.links.dexscreener) || (p.links && p.links.explorer) || "#";
       const label = (p.ticker && p.ticker !== "UNKNOWN") ? `$${p.ticker}` : "unresolved";
-      const reasons = (p.early_momentum_reasons || []).join(" &middot; ") || "baseline, no standout signals yet";
-      const txnLine = (p.buys_24h || p.sells_24h) ? ` &middot; ${p.buys_24h || 0}↑${p.sells_24h || 0}↓` : "";
+      const reasons = (p.early_momentum_reasons || []).join(" · ") || "early volume breakout";
+      const txnLine = (p.buys_24h || p.sells_24h) ? ` · ${p.buys_24h || 0}↑${p.sells_24h || 0}↓` : "";
       const holderLine = holderLineHtml(p);
-      return `<a class="card opp-card" href="${href}" target="_blank" rel="noopener" title="dev: ${p.dev_wallet}">
-        <div class="title" style="display:flex;align-items:center;gap:6px;">${tokenImageHtml(p, 24)}${chainTag(p.chain)} ${label} <span class="opp-score ${scoreClass(p.early_momentum_score)}">${p.early_momentum_score}</span></div>
-        <div class="meta">${fmtUsd(p.market_cap)} mcap &middot; vol ${fmtUsd(p.volume_24h)}${txnLine} &middot; ${p.platform || "-"}</div>
-        <div class="meta">dev ${devBadge(p)}${holderLine ? " &middot; " + holderLine : ""}</div>
-        <div class="meta">${reasons}</div>
+      const liqLine = liquidityHtml(p);
+      const devLine = devBadge(p);
+      const ca = p.token_address || "";
+      const caShort = ca.length > 12 ? (ca.slice(0, 6) + "..." + ca.slice(-4)) : ca;
+      const caRow = ca ? `<div style="font-family:monospace;font-size:10px;color:var(--text-bright);background:rgba(255,255,255,0.04);padding:2px 6px;border-radius:4px;display:flex;justify-content:space-between;align-items:center;margin:3px 0;" onclick="navigator.clipboard.writeText('${ca}');const s=this.querySelector('.ca-val');s.textContent='Copied!';setTimeout(()=>s.textContent='${caShort}',1000);event.preventDefault();" title="Click to copy full CA: ${ca}"><span style="color:var(--text-dim);">CA:</span> <span class="ca-val" style="color:var(--text-bright);font-weight:600;cursor:pointer;">${caShort} 📋</span></div>` : "";
+      const fomoUrl = (p.links && p.links.fomo) || (ca ? `https://fomo.family/tokens/${p.chain || 'solana'}/${ca}` : "");
+      const isStonk = (p.platform || "").toLowerCase() === "stonkfun" || Boolean(p.is_stonkboard) || Boolean(p.links && p.links.stonkboard);
+      const stonkUrl = (p.links && p.links.stonkboard) || (isStonk && ca ? `https://thestonkboard.com/coin/${ca}` : "");
+      const goplusBadge = goPlusBadgeHtml(p);
+      return `<a class="opp-card" href="${href}" target="_blank" rel="noopener" title="Contract: ${p.token_address}
+Dev: ${p.dev_wallet}">
+        <div class="opp-head">
+          <div style="display:flex;align-items:center;gap:6px;">
+            ${tokenImageHtml(p, 24)}
+            ${chainTag(p.chain)}
+            <span style="font-size:12px;font-weight:800;">${label}</span>
+            <span style="color:var(--text-dim);font-size:10px;">${p.platform || "-"}</span>
+          </div>
+          <span class="opp-score ${scoreClass(p.early_momentum_score)}">${p.early_momentum_score} pts</span>
+        </div>
+        ${caRow}
+        <div class="opp-metrics-row">
+          <span><b>${fmtUsd(p.market_cap)}</b> mcap</span>
+          <span style="color:var(--text-dim);">vol ${fmtUsd(p.volume_24h)}${txnLine}</span>
+        </div>
+        <div class="opp-highlight-row">
+          ${liqLine}
+          ${holderLine}
+        </div>
+        <div style="font-size:10px; margin:3px 0; display:flex; align-items:center; gap:5px;">
+          <span style="color:var(--text-dim);">🛡️ Security:</span> ${goplusBadge}
+        </div>
+        <div class="opp-dev-row">
+          <span style="color:var(--text-dim);font-size:10px;">👨‍💻 Dev:</span> ${devLine}
+        </div>
+        <div class="opp-reasons">${reasons}</div>
+        <div style="margin-top:6px;display:flex;gap:6px;flex-wrap:wrap;align-items:center;">
+          ${fomoUrl ? `<span style="font-size:10px;font-weight:700;color:#c084fc;background:rgba(192,132,252,0.12);padding:2px 6px;border-radius:4px;border:1px solid rgba(192,132,252,0.25);cursor:pointer;" onclick="window.open('${fomoUrl}','_blank','noopener');event.preventDefault();event.stopPropagation();">🦄 FOMO.family &rarr;</span>` : ""}
+          ${stonkUrl ? `<span style="font-size:10px;font-weight:700;color:#38bdf8;background:rgba(56,189,248,0.12);padding:2px 6px;border-radius:4px;border:1px solid rgba(56,189,248,0.25);cursor:pointer;" onclick="window.open('${stonkUrl}','_blank','noopener');event.preventDefault();event.stopPropagation();">📈 StonkBoard &rarr;</span>` : ""}
+          ${(p.socials && p.socials.twitter) ? `<span style="font-size:10px;font-weight:600;color:#38bdf8;background:rgba(56,189,248,0.1);padding:2px 6px;border-radius:4px;border:1px solid rgba(56,189,248,0.25);cursor:pointer;" onclick="window.open('${p.socials.twitter}','_blank','noopener');event.preventDefault();event.stopPropagation();" title="Twitter/X">🐦 X</span>` : ""}
+          ${(p.socials && p.socials.telegram) ? `<span style="font-size:10px;font-weight:600;color:#22d3ee;background:rgba(34,211,238,0.1);padding:2px 6px;border-radius:4px;border:1px solid rgba(34,211,238,0.25);cursor:pointer;" onclick="window.open('${p.socials.telegram}','_blank','noopener');event.preventDefault();event.stopPropagation();" title="Telegram">✈️ TG</span>` : ""}
+          ${(p.socials && p.socials.website) ? `<span style="font-size:10px;font-weight:600;color:#34d399;background:rgba(52,211,153,0.1);padding:2px 6px;border-radius:4px;border:1px solid rgba(52,211,153,0.25);cursor:pointer;" onclick="window.open('${p.socials.website}','_blank','noopener');event.preventDefault();event.stopPropagation();" title="Website">🌐 Web</span>` : ""}
+        </div>
       </a>`;
     }).join("");
   }
 
+
+  function descEscape(s) {
+    return String(s == null ? "" : s)
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;");
+  }
+
+  // Renders the Pump.fun description panel: a trending-words pill bar plus a
+  // newest-first list of recent token descriptions. Called from both the
+  // snapshot handler (payload.description_feed) and the live 'description_feed'
+  // WebSocket message. The backend already expires/sorts trending_words, so we
+  // just render whatever we receive.
+  function renderDescriptionFeed(payload) {
+    if (!payload) return;
+
+    if (trendingWords) {
+      const words = payload.trending_words || [];
+      trendingWords.innerHTML = words.map(w =>
+        `<span class="trending-pill">${descEscape(w.word)}<span class="tp-count">x${w.count}</span></span>`
+      ).join("");
+    }
+
+    const descs = payload.descriptions || [];
+    if (descCount) descCount.textContent = descs.length;
+
+    if (descriptionFeed) {
+      if (!descs.length) {
+        descriptionFeed.innerHTML = '<div class="empty-state">No descriptions yet.</div>';
+      } else {
+        // newest first
+        const ordered = descs.slice().sort((a, b) => (b.ts || 0) - (a.ts || 0));
+        descriptionFeed.innerHTML = ordered.map(d => {
+          const label = d.ticker ? ("$" + d.ticker) : (d.name || (d.token_address || "").slice(0, 8));
+          const plat = d.platform ? `<span class="dc-plat">${descEscape(d.platform)}</span>` : "";
+          const text = d.description ? `<div class="dc-text">${descEscape(d.description)}</div>` : "";
+          return `<div class="desc-card"><span class="dc-ticker">${descEscape(label)}</span>${plat}${text}</div>`;
+        }).join("");
+      }
+    }
+  }
+
   function applySnapshot(payload) {
-    const devRep = payload.dev_reputation || {};
-    let eliteCount = 0, blacklistCount = 0;
-    Object.values(devRep).forEach(dev => {
-      if (dev.successful_launches >= 1 && !dev.is_blacklisted) eliteCount += 1;
-      if (dev.is_blacklisted) blacklistCount += 1;
-    });
+    const eliteCount = payload.elite_count !== undefined ? payload.elite_count : 0;
+    const blacklistCount = payload.blacklist_count !== undefined ? payload.blacklist_count : 0;
     document.getElementById("stat-elite").textContent = eliteCount;
     document.getElementById("stat-blacklist").textContent = blacklistCount;
 
@@ -1472,6 +3264,7 @@
     renderWeeklyProgress();
     renderHourlyActivity();
     renderMockPortfolio(payload.mock_portfolio || []);
+    renderJevStats(payload.jev_stats);
 
     // ALERT_HISTORY / TOKEN_FEED arrive oldest-first; each render*() prepends,
     // so replaying oldest-to-newest (no reverse) leaves the newest on top.
@@ -1487,6 +3280,8 @@
     (payload.tokens || []).forEach(renderToken);
 
     Object.values(payload.narratives || {}).forEach(renderNarrative);
+
+    renderDescriptionFeed(payload.description_feed);
   }
 
   function handleMessage(msg) {
@@ -1519,8 +3314,23 @@
       case "mock_portfolio":
         renderMockPortfolio(msg.payload);
         break;
+      case "jev_stats":
+        renderJevStats(msg.payload);
+        break;
+      case "jev_judgment":
+        renderJevJudgment(msg.payload);
+        break;
+      case "jev_pvp":
+        renderJevPvp(msg.payload);
+        break;
+      case "jev_event":
+        renderJevEvent(msg.payload);
+        break;
       case "opportunity_history":
         renderOpportunityHistoryList(msg.payload);
+        break;
+      case "description_feed":
+        renderDescriptionFeed(msg.payload);
         break;
     }
   }
@@ -1554,6 +3364,70 @@
     };
   }
 
+  // --- Main Tab Navigation & Live Badge Counters ---
+  window.switchMainTab = function(tabId) {
+    document.querySelectorAll(".main-tab-btn").forEach(btn => {
+      btn.classList.toggle("active", btn.dataset.tab === tabId);
+    });
+    document.querySelectorAll(".main-tab-view").forEach(view => {
+      view.classList.toggle("active", view.id === tabId);
+    });
+    if (tabId === "tab-ai") {
+      fetchAndRenderJevStats();
+    }
+    try { localStorage.setItem("active_tracker_tab", tabId); } catch(e) {}
+  };
+
+  document.querySelectorAll(".main-tab-btn").forEach(btn => {
+    btn.addEventListener("click", () => window.switchMainTab(btn.dataset.tab));
+  });
+
+  // --- Jev Sub-Tab Navigation ---
+  window.switchJevSubTab = function(subtabId) {
+    document.querySelectorAll(".jev-subnav-btn").forEach(btn => {
+      btn.classList.toggle("active", btn.dataset.subtab === subtabId);
+    });
+    document.querySelectorAll(".jev-sub-panel").forEach(panel => {
+      panel.classList.toggle("active", panel.id === subtabId);
+    });
+  };
+
+  document.querySelectorAll(".jev-subnav-btn").forEach(btn => {
+    btn.addEventListener("click", () => window.switchJevSubTab(btn.dataset.subtab));
+  });
+
+  // --- TypeSafe Jev API Fetching & Periodic Polling ---
+  async function fetchAndRenderJevStats() {
+    try {
+      const res = await fetch("/api/jev");
+      if (!res.ok) return;
+      const data = await res.json();
+      renderJevStats(data);
+    } catch (err) {
+      console.warn("Failed to fetch /api/jev:", err);
+    }
+  }
+
+  // Periodic polling so Jev intelligence is always fresh
+  setInterval(() => {
+    const aiTab = document.getElementById("tab-ai");
+    if (aiTab && aiTab.classList.contains("active")) {
+      fetchAndRenderJevStats();
+    }
+  }, 12000);
+
+  try {
+    const saved = localStorage.getItem("active_tracker_tab");
+    if (saved && document.getElementById(saved)) {
+      window.switchMainTab(saved);
+    }
+  } catch(e) {}
+
+  // Initial load
+  fetchAndRenderJevStats();
   connect();
 })();
 </script>
+
+</body>
+</html>

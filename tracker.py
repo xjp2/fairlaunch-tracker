@@ -59,6 +59,7 @@ the rest of the stack.
 
 import asyncio
 import base64
+import hashlib
 import html
 import json
 import logging
@@ -74,7 +75,7 @@ from typing import Any, Optional
 import aiohttp
 import websockets
 from Crypto.Hash import keccak as _keccak
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 import uvicorn
@@ -147,6 +148,37 @@ LONGXYZ_EVENT_SIGNATURE = os.getenv(
 # --- Market data -----------------------------------------------------------
 DEXSCREENER_API_BASE = os.getenv("DEXSCREENER_API_BASE", "https://api.dexscreener.com")
 
+# --- Birdeye (Solana) — rate-limited enrichment/fallback --------------------
+# DexScreener stays PRIMARY (free/unlimited) for price/mcap/liquidity. Birdeye
+# fills two gaps for Solana coins: (1) price/mcap/liquidity when DexScreener has
+# nothing yet, and (2) holder count + top-holder concentration (DexScreener
+# gives no holder data, and the RPC holder scan is often rate-limited).
+# Free tier is ~1 req/s, so calls are globally throttled + only made for gated
+# candidates. Blank key = disabled (feature no-ops, never blocks the pipeline).
+BIRDEYE_API_KEY = os.getenv("BIRDEYE_API_KEY", "")
+BIRDEYE_API_BASE = os.getenv("BIRDEYE_API_BASE", "https://public-api.birdeye.so")
+BIRDEYE_ENABLED = bool(BIRDEYE_API_KEY)
+BIRDEYE_MIN_INTERVAL_SECONDS = float(os.getenv("BIRDEYE_MIN_INTERVAL_SECONDS", "1.2"))  # global throttle
+BIRDEYE_TIMEOUT = float(os.getenv("BIRDEYE_TIMEOUT", "12"))
+BIRDEYE_MAX_RETRIES = int(os.getenv("BIRDEYE_MAX_RETRIES", "2"))  # retry on 429 with backoff
+# Only re-check a given coin via Birdeye this often — caches the "DexScreener
+# had nothing" fallback so the same coin doesn't burn quota every 20s poll.
+BIRDEYE_RECHECK_SECONDS = float(os.getenv("BIRDEYE_RECHECK_SECONDS", "600"))  # 10 min
+
+# --- Discovery scanner ------------------------------------------------------
+# The launch listeners only catch coins at BIRTH. A coin that was missed at
+# launch but is now trading well (like $JEV) stays invisible forever. The
+# discovery scanner periodically pulls trending/high-volume Solana coins from
+# DexScreener (free) + Birdeye and INJECTS qualifying ones into the watchlist
+# so they enter the normal pipeline + Jev gate. Gated by mcap/volume floors +
+# the same stock/ticker filters so it doesn't flood with junk. Solscan's free
+# tier can't help (every endpoint 401s), so it isn't used.
+DISCOVERY_ENABLED = os.getenv("DISCOVERY_ENABLED", "true").lower() == "true"
+DISCOVERY_INTERVAL_SECONDS = float(os.getenv("DISCOVERY_INTERVAL_SECONDS", "150"))  # every 2.5 min
+DISCOVERY_MIN_MCAP = float(os.getenv("DISCOVERY_MIN_MCAP", "10000"))  # match the Jev eval gate
+DISCOVERY_MIN_VOLUME_24H = float(os.getenv("DISCOVERY_MIN_VOLUME_24H", "8000"))
+DISCOVERY_MAX_PER_SCAN = int(os.getenv("DISCOVERY_MAX_PER_SCAN", "30"))  # cap injections per cycle
+
 # --- Telegram opportunity pings ---------------------------------------------
 # Bot token from @BotFather; chat ID is whichever chat/user/channel should
 # receive pings — Telegram gives no way to discover it from the token alone,
@@ -156,20 +188,240 @@ DEXSCREENER_API_BASE = os.getenv("DEXSCREENER_API_BASE", "https://api.dexscreene
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 TELEGRAM_API_BASE = "https://api.telegram.org"
-TELEGRAM_OPPORTUNITY_SCORE_THRESHOLD = float(os.getenv("TELEGRAM_OPPORTUNITY_SCORE_THRESHOLD", "60"))
+TELEGRAM_OPPORTUNITY_SCORE_THRESHOLD = float(os.getenv("TELEGRAM_OPPORTUNITY_SCORE_THRESHOLD", "20"))
 TELEGRAM_MIN_SEND_INTERVAL_SECONDS = 1.5  # keeps sends under Telegram's per-chat rate limit even if several tokens cross threshold at once
+TELEGRAM_SEND_EARLY_MOMENTUM = os.getenv("TELEGRAM_SEND_EARLY_MOMENTUM", "false").lower() in ("true", "1", "yes")
 # Early Momentum gets its own, independent ping — same mechanics, different
-# score field and threshold. Gated to the same $50k-$200k band the
-# dashboard's Early Momentum panel uses (EARLY_MOMENTUM_MIN_MCAP/MAX_MCAP in
-# static/dashboard.html) so a noisy ratio spike on a $500 mcap token can't
-# fire Telegram — keep these two pairs of numbers in sync if either changes.
-TELEGRAM_EARLY_MOMENTUM_SCORE_THRESHOLD = float(os.getenv("TELEGRAM_EARLY_MOMENTUM_SCORE_THRESHOLD", "55"))
-EARLY_MOMENTUM_PING_MIN_MCAP_USD = float(os.getenv("EARLY_MOMENTUM_PING_MIN_MCAP_USD", "50000"))
-EARLY_MOMENTUM_PING_MAX_MCAP_USD = float(os.getenv("EARLY_MOMENTUM_PING_MAX_MCAP_USD", "200000"))
+# score field and threshold. Gated to under $100k matching user's opportunity ceiling.
+TELEGRAM_EARLY_MOMENTUM_SCORE_THRESHOLD = float(os.getenv("TELEGRAM_EARLY_MOMENTUM_SCORE_THRESHOLD", "20"))
+TELEGRAM_EARLY_MOMENTUM_PING_MIN_MCAP_USD = float(os.getenv("EARLY_MOMENTUM_PING_MIN_MCAP_USD", "15000"))
+TELEGRAM_EARLY_MOMENTUM_PING_MAX_MCAP_USD = float(os.getenv("EARLY_MOMENTUM_PING_MAX_MCAP_USD", "100000"))
+
+# Market cap ceiling for opportunity consideration & calls: strictly under 100k ONLY for thestonkboard.com / StonkFun
+MAX_OPPORTUNITY_MARKET_CAP_USD = float(os.getenv("MAX_OPPORTUNITY_MARKET_CAP_USD", "100000"))
+
+# Only evaluate tokens launched from recognized launchpads and/or contracts ending in 7777, pump, 4444
+QUALIFYING_CONTRACT_SUFFIXES = ("7777", "pump", "4444")
+KNOWN_LAUNCHPAD_PLATFORMS = {
+    "pump.fun",
+    "stonkfun",
+    "four.meme",
+    "flap.sh",
+    "pons",
+    "ember",
+    "long.xyz",
+}
+
+def infer_launchpad_platform(platform: Optional[str], token_address: str) -> Optional[str]:
+    """Infers or normalizes the launchpad platform name based on contract suffix and platform string:
+    - ends in 'pump' -> 'pump.fun'
+    - ends in '4444' -> 'four.meme'
+    - ends in '7777' -> 'flap.sh'
+    """
+    addr = (token_address or "").lower()
+    if addr.endswith("pump"):
+        return "pump.fun"
+    if addr.endswith("4444"):
+        return "four.meme"
+    if addr.endswith("7777"):
+        return "flap.sh"
+    plat = (platform or "").lower().strip()
+    if "pump" in plat:
+        return "pump.fun"
+    if "four" in plat or "4meme" in plat:
+        return "four.meme"
+    if "flap" in plat:
+        return "flap.sh"
+    if "stonk" in plat:
+        return "stonkfun"
+    return platform if platform and platform not in ("?", "unknown") else None
+
+
+def is_launchpad_or_target_suffix(platform: Optional[str], token_address: str) -> tuple[bool, str]:
+    """Checks if a token was launched from a recognized launchpad (pump.fun, four.meme, flap.sh,
+    stonkfun, pons, ember) and/or its contract address ends in 7777, pump, or 4444:
+    - ends with pump: pump.fun launchpad
+    - ends with 4444: four.meme launchpad
+    - ends with 7777: flap.sh launchpad"""
+    addr = (token_address or "").lower()
+    inferred = infer_launchpad_platform(platform, token_address)
+
+    if addr.endswith("pump"):
+        return True, "pump.fun launchpad (contract suffix 'pump')"
+    if addr.endswith("4444"):
+        return True, "four.meme launchpad (contract suffix '4444')"
+    if addr.endswith("7777"):
+        return True, "flap.sh launchpad (contract suffix '7777')"
+
+    plat = (platform or inferred or "").lower().strip()
+    is_launchpad = any(lp in plat for lp in KNOWN_LAUNCHPAD_PLATFORMS)
+    if is_launchpad:
+        return True, f"Launchpad ({inferred or platform})"
+
+    return False, f"Not from a launchpad ({platform or 'unknown'}) & contract does not end in 7777/pump/4444"
+
+# --- TheStonkBoard token detection & sync -------------------------------------
+# The user specified that the <$100k market cap ceiling applies strictly to
+# coins associated with thestonkboard.com (StonkFun native launches and coins
+# indexed on TheStonkBoard). Other launchpads (pump.fun, etc.) are NOT capped at 100k.
+STONKBOARD_COIN_ADDRESSES: set[str] = set()
+STONKBOARD_LAST_SYNC_TS: float = 0.0
+
+def is_stonkboard_token(token_address: str, platform: Optional[str] = None, links: Optional[dict[str, Any]] = None) -> bool:
+    """Checks if a coin is associated with TheStonkBoard (thestonkboard.com) —
+    either native to StonkFun, listed in TheStonkBoard cache, or has a verified StonkBoard link."""
+    if not token_address:
+        return False
+    plat = (platform or "").lower().strip()
+    if "stonkfun" in plat or "stonk" in plat:
+        return True
+    if token_address in STONKBOARD_COIN_ADDRESSES:
+        return True
+    if links and bool(links.get("stonkboard")):
+        return True
+    return False
+
+async def sync_stonkboard_coins() -> None:
+    """Scrapes token roster from https://thestonkboard.com so we know exactly
+    which tokens are visible on TheStonkBoard."""
+    global STONKBOARD_LAST_SYNC_TS
+    try:
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        }
+        async with aiohttp.ClientSession(headers=headers) as session:
+            async with session.get("https://thestonkboard.com", timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                if resp.status == 200:
+                    text = await resp.text()
+                    mints = set(re.findall(r'/coin/([1-9A-HJ-NP-Za-km-z]{32,44})', text))
+                    json_mints = set(re.findall(r'"mint":"([1-9A-HJ-NP-Za-km-z]{32,44})"', text))
+                    all_mints = mints | json_mints
+                    if all_mints:
+                        STONKBOARD_COIN_ADDRESSES.update(all_mints)
+                        STONKBOARD_LAST_SYNC_TS = time.time()
+                        logger.debug(f"[stonkboard] Synced {len(all_mints)} tokens from thestonkboard.com (cache size: {len(STONKBOARD_COIN_ADDRESSES)})")
+    except Exception as exc:
+        logger.debug(f"[stonkboard] Sync failed: {exc!r}")
+
+async def stonkboard_sync_worker() -> None:
+    while True:
+        await sync_stonkboard_coins()
+        await asyncio.sleep(180)
+
+
 # Paper-trading size for the Mock Portfolio panel — purely a display multiplier
 # (pnl_pct * this / 100), no real funds involved. Answers "how much would I be
 # up" without needing per-position custom stake sizing.
 MOCK_BUY_SIZE_USD = float(os.getenv("MOCK_BUY_SIZE_USD", "100"))
+
+# --- TypeSafe "Jev" semantic reasoner ---------------------------------------
+# Jev (TypeSafe's System One model) is used here as a per-coin SEMANTIC layer:
+# it judges the qualitative things this pipeline's arithmetic can't compute —
+# is the name/narrative coherent or low-effort garbage, does it look like a
+# serious launch, is it impersonating an established asset, does the theme have
+# staying power. It returns calibrated, typed judgments (not generated text);
+# code owns the workflow and blends the judgment into the opportunity score as
+# confidence-scaled, fully-attributed points (see compute_opportunity_score).
+#
+# IMPORTANT — Jev does NOT learn on its own. It's a stateless reasoner. The
+# "learning" lives in THIS system: every judgment is logged next to the token's
+# eventual outcome (mooned/rugged/flat, from the mock portfolio + graduation
+# history), and JEV_CORRELATION stats show which dimensions actually track
+# winners on YOUR data. That's the loop that improves opportunity-finding.
+#
+# Blank key = feature silently disabled (idles like every other listener),
+# so the stack runs fine with no TypeSafe account at all.
+TYPESAFE_API_KEY = os.getenv("TYPESAFE_API_KEY", "")
+TYPESAFE_API_BASE = os.getenv("TYPESAFE_API_BASE", "https://api.typesafe.ai")
+TYPESAFE_MODEL = os.getenv("TYPESAFE_MODEL", "jev-latest")
+JEV_ENABLED = bool(TYPESAFE_API_KEY)
+JEV_REQUEST_TIMEOUT = float(os.getenv("JEV_REQUEST_TIMEOUT", "20"))
+JEV_MAX_RETRIES = int(os.getenv("JEV_MAX_RETRIES", "3"))  # retried only on 429/529, exp backoff
+
+# --- Jev COST CONTROL (small credit budgets: Jev calls cost tokens) ---------
+# Jev is NEVER called on every candidate the firehose produces — that would
+# drain a small credit balance in minutes. It's gated so only genuinely
+# promising, identifiable candidates ever cost a call, evaluated once each and
+# cached, and hard-capped per day and lifetime. When any cap is hit, Jev
+# silently stops calling and tokens score on the deterministic signals only
+# (identical to the no-key path). Defaults are deliberately conservative.
+JEV_MIN_SCORE_TO_EVALUATE = float(os.getenv("JEV_MIN_SCORE_TO_EVALUATE", "40"))  # deterministic opp-score bar before spending a call
+JEV_MIN_MCAP_TO_EVALUATE = float(os.getenv("JEV_MIN_MCAP_TO_EVALUATE", "30000"))
+JEV_MAX_CALLS_PER_DAY = int(os.getenv("JEV_MAX_CALLS_PER_DAY", "400"))
+JEV_MAX_CALLS_TOTAL = int(os.getenv("JEV_MAX_CALLS_TOTAL", "3000"))  # lifetime safety cap across restarts (persisted)
+# Blend weights — points contributed to the 0-100 opportunity score at FULL
+# confidence; the actual contribution is scaled by Jev's own confidence, so an
+# uncertain judgment moves the score little (docs' confidence-gating pattern).
+# Kept in code (not sent to Jev) so you can retune from outcomes without any
+# re-inference (docs: "changing a weight need not rerun inference").
+JEV_WEIGHT_NARRATIVE_QUALITY = float(os.getenv("JEV_WEIGHT_NARRATIVE_QUALITY", "12"))
+JEV_WEIGHT_LEGITIMACY = float(os.getenv("JEV_WEIGHT_LEGITIMACY", "12"))
+JEV_WEIGHT_DURABILITY = float(os.getenv("JEV_WEIGHT_DURABILITY", "10"))
+# Impersonation is a Noul (prob 0..1); above this it HARD-VETOES the score to 0,
+# matching the existing blacklist/implausible-mcap hard floors.
+JEV_IMPERSONATION_VETO = float(os.getenv("JEV_IMPERSONATION_VETO", "0.6"))
+# Trap/rug risk (Noul over the enriched on-chain state): negative points scaled
+# by probability up to this weight; above the veto it hard-zeros the score.
+JEV_WEIGHT_TRAP_RISK = float(os.getenv("JEV_WEIGHT_TRAP_RISK", "20"))
+JEV_TRAP_RISK_VETO = float(os.getenv("JEV_TRAP_RISK_VETO", "0.85"))
+
+# --- PvP same-name comparative choice + >$500k runner history ---------------
+# When several coins share a name (old + new, across launchpads — the "PvP"
+# situation, e.g. a narrative spike spawning copycats of $OPTIMUS), Jev can be
+# asked to PICK which coin in that cohort is the actual play, grounded in a
+# per-chain history of coins that previously ran above BIG_RUNNER_MCAP_USD.
+BIG_RUNNER_MCAP_USD = float(os.getenv("BIG_RUNNER_MCAP_USD", "500000"))
+BIG_RUNNERS_MAX_PER_CHAIN = int(os.getenv("BIG_RUNNERS_MAX_PER_CHAIN", "200"))
+# Minimum distinct same-name coins before a PvP comparative call is worth it.
+JEV_PVP_MIN_COHORT = int(os.getenv("JEV_PVP_MIN_COHORT", "2"))
+# PvP is expensive and was over-firing — gate it: at least one cohort member
+# must have real mcap, and don't re-run the same narrative within the cooldown
+# even if the cohort drifts a little (prevents churn re-spend).
+JEV_PVP_MIN_MCAP = float(os.getenv("JEV_PVP_MIN_MCAP", "20000"))
+JEV_PVP_COOLDOWN_SECONDS = float(os.getenv("JEV_PVP_COOLDOWN_SECONDS", "1800"))  # 30 min per narrative
+# Points from the primary 'moon potential' judgment (confidence-scaled). Jev
+# judges upside-from-here for any LIVE coin (big or small); only already-run
+# GRADUATED/RUGGED coins are excluded from candidacy (see assemble_same_name_cohort).
+JEV_WEIGHT_MOON_POTENTIAL = float(os.getenv("JEV_WEIGHT_MOON_POTENTIAL", "18"))
+
+# --- Real-trajectory outcome model (replaces graduation=moon) ---------------
+# A Jev-flagged coin is tracked from its flag mcap. Outcomes are graded on the
+# ACTUAL move, not graduation:
+#   MOONED  = reached a tier multiple AND held >= sustain minutes
+#   RUGGED  = instant/sharp >= 80% drop from peak within the rug window
+#   DYING   = slow bleed down (not a rug) — a separate, softer negative
+#   ALIVE   = still tracking, no verdict yet
+JEV_MOON_TIERS = [float(x) for x in os.getenv("JEV_MOON_TIERS", "3,5,10").split(",")]  # x-multiples
+JEV_MOON_SUSTAIN_SECONDS = float(os.getenv("JEV_MOON_SUSTAIN_SECONDS", "900"))  # 15 min
+JEV_RUG_DROP_PCT = float(os.getenv("JEV_RUG_DROP_PCT", "0.80"))                 # 80% from peak
+JEV_RUG_WINDOW_SECONDS = float(os.getenv("JEV_RUG_WINDOW_SECONDS", "600"))      # "instant" = within 10 min of peak
+JEV_DYING_DROP_PCT = float(os.getenv("JEV_DYING_DROP_PCT", "0.60"))            # >=60% down but slow = dying
+JEV_TRACK_WINDOW_SECONDS = float(os.getenv("JEV_TRACK_WINDOW_SECONDS", "86400"))  # keep grading up to 24h
+JEV_TRACK_POLL_SECONDS = float(os.getenv("JEV_TRACK_POLL_SECONDS", "30"))
+
+# --- Level C: auto-tuning of blend weights from real outcomes ----------------
+# Once enough coins have reached a real moon/rug/dying outcome, the system
+# measures which Jev dimensions separated winners from losers and derives a
+# per-dimension weight MULTIPLIER (predictive → up, useless/inverted → down).
+# Gated on sample size so it never tunes on noise; multipliers are clamped so
+# one weird batch can't dominate. Learned multipliers are applied on top of the
+# base JEV_WEIGHT_* constants in jev_score_contribution.
+JEV_AUTOTUNE_ENABLED = os.getenv("JEV_AUTOTUNE_ENABLED", "true").lower() == "true"
+JEV_AUTOTUNE_MIN_OUTCOMES = int(os.getenv("JEV_AUTOTUNE_MIN_OUTCOMES", "30"))  # labeled outcomes before activating
+JEV_AUTOTUNE_MIN_WINNERS = int(os.getenv("JEV_AUTOTUNE_MIN_WINNERS", "3"))     # need some moons for a real contrast
+JEV_AUTOTUNE_CLAMP_LOW = float(os.getenv("JEV_AUTOTUNE_CLAMP_LOW", "0.3"))     # a dimension can't drop below 0.3x
+JEV_AUTOTUNE_CLAMP_HIGH = float(os.getenv("JEV_AUTOTUNE_CLAMP_HIGH", "2.5"))   # or above 2.5x
+JEV_AUTOTUNE_INTERVAL_SECONDS = float(os.getenv("JEV_AUTOTUNE_INTERVAL_SECONDS", "1800"))
+# Learned multipliers per scored dimension (1.0 = base weight, updated live).
+JEV_LEARNED_WEIGHTS: dict[str, float] = {}
+JEV_AUTOTUNE_STATUS: dict[str, Any] = {"active": False, "reason": "not enough outcomes yet", "updated_at": None}
+# Points the PvP winner gets (confidence-scaled); a coin the cohort-pick did
+# NOT choose gets a small penalty so the chosen one is preferred.
+JEV_WEIGHT_PVP_PICK = float(os.getenv("JEV_WEIGHT_PVP_PICK", "15"))
+# Optional seed of known past big runners so the history is useful on day one,
+# before the tracker has observed its own. Format: "chain:TICKER:platform"
+# comma-separated, e.g. "solana:OPTIMUS:pump.fun,solana:PEPE:pump.fun".
+BIG_RUNNERS_SEED = os.getenv("BIG_RUNNERS_SEED", "")
 
 # --- Filtering engine tunables ----------------------------------------------
 SPAM_WINDOW_SECONDS = float(os.getenv("SPAM_WINDOW_SECONDS", str(24 * 3600)))
@@ -254,36 +506,105 @@ STATE_SNAPSHOT_INTERVAL = float(os.getenv("STATE_SNAPSHOT_INTERVAL", "60"))
 # populated live.
 
 SMART_WALLETS: dict[str, dict[str, Any]] = {
-    "9WzDXwBbmkg8ZTbNMqUxvQRAyrZzDsGYdLVL9zYtAWWM": {
-        "alias": "ExampleWallet-SOL-Alpha",
-        "chain": "solana",
-        "avg_trade_size_usd": 2500.0,
-        "win_rate": 0.71,
-    },
-    "5Q544fKrFoe6tsEbD7S8EmxGTJYAKtTVhAW5Q5pge4j1": {
-        "alias": "ExampleWallet-SOL-Sniper",
-        "chain": "solana",
-        "avg_trade_size_usd": 800.0,
-        "win_rate": 0.63,
-    },
-    "0x1f9840a85d5af5bf1d1762f925bdaddc4201f984": {
-        "alias": "ExampleWallet-BNB-Degen",
-        "chain": "bnb",
-        "avg_trade_size_usd": 4200.0,
-        "win_rate": 0.58,
-    },
-    "0x28c6c06298d514db089934071355e5743bf21d60": {
-        "alias": "ExampleWallet-BNB-Scalper",
-        "chain": "bnb",
-        "avg_trade_size_usd": 1100.0,
-        "win_rate": 0.66,
-    },
-    "0x6b175474e89094c44da98b954eedeac495271d0f": {
-        "alias": "ExampleWallet-Robinhood-Chain-Whale",
-        "chain": "robinhood",
-        "avg_trade_size_usd": 3000.0,
-        "win_rate": 0.60,
-    },
+    # --- user smart wallets (bulk-loaded) ---
+    "Dj59QJvGrRJZfAbGAUdrv11TZm7d1K4qawvw7V59v6So": {"alias": "Tuna", "chain": "solana", "avg_trade_size_usd": 1000.0, "win_rate": 0.5},
+    "EyDiU3AWmav8dkGLFRmjeVckmw9uZ3B43QtAkdURGAky": {"alias": "kalm", "chain": "solana", "avg_trade_size_usd": 1000.0, "win_rate": 0.5},
+    "5zVedvk9ffJKwaoueQWKEAAAa1nutXKhaqmFxzwmvVkW": {"alias": "AJC", "chain": "solana", "avg_trade_size_usd": 1000.0, "win_rate": 0.5},
+    "Gw4eZYJNpf7eqMk97tWx5XjnBQ9QzegLxwnsQPTfTAEU": {"alias": "Theo", "chain": "solana", "avg_trade_size_usd": 1000.0, "win_rate": 0.5},
+    "9QWZhySZ3UqXR6pEfk43w3w8c8udGeLv8jcvWjgn1cCH": {"alias": "iykyk", "chain": "solana", "avg_trade_size_usd": 1000.0, "win_rate": 0.5},
+    "BSM7obo97xfVUPSPEuU6kURoPvTYUNVspQSKJm5jpPUq": {"alias": "jg", "chain": "solana", "avg_trade_size_usd": 1000.0, "win_rate": 0.5},
+    "GEyyNQPCykZ4MzazG9xja4vRiKUmvvFnFKt2YkvftmQp": {"alias": "eric", "chain": "solana", "avg_trade_size_usd": 1000.0, "win_rate": 0.5},
+    "6pVvYMQgSUETvtUc4mBFZPxKW43k7R46jszFidbCKmWP": {"alias": "GrantLiu", "chain": "solana", "avg_trade_size_usd": 1000.0, "win_rate": 0.5},
+    "EmFaYsznEzQ1awoTyNxU9bi7wH9z2Xp2ufTRdY8pbYYQ": {"alias": "cipher", "chain": "solana", "avg_trade_size_usd": 1000.0, "win_rate": 0.5},
+    "Gf3MCpRezf6kFMRTuoXjMa21Lsj9HrEgSGarxi6EK5AG": {"alias": "Clark", "chain": "solana", "avg_trade_size_usd": 1000.0, "win_rate": 0.5},
+    "7mRxZ7yAk6KZxdre9s59odHSR5Xq2XVj46j3jyjafkDp": {"alias": "Hammy", "chain": "solana", "avg_trade_size_usd": 1000.0, "win_rate": 0.5},
+    "Bhkhub5XjRTjcoG4FnCgfNvymdhan8ZXTTbQYXfhf9rv": {"alias": "hihi33", "chain": "solana", "avg_trade_size_usd": 1000.0, "win_rate": 0.5},
+    "588deeKuwhHddybmi6H9c7R9SXFidMs43GpjpgKsPnXN": {"alias": "User2", "chain": "solana", "avg_trade_size_usd": 1000.0, "win_rate": 0.5},    "7CMeePt8sKLnndc65hbBe7Ye7VZuAFBHcFSyMGnpK3C1": {"alias": "moneysurfers", "chain": "solana", "avg_trade_size_usd": 1000.0, "win_rate": 0.5},
+    "A5SEXYJY4jTEi6sjMLfZs5KAP8SVFvLDPDV67GgSSZSk": {"alias": "frank", "chain": "solana", "avg_trade_size_usd": 1000.0, "win_rate": 0.5},
+    "DsoMrMSYzcMuUAR9WP3qjyPj3uo6oVcwjjQDfD8S4hgV": {"alias": "BIGWARZ", "chain": "solana", "avg_trade_size_usd": 1000.0, "win_rate": 0.5},
+    "9GUeC76XUTbct39mdNy6kHs7YwfrvwdBSe8tummTm5sT": {"alias": "BS", "chain": "solana", "avg_trade_size_usd": 1000.0, "win_rate": 0.5},
+    "D14CPUBvncprFxofp8jq2dmavW9kpobLGvMHN6vbDhNT": {"alias": "DegenCapitalLLC", "chain": "solana", "avg_trade_size_usd": 1000.0, "win_rate": 0.5},
+    "2Kj9rdrLkU44neC3CwXuBfN1oz4VycZEDuwnD8fZAU4v": {"alias": "lilbro", "chain": "solana", "avg_trade_size_usd": 1000.0, "win_rate": 0.5},
+    "8QmE9tvK8jaB1E2azGHySv8wACpnPMSuLd6jVTKAuMve": {"alias": "ShillPill", "chain": "solana", "avg_trade_size_usd": 1000.0, "win_rate": 0.5},
+    "DATMkmVrFbZt7isGoxyDSpAuF9vJycpkDKwhbf978eUw": {"alias": "game", "chain": "solana", "avg_trade_size_usd": 1000.0, "win_rate": 0.5},
+    "9QcRTLHsVzLNFgxCNDVR9M6ZkA1FGkVDAcAefQaHgDN3": {"alias": "seb", "chain": "solana", "avg_trade_size_usd": 1000.0, "win_rate": 0.5},
+    "AN5qesUgQDDUgVGVqEErxhNbgQbLEqBmXANrEnauwd5D": {"alias": "Yodel", "chain": "solana", "avg_trade_size_usd": 1000.0, "win_rate": 0.5},
+    "6CKfpKL3nNHyZ5mStHaDcKAUiLzajrJPruYCpWXtsn6P": {"alias": "kiss", "chain": "solana", "avg_trade_size_usd": 1000.0, "win_rate": 0.5},
+    "6Buy9uMErVDFZfMq7mGDfnY88wxt4FETcCx8g4xD6Gox": {"alias": "Bruce", "chain": "solana", "avg_trade_size_usd": 1000.0, "win_rate": 0.5},
+    "7AY1paSDAwdUjo2vQGz5mU6LQuy2ESYJ1s46qJrLkrZr": {"alias": "cjuggz", "chain": "solana", "avg_trade_size_usd": 1000.0, "win_rate": 0.5},
+    "zn535ZgYyoMPoixDG6LH5S7E2ucF5fZmFjF9s2uw9Ak": {"alias": "dietrying", "chain": "solana", "avg_trade_size_usd": 1000.0, "win_rate": 0.5},
+    "HYmWmpbJbjzsSGu19qBKBjBaXrSrFiGzX3EFtaoPos9F": {"alias": "DipWheeler", "chain": "solana", "avg_trade_size_usd": 1000.0, "win_rate": 0.5},
+    "3hrre4tP36Hgy43a2GrzcixVPbb5JEz6gVHJ2B4dh3uU": {"alias": "chrollo", "chain": "solana", "avg_trade_size_usd": 1000.0, "win_rate": 0.5},
+    "4WhFtDKcJGLoLAYbQm7iByw5h2sNQTTZF99v4y21T28L": {"alias": "remus", "chain": "solana", "avg_trade_size_usd": 1000.0, "win_rate": 0.5},
+    "AyqBKrYYF4C3GpUrMm15xMf8KP6hz1jNiMzugHj4urVt": {"alias": "ton", "chain": "solana", "avg_trade_size_usd": 1000.0, "win_rate": 0.5},
+    "7TAMgUTRR2J8iUpPVuevFRFq8oX1kmhKTx4Y4BUNF9Eb": {"alias": "RC", "chain": "solana", "avg_trade_size_usd": 1000.0, "win_rate": 0.5},
+    "8kK1P9Fuqx3whGjjZpFFPTuJ7jKGSPBTcWLeaQ32vpuk": {"alias": "se", "chain": "solana", "avg_trade_size_usd": 1000.0, "win_rate": 0.5},
+    "CJDjRAjigb3UdsjxaV7AiMchhJV6qAcc3SjrSLFyytE3": {"alias": "bigbabbajohnson", "chain": "solana", "avg_trade_size_usd": 1000.0, "win_rate": 0.5},
+    "9u9KvMKSrwNeWbgyU3dErGFvVzxmc3QQzh2nH7YdA7dz": {"alias": "Levis", "chain": "solana", "avg_trade_size_usd": 1000.0, "win_rate": 0.5},
+    "3Jh89g9WSztmVHryfWrWM455FvMLMWuvhpkPDXCuqnUc": {"alias": "BTheBezel", "chain": "solana", "avg_trade_size_usd": 1000.0, "win_rate": 0.5},
+    "CUjK7UkVughqGpv8H5jabZvMMx5pFe7a3GSLUEEH3hnz": {"alias": "Nach", "chain": "solana", "avg_trade_size_usd": 1000.0, "win_rate": 0.5},
+    "7Nah6th1W2cKzGXVL24uNBfEKCzEtrkBc2fmEbkdkLAR": {"alias": "Red", "chain": "solana", "avg_trade_size_usd": 1000.0, "win_rate": 0.5},
+    "Bj6u3bLyd7CciYev1SkBtDdsjz8p7knjNxByFAH8MyfY": {"alias": "Qwerty", "chain": "solana", "avg_trade_size_usd": 1000.0, "win_rate": 0.5},
+    "2kDuF558okYKx4P3va7nCigFSBtN3uCjRgERQqoNnxtx": {"alias": "TheBoggartt", "chain": "solana", "avg_trade_size_usd": 1000.0, "win_rate": 0.5},
+    "8nwzLRBBQyW9BndxZn3YLaEVVoNp91iAxMpuWgczGZB7": {"alias": "dns", "chain": "solana", "avg_trade_size_usd": 1000.0, "win_rate": 0.5},
+    "6FYwko4PVrbTuVaPyqcD8e6gquvx5yXnEBjvUMcfKv9b": {"alias": "fomopumpguy", "chain": "solana", "avg_trade_size_usd": 1000.0, "win_rate": 0.5},
+    "CxVjCVvSw5W8Sc8fXARCd5cAna1xNGopDmV6D8oh42B1": {"alias": "Tekkerrss", "chain": "solana", "avg_trade_size_usd": 1000.0, "win_rate": 0.5},
+    "3QGeGcN3atNeBehp9TWKDPvvroNrK6uQZieSPa4qPfqQ": {"alias": "Sneaky", "chain": "solana", "avg_trade_size_usd": 1000.0, "win_rate": 0.5},
+    "7CCJbLegkjpJNNbSe7zrkFaTt7mHoakFz6yecbQhV8Rk": {"alias": "arbitrary", "chain": "solana", "avg_trade_size_usd": 1000.0, "win_rate": 0.5},
+    "6a1ADPXoWdFyHNBw6ECVANq4TtcGFe2aMHgQDYW45cPw": {"alias": "reese", "chain": "solana", "avg_trade_size_usd": 1000.0, "win_rate": 0.5},
+    "7b3GfEL2ofEchjaMpt7LMDUh4dZqBvVHSw4z6i85VCai": {"alias": "bird", "chain": "solana", "avg_trade_size_usd": 1000.0, "win_rate": 0.5},
+    "6H5fSkG1WyYNRuqQJsjUG5saxYdfuYZwukTX1YywUSQV": {"alias": "nahyeR", "chain": "solana", "avg_trade_size_usd": 1000.0, "win_rate": 0.5},
+    "3V6Cqe2iwCaRbZ8jB34qDWCtoHKgvdmY8M1DgW8Dxnm6": {"alias": "Slurp", "chain": "solana", "avg_trade_size_usd": 1000.0, "win_rate": 0.5},
+    "F2VrjQDtdNC1dvnz4UaZX1LZd5Ra8vYJE4EnZX6rEfgg": {"alias": "willwin", "chain": "solana", "avg_trade_size_usd": 1000.0, "win_rate": 0.5},
+    "EhD4iG1UYBxHVXByQ9Xgy8i99wcZWRrtp6tKDYBneRur": {"alias": "irio", "chain": "solana", "avg_trade_size_usd": 1000.0, "win_rate": 0.5},
+    "37HfT8ESMHoyqUPXCXWDhtaiw4wN922vZx2Gbh1VPgLA": {"alias": "Bitman", "chain": "solana", "avg_trade_size_usd": 1000.0, "win_rate": 0.5},
+    "6PH7KwBsMC9Aq9um5YrQPA4hx34opEA4iLTeMGq543VL": {"alias": "31337", "chain": "solana", "avg_trade_size_usd": 1000.0, "win_rate": 0.5},
+    "GJcMxxQf27cYv2KLA26H6VTZdPfrneZ2HmvCdvMxxZfi": {"alias": "fibs", "chain": "solana", "avg_trade_size_usd": 1000.0, "win_rate": 0.5},
+    "ENgh9jC8T49tKCgLEmj2h4tryQxB7XYb9sNQsfmaiKKg": {"alias": "Don", "chain": "solana", "avg_trade_size_usd": 1000.0, "win_rate": 0.5},
+    "CRaP9mv2Ws84phVq2xH8SeqMv2NkR1HvALrxpR9Le6Hy": {"alias": "kch3n", "chain": "solana", "avg_trade_size_usd": 1000.0, "win_rate": 0.5},
+    "FF93UeCJ8Gf5w5nH3n7ZzQhiP7QykwbNpM3No2n7YbXC": {"alias": "px", "chain": "solana", "avg_trade_size_usd": 1000.0, "win_rate": 0.5},
+    "FdmJL6ApGjeyKSymASrjtUu9cxQCfMzVHSCzHxQSQTPZ": {"alias": "bobloblaw", "chain": "solana", "avg_trade_size_usd": 1000.0, "win_rate": 0.5},
+    "GWcBJ6BUPw4w87GyiSiKgzrRBGBXypmC98rqzMJqA2dJ": {"alias": "yanineko", "chain": "solana", "avg_trade_size_usd": 1000.0, "win_rate": 0.5},
+    "6zMPHJMEnaS5toiVy59KL8k5SvVYCdEAZgbf4RCa8vBE": {"alias": "Dedrater", "chain": "solana", "avg_trade_size_usd": 1000.0, "win_rate": 0.5},
+    "4t5nPKrKC2BX7RBLv7Gm5MghFMvgoXTQFg8KSy4QdM6V": {"alias": "lefty", "chain": "solana", "avg_trade_size_usd": 1000.0, "win_rate": 0.5},
+    "usvNm7AraV9bjfJs3bRs7KjgfbYDZKvpn1GMsVX2fb1": {"alias": "RT", "chain": "solana", "avg_trade_size_usd": 1000.0, "win_rate": 0.5},
+    "FJDy9FDRy6bwGEUKuAC98bUtN8MkpE2pT7Dj7HE3Z7Q1": {"alias": "Unipcs", "chain": "solana", "avg_trade_size_usd": 1000.0, "win_rate": 0.5},
+    "AS6XTzRBBKe15u7c6hTbzjru22MQRWhRRM91QzshYzya": {"alias": "Kaduna", "chain": "solana", "avg_trade_size_usd": 1000.0, "win_rate": 0.5},
+    "5amw8o962mrUQq1hWTjUa6WMcyBPcNdWRe6rWM6zo4x6": {"alias": "ebaniludik", "chain": "solana", "avg_trade_size_usd": 1000.0, "win_rate": 0.5},
+    "7rpkCAMyNnpGxsbRKszqawgPDe8eRwho9jgfzMZfsfEK": {"alias": "EricCryptoman", "chain": "solana", "avg_trade_size_usd": 1000.0, "win_rate": 0.5},
+    "2r8Z99rdDQNuiGHBoK1bbfVvifiYUwofc8e7wUz7S7Qm": {"alias": "bluntz", "chain": "solana", "avg_trade_size_usd": 1000.0, "win_rate": 0.5},
+    "B8tB2a5uRHLSTg6hSoc8UDJaL6LeJYCaEVhfq6DEG5FF": {"alias": "generationalfumble", "chain": "solana", "avg_trade_size_usd": 1000.0, "win_rate": 0.5},
+    "HZrxCXCms81ryxwvYNycwcPmynXmPgcKV4C2FeDJA86e": {"alias": "ericeth", "chain": "solana", "avg_trade_size_usd": 1000.0, "win_rate": 0.5},
+    "BS5KRbtnAkqQyDgEcjr97A2ZeNv6DMTZgq149paGagWC": {"alias": "DuckSoldier", "chain": "solana", "avg_trade_size_usd": 1000.0, "win_rate": 0.5},
+    "48M5Q8gy9TyfPrMjPEqHWm61DsQ2393JwGhnuRXj8rzH": {"alias": "neo", "chain": "solana", "avg_trade_size_usd": 1000.0, "win_rate": 0.5},
+    "ELXarhHXtFydYLJ3cZ3NbEFRsP85TSfkW9YXhQtWnWgc": {"alias": "DeeZe", "chain": "solana", "avg_trade_size_usd": 1000.0, "win_rate": 0.5},
+    "AvDcwxqbVvUYBvSeUR88JxvmgGJuwayNvAdboDv4rTCM": {"alias": "kimjongun", "chain": "solana", "avg_trade_size_usd": 1000.0, "win_rate": 0.5},
+    "8ks6a6bj1Lq78TsdDjA12VkD8nFgJtP5FFiyX7o39WCW": {"alias": "Unicorn", "chain": "solana", "avg_trade_size_usd": 1000.0, "win_rate": 0.5},
+    "BDuKtmc5ssnZhWLQbux7VLnTA6BdBHFs4ThiMfFj9u4P": {"alias": "zaceth", "chain": "solana", "avg_trade_size_usd": 1000.0, "win_rate": 0.5},
+    "EArbLvWf5xo6JZfVpfk7ANUThZEwMNhYcptP7eKg5qgs": {"alias": "Badabeep", "chain": "solana", "avg_trade_size_usd": 1000.0, "win_rate": 0.5},
+    "CGcvCcpRLxYs9ZKd15wbFStg4HBuwstdXiw5Jgwxq27d": {"alias": "Value", "chain": "solana", "avg_trade_size_usd": 1000.0, "win_rate": 0.5},
+    "ARCRywUNjhjNMAQCRxKXna1KH5HMzx1C8kN8EppD9D4U": {"alias": "Albus", "chain": "solana", "avg_trade_size_usd": 1000.0, "win_rate": 0.5},
+    "4v2t4fn7EuZaUtGymVyEqCediePfdoE1v3azozTw16T4": {"alias": "topickcrypto", "chain": "solana", "avg_trade_size_usd": 1000.0, "win_rate": 0.5},
+    "9ad2xvzHWbjui5NyUaRkC8ycsX4ZufJpLegQ8texV9Ao": {"alias": "DueRivalWren", "chain": "solana", "avg_trade_size_usd": 1000.0, "win_rate": 0.5},
+    "6ug9m4JajZrkJ5kB31VQ6m6kQsWBkCs3x2TAvUFqJD19": {"alias": "GiganticCheeseRetard", "chain": "solana", "avg_trade_size_usd": 1000.0, "win_rate": 0.5},
+    "HbqKbT4UXvqWdEyCs54PzjrrKysFBirq9sqx1avrLmwQ": {"alias": "LevelsDennis", "chain": "solana", "avg_trade_size_usd": 1000.0, "win_rate": 0.5},
+    "GM8u1GgckUpsWEtGpdztLEzPyF5fQUBTUrnQsa32WVVc": {"alias": "Frosty", "chain": "solana", "avg_trade_size_usd": 1000.0, "win_rate": 0.5},
+    "AZJ4G1bRA3zT8BkqyyTPppqCUY7j92arwYCjcR3KaMfQ": {"alias": "mk4", "chain": "solana", "avg_trade_size_usd": 1000.0, "win_rate": 0.5},
+    "6fs1GrNW9176CmBTDrtC2su7FQe1XjntUnRwGyNqYowU": {"alias": "lyx", "chain": "solana", "avg_trade_size_usd": 1000.0, "win_rate": 0.5},
+    "2GKpFFehqF2VknP6TNrh5pnbpGhFA9aiNGaLWbwRLcGS": {"alias": "cringelord", "chain": "solana", "avg_trade_size_usd": 1000.0, "win_rate": 0.5},
+    "CckZNRTevhQizNyU4Nv1BXJtEyRo9RqnnSjbcRkHFszf": {"alias": "au2", "chain": "solana", "avg_trade_size_usd": 1000.0, "win_rate": 0.5},
+    "HTpumppos77vJbxekoSEFsi6HejDLknn6tRngFNptDzR": {"alias": "plottwist", "chain": "solana", "avg_trade_size_usd": 1000.0, "win_rate": 0.5},
+    "D5NAtCzYikf67zNVpg6uDc6w27ZRQdRM66iQmpuZFKuU": {"alias": "Miyamoto", "chain": "solana", "avg_trade_size_usd": 1000.0, "win_rate": 0.5},
+    "9nKxuozxn9ozXYx32nU8EhzuqUjijqfjvrQkQe5sqiE4": {"alias": "TreasureGoblin", "chain": "solana", "avg_trade_size_usd": 1000.0, "win_rate": 0.5},
+    "EMSxJrFaB9A2LSp9tbUsjmBNNnkNZ8euDcRvdLEhDxik": {"alias": "Monkey", "chain": "solana", "avg_trade_size_usd": 1000.0, "win_rate": 0.5},
+    "853yxZmJZVnPoWzUsQiGkk9DWgrA8v2uFN8fJvWNo1JN": {"alias": "downhorrendously", "chain": "solana", "avg_trade_size_usd": 1000.0, "win_rate": 0.5},
+    "BoBdB7Zi4Vvjg4zVEgTwasQPhuU3GrVzEFkLhiAzTpy5": {"alias": "ice", "chain": "solana", "avg_trade_size_usd": 1000.0, "win_rate": 0.5},
+    "Gt6MM3JA2HeJRU7x6tp5yUBVZrTFeMscs6S5gg8BpRqd": {"alias": "Ethermonk", "chain": "solana", "avg_trade_size_usd": 1000.0, "win_rate": 0.5},
+    "2FZWheWt5r9zDSa7y8aB5A5iHT65NKMXVWrvnPYWN13h": {"alias": "dougfunnie", "chain": "solana", "avg_trade_size_usd": 1000.0, "win_rate": 0.5},
+    "7VwwdxZXECjp8Dxex5DTvFcXAtsjQMFddnyHVbMGGAtP": {"alias": "auspicious", "chain": "solana", "avg_trade_size_usd": 1000.0, "win_rate": 0.5},
+    "2zU6ASCZJSDHRvUvJvJg4aP454ioq9CRz9DdcBsaJbZp": {"alias": "Conviction", "chain": "solana", "avg_trade_size_usd": 1000.0, "win_rate": 0.5},
+    "GsJhJ9zo19vWbQMBaMGPhMfkNzVAB16bCUWM7D8bD191": {"alias": "picadura", "chain": "solana", "avg_trade_size_usd": 1000.0, "win_rate": 0.5},
+    "51hE7oK7rRsG7FZESY4pXuZfgP4mNN31L9LqbzSYGm4V": {"alias": "TubifexPupa", "chain": "solana", "avg_trade_size_usd": 1000.0, "win_rate": 0.5},
 }
 
 DEV_REPUTATION_DATABASE: dict[str, dict[str, Any]] = {
@@ -361,13 +682,146 @@ HIVE_MIND_TIMESTAMPS: dict[str, list[tuple[str, float]]] = defaultdict(list)
 TOKEN_CREATION_TIME: dict[str, float] = {}
 TOKEN_WATCHLIST: dict[str, dict[str, Any]] = {}
 
+# --- Jev (TypeSafe) runtime state -------------------------------------------
+# Which tokens have already been sent to Jev (once-per-candidate cache). Value
+# is the timestamp of the evaluation; presence alone means "don't spend another
+# call on this token." Bounded so long uptime can't grow it unbounded.
+JEV_EVALUATED_TOKENS: dict[str, float] = {}
+JEV_EVALUATED_MAX = 4000
+
+# Stage-1 Early Momentum screening cache (gated, 2-question screening before full eval)
+JEV_SCREENED_TOKENS: dict[str, float] = {}
+JEV_SCREENED_MAX = 4000
+
+# Semantic content-hash cache for invariant qualitative questions (dedup across identical memes)
+JEV_SEMANTIC_CACHE: dict[str, dict[str, Any]] = {}
+JEV_SEMANTIC_CACHE_MAX = 2000
+JEV_SEMANTIC_CACHE_TTL = 86400.0  # 24 hours
+
+
+def _compute_semantic_hash(ticker: Optional[str], name: Optional[str], description: Optional[str]) -> str:
+    t = (ticker or "").upper().strip()
+    n = (name or "").lower().strip()
+    d = (description or "").lower().strip()[:300]
+    raw = f"{t}|{n}|{d}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+# Live spend/usage accounting so the budget is never a black box. Persisted so
+# the lifetime cap and today's counts survive restarts. day_key rolls over.
+JEV_USAGE: dict[str, Any] = {
+    "calls_total": 0,          # lifetime successful calls (counts against JEV_MAX_CALLS_TOTAL)
+    "calls_today": 0,
+    "input_tokens_total": 0,
+    "output_tokens_total": 0,
+    "errors": 0,
+    "last_error": None,
+    "skipped_not_ready": 0,  # routine "token not ready" skips (not shown as events)
+    "day_key": "",             # date these _today counters belong to
+    "budget_exhausted": False, # set True once a cap is hit; surfaced in UI
+    "disabled_reason": None,    # human-readable why Jev isn't calling (no key / cap hit)
+}
+# The learning-loop ledger: one record per Jev judgment, with the token's
+# eventual outcome filled in later (mooned / rugged / flat) so JEV_CORRELATION
+# can show which dimensions actually track winners on YOUR data. Bounded.
+JEV_JUDGMENT_LOG: dict[str, dict[str, Any]] = {}
+JEV_JUDGMENT_LOG_MAX = 4000
+# PvP learning ledger: one record per comparative pick, keyed by narrative, with
+# the picked coin + the full cohort + which coin (if any) actually mooned. Lets
+# us measure "when Jev picked between same-name coins, was it right?" Bounded.
+JEV_PVP_LOG: dict[str, dict[str, Any]] = {}
+JEV_PVP_LOG_MAX = 2000
+# Reverse index: token_address -> narrative_key(s) it belongs to in a PvP pick,
+# so a token's terminal outcome can update the right PvP record(s).
+JEV_PVP_TOKEN_INDEX: dict[str, set[str]] = defaultdict(set)
+# A rich, display-ready feed of the most recent judgments (full dimensions,
+# score contribution, reasons, verdict) so the dashboard can show, in detail,
+# exactly what Jev looked at and concluded — not just aggregate counts.
+RECENT_JEV_JUDGMENTS: "deque" = deque(maxlen=60)
+# A UNIFIED event log of EVERYTHING Jev does — every evaluation, every skip
+# (with the exact reason), every veto, every API error, every PvP pick/skip.
+# The point: no Jev action is invisible. Broadcast live + shown as a stream.
+RECENT_JEV_EVENTS: "deque" = deque(maxlen=200)
+# Tokens that have already emitted a budget-block event today (dedup so a
+# capped day doesn't flood the log with the same token every poll).
+JEV_BUDGET_BLOCKED_SEEN: set[str] = set()
+
+# Per-chain history of coins that ran above BIG_RUNNER_MCAP_USD — the reference
+# set Jev compares a new same-name cohort against. Keyed by chain -> list of
+# {ticker, narrative_key, platform, peak_mcap, first_seen, recorded_at}. This
+# is the "check coins that ran >$500k on this chain" evidence, supplied to Jev
+# as state (Jev can't fetch history itself). Populated live + seedable.
+BIG_RUNNERS: dict[str, list[dict[str, Any]]] = defaultdict(list)
+BIG_RUNNERS_SEEN: set[str] = set()  # token addresses already recorded, dedup
+
+# Cohort-signature cache so a PvP comparative call isn't re-spent every poll —
+# only when the same-name cohort materially changes (new member / leader flip).
+JEV_PVP_CACHE: dict[str, dict[str, Any]] = {}
+JEV_PVP_CACHE_MAX = 500
+# Narratives with a PvP call currently in flight — prevents an async race where
+# several cohort members rescored at the same instant each fire a duplicate call.
+JEV_PVP_INFLIGHT: set[str] = set()
+
+# --- #3 Question-proposal & measurement loop --------------------------------
+# Candidate questions being TESTED (not yet part of the trusted scoring set).
+# Each is asked alongside the core questions, its answers logged per token, and
+# scored by how well it separates winners from losers. A generative LLM can
+# auto-propose these (if a key is set); otherwise they're added manually via the
+# /api/jev/propose endpoint. Winners can be promoted into the core set.
+# Shape per id: {type, instructions, criteria, active, status, proposed_by,
+#                proposed_at, answers: {token: value}}
+JEV_PROPOSED_QUESTIONS: dict[str, dict[str, Any]] = {}
+JEV_PROPOSED_MAX = 12  # cap active proposals so test calls don't bloat token cost
+
+# --- Semantic narrative themes (DeepSeek-tagged, replaces regex clustering) --
+# For each gated coin, DeepSeek assigns a canonical theme slug (e.g. "ai-agents",
+# "politics", "dog-meme"). Coins are then grouped by THEME across different
+# tickers — real semantic narratives, not just identical ticker strings.
+NARRATIVE_THEMES: dict[str, dict[str, Any]] = {}   # theme_slug -> {label, coins:[...], first_seen, chains}
+TOKEN_THEME: dict[str, str] = {}                    # token_address -> theme_slug
+JEV_THEME_TAGGED: dict[str, float] = {}             # dedup: token -> tagged_at
+JEV_THEME_TAGGED_MAX = 4000
+# Tokens the discovery scanner has already injected (dedup so it doesn't
+# re-add the same coin every scan). Bounded.
+DISCOVERED_TOKENS: dict[str, float] = {}
+DISCOVERED_TOKENS_MAX = 4000
+# Free social data from DexScreener token-profiles (twitter/telegram/website
+# links + description). Rolling cache keyed by token address, refreshed by a
+# periodic worker. Real X sentiment isn't free, but "does it have socials" is.
+TOKEN_PROFILES: dict[str, dict[str, Any]] = {}   # addr -> {socials:[types], description, link_count}
+TOKEN_PROFILES_MAX = 3000
+# Live pump.fun description feed + rolling trending-word aggregation. Each new
+# coin description is pushed here; words are counted with a last-seen timestamp
+# so a word drops off the trending pill bar after TRENDING_WORD_TTL_SECONDS of
+# not reappearing (a decaying, live "what narrative is hot right now" view).
+RECENT_DESCRIPTIONS: "deque" = deque(maxlen=80)
+TRENDING_WORDS: dict[str, dict[str, Any]] = {}   # word -> {count, last_seen}
+TRENDING_WORD_TTL_SECONDS = 180.0                # 3 min without reappearing = dies
+TRENDING_STOPWORDS = {
+    "the","a","an","to","of","and","for","in","on","is","it","its","this","that","with",
+    "coin","token","meme","memecoin","solana","sol","pump","fun","launched","stonkfun",
+    "via","by","new","first","official","community","your","you","we","are","be","will",
+    "was","has","have","from","at","as","or","not","no","all","just","now","get","let",
+    "fees","cameo","usepaid","http","https","com","www","t","co","x",
+}
+# Generative LLM for the auto-writer (optional). Blank => manual queue only.
+JEV_PROPOSER_LLM_KEY = os.getenv("JEV_PROPOSER_LLM_KEY", "") or os.getenv("OPENAI_API_KEY", "") or os.getenv("ANTHROPIC_API_KEY", "")
+JEV_PROPOSER_LLM_URL = os.getenv("JEV_PROPOSER_LLM_URL", "https://api.deepseek.com/chat/completions")
+JEV_PROPOSER_LLM_MODEL = os.getenv("JEV_PROPOSER_LLM_MODEL", "deepseek-chat")
+# How often the auto-proposer runs, and how many new candidates it may add per
+# round. Conservative: proposals cost Jev tokens on every subsequent eval.
+JEV_PROPOSER_INTERVAL_SECONDS = float(os.getenv("JEV_PROPOSER_INTERVAL_SECONDS", "3600"))
+JEV_PROPOSER_MAX_NEW_PER_ROUND = int(os.getenv("JEV_PROPOSER_MAX_NEW_PER_ROUND", "2"))
+# A proposal with clearly negative separation after this many labeled outcomes
+# is auto-retired (it predicts the wrong way or nothing).
+JEV_PROPOSAL_MIN_LABELS_TO_JUDGE = int(os.getenv("JEV_PROPOSAL_MIN_LABELS_TO_JUDGE", "8"))
+
 # Bounded, dashboard-facing token feed (survives a browser refresh via the
 # /ws/dashboard snapshot). Insertion order is creation order; updates mutate
 # in place without moving position. Capped so a 24/7 deployment doesn't leak
 # memory indefinitely.
 TOKEN_FEED: dict[str, dict[str, Any]] = {}
 TOKEN_FEED_MAX = 1500
-SNAPSHOT_TOKEN_LIMIT = 400  # cap on how many tokens a reconnect snapshot sends at once
+SNAPSHOT_TOKEN_LIMIT = 80  # cap on how many tokens a reconnect snapshot sends at once
 SPARKLINE_MAX_POINTS = 24
 
 
@@ -381,7 +835,71 @@ def token_feed_upsert(token_address: str, **fields: Any) -> dict[str, Any]:
             if oldest_key != token_address:
                 del TOKEN_FEED[oldest_key]
     entry.update(fields)
+    inferred_plat = infer_launchpad_platform(entry.get("platform"), token_address)
+    if inferred_plat:
+        entry["platform"] = inferred_plat
     return entry
+
+
+import re as _re_desc
+
+
+def record_description(ticker: Optional[str], name: Optional[str], description: Optional[str],
+                      platform: Optional[str], token_address: str) -> bool:
+    """Push a coin's description into the live feed and fold its words into the
+    rolling trending-word counter. Deduped per token. Returns True if recorded."""
+    if not description or len(description.strip()) < 3:
+        return False
+    # dedup: don't re-record the same token's description
+    if any(d.get("token_address") == token_address for d in RECENT_DESCRIPTIONS):
+        return False
+    now = time.time()
+    RECENT_DESCRIPTIONS.append({
+        "token_address": token_address, "ticker": ticker, "name": name,
+        "description": description.strip()[:200], "platform": platform, "ts": now,
+    })
+    # tokenize name + description into words for trending aggregation
+    text = f"{name or ''} {description}".lower()
+    words = _re_desc.findall(r"[a-z0-9$#]{3,20}", text)
+    seen_this = set()
+    for w in words:
+        w = w.strip("$#")
+        if len(w) < 3 or w in TRENDING_STOPWORDS or w.isdigit():
+            continue
+        if w in seen_this:
+            continue  # count each word once per coin
+        seen_this.add(w)
+        rec = TRENDING_WORDS.get(w)
+        if rec:
+            rec["count"] += 1
+            rec["last_seen"] = now
+        else:
+            TRENDING_WORDS[w] = {"count": 1, "last_seen": now}
+    return True
+
+
+def build_trending_words(limit: int = 12) -> list[dict[str, Any]]:
+    """Current trending words — those seen within the TTL window, by count.
+    Words not reappearing within TRENDING_WORD_TTL_SECONDS drop off (die)."""
+    now = time.time()
+    # prune dead words
+    for w in list(TRENDING_WORDS.keys()):
+        if now - TRENDING_WORDS[w]["last_seen"] > TRENDING_WORD_TTL_SECONDS:
+            del TRENDING_WORDS[w]
+    live = [
+        {"word": w, "count": r["count"], "age_s": round(now - r["last_seen"])}
+        for w, r in TRENDING_WORDS.items() if r["count"] >= 2  # need >=2 coins to "trend"
+    ]
+    live.sort(key=lambda x: (-x["count"], x["age_s"]))
+    return live[:limit]
+
+
+def build_description_feed(limit: int = 40) -> dict[str, Any]:
+    """Recent descriptions (newest first) + current trending words for the UI."""
+    return {
+        "descriptions": list(RECENT_DESCRIPTIONS)[-limit:][::-1],
+        "trending_words": build_trending_words(),
+    }
 
 CONNECTED_CLIENTS: set[WebSocket] = set()
 ALERT_HISTORY: deque = deque(maxlen=300)
@@ -490,7 +1008,14 @@ async def run_forever(coro_factory, name: str) -> None:
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 - top-level resiliency boundary by design
+            err_msg = str(exc)
             logger.warning(f"[{name}] error: {exc!r}")
+            # If the RPC quota is exhausted or access is forbidden (HTTP 403),
+            # back off for 30 minutes instead of rapidly spamming logs every 60s.
+            if "403" in err_msg or "quota" in err_msg.lower() or "forbidden" in err_msg.lower():
+                logger.warning(f"[{name}] RPC quota exhausted or forbidden (403). Pausing connection attempts for 30 minutes.")
+                await asyncio.sleep(1800)
+                continue
         elapsed = time.time() - started
         backoff = 1.0 if elapsed > 60 else min(backoff * 2, 60.0)
         sleep_for = backoff + random.uniform(0, 1)
@@ -558,7 +1083,13 @@ class JsonRpcWsClient:
         msg = await self._notifications.get()
         params = msg.get("params", {})
         result = params.get("result")
-        return result if isinstance(result, dict) else {}
+        out = result if isinstance(result, dict) else {}
+        # expose the subscription id so callers can map a notification back to
+        # which subscription (e.g. which watched wallet) produced it.
+        if isinstance(out, dict) and "subscription" in params:
+            out = dict(out)
+            out["_subscription"] = params.get("subscription")
+        return out
 
     async def close(self) -> None:
         if self._reader_task:
@@ -692,6 +1223,175 @@ def decode_four_meme_token_create(data_hex: str) -> dict[str, Any]:
 # SECTION 5 — MARKET DATA (DexScreener — public, unauthenticated, real)
 # ============================================================================
 
+# --- Birdeye rate-limited enrichment (Solana) -------------------------------
+_BIRDEYE_LOCK = asyncio.Lock()
+_BIRDEYE_LAST_CALL = 0.0
+
+
+async def _birdeye_get(path: str) -> Optional[dict[str, Any]]:
+    """One throttled Birdeye GET. Serializes calls through a lock + global
+    min-interval so the free tier's ~1 req/s isn't exceeded. Retries 429 with
+    backoff. Returns the JSON 'data' object, or None on any failure (fail-safe)."""
+    if not BIRDEYE_ENABLED:
+        return None
+    global _BIRDEYE_LAST_CALL
+    url = f"{BIRDEYE_API_BASE.rstrip('/')}/{path}"
+    headers = {"X-API-KEY": BIRDEYE_API_KEY, "x-chain": "solana", "Accept-Encoding": "gzip, deflate"}
+    backoff = 1.5
+    for attempt in range(1, BIRDEYE_MAX_RETRIES + 1):
+        try:
+            async with _BIRDEYE_LOCK:
+                # global throttle: space calls out
+                wait = BIRDEYE_MIN_INTERVAL_SECONDS - (time.time() - _BIRDEYE_LAST_CALL)
+                if wait > 0:
+                    await asyncio.sleep(wait)
+                timeout = aiohttp.ClientTimeout(total=BIRDEYE_TIMEOUT)
+                async with aiohttp.ClientSession(timeout=timeout) as session:
+                    async with session.get(url, headers=headers) as resp:
+                        _BIRDEYE_LAST_CALL = time.time()
+                        if resp.status == 200:
+                            body = await resp.json()
+                            return body.get("data") if isinstance(body, dict) else None
+                        if resp.status == 429 and attempt < BIRDEYE_MAX_RETRIES:
+                            pass  # fall through to backoff below (outside lock)
+                        else:
+                            return None
+            await asyncio.sleep(backoff)
+            backoff *= 2
+        except Exception as exc:
+            logger.debug(f"[birdeye] {path} failed: {exc!r}")
+            return None
+    return None
+
+
+async def fetch_birdeye_overview(token_address: str) -> dict[str, Any]:
+    """Price / market cap / liquidity from Birdeye — fallback when DexScreener
+    has no data yet. Returns normalized dict (same keys as DexScreener) or {}."""
+    data = await _birdeye_get(f"defi/token_overview?address={token_address}")
+    if not data:
+        return {}
+    return {
+        "market_cap": float(data.get("marketCap") or data.get("mc") or 0.0),
+        "price_usd": float(data.get("price") or 0.0),
+        "liquidity_usd": float(data.get("liquidity") or 0.0),
+        "volume_24h": float((data.get("v24hUSD") or data.get("v24h") or 0.0) or 0.0),
+        "symbol": (data.get("symbol") or "").strip(),
+        "name": (data.get("name") or "").strip(),
+        "_source": "birdeye",
+    }
+
+
+async def fetch_birdeye_holders(token_address: str) -> dict[str, Any]:
+    """Holder count + top-holder concentration from Birdeye — fills the gap
+    DexScreener doesn't cover and the RPC holder scan often can't. Returns
+    {holder_count, top_holder_pct, top10_holder_pct} or {}."""
+    data = await _birdeye_get(f"defi/v3/token/holder?address={token_address}&offset=0&limit=10")
+    if not data:
+        return {}
+    out: dict[str, Any] = {}
+    if data.get("holder") is not None:
+        out["holder_count"] = int(data.get("holder") or 0)
+    if data.get("top10_hold_percent") is not None:
+        out["top10_holder_pct"] = round(float(data["top10_hold_percent"]), 2)
+    items = data.get("items") or []
+    if items:
+        # top holder % ≈ largest holder's share; Birdeye gives raw amounts, and
+        # top10% — approximate the single top holder from the first item vs total
+        # of the returned items is unreliable, so only set top10 (authoritative).
+        try:
+            top1 = float(items[0].get("amount") or 0)
+            # amount is raw; use it only relative to nothing reliable → skip top_holder_pct
+        except (ValueError, TypeError, IndexError):
+            pass
+    return out
+
+
+# --- Discovery sources: find already-trading Solana coins we missed at launch --
+async def refresh_token_profiles() -> int:
+    """Pull DexScreener token-profiles (free, no key) — the 30 newest coins that
+    submitted a profile, with their social links (twitter/telegram/website) +
+    description. Cache by address so Jev can be told whether a coin has real
+    social presence. Real X sentiment isn't free, but this presence signal is.
+    Returns count cached. Fail-safe."""
+    try:
+        url = f"{DEXSCREENER_API_BASE}/token-profiles/latest/v1"
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                if resp.status != 200:
+                    return 0
+                data = await resp.json()
+    except Exception as exc:
+        logger.debug(f"[profiles] fetch failed: {exc!r}")
+        return 0
+    n = 0
+    for item in (data if isinstance(data, list) else []):
+        addr = item.get("tokenAddress")
+        if not addr:
+            continue
+        links = item.get("links") or []
+        socials = sorted({(l.get("type") or "").lower() for l in links if l.get("type")})
+        TOKEN_PROFILES[addr] = {
+            "socials": socials,
+            "link_count": len(links),
+            "description": (item.get("description") or "").strip()[:400],
+            "cached_at": time.time(),
+        }
+        n += 1
+    # bound the cache
+    while len(TOKEN_PROFILES) > TOKEN_PROFILES_MAX:
+        TOKEN_PROFILES.pop(next(iter(TOKEN_PROFILES)), None)
+    return n
+
+
+async def token_profiles_worker() -> None:
+    """Refresh the token-profiles social cache periodically (free endpoint)."""
+    await asyncio.sleep(15)
+    while True:
+        try:
+            await refresh_token_profiles()
+        except Exception as exc:
+            logger.warning(f"[profiles] worker error: {exc!r}")
+        await asyncio.sleep(120)  # every 2 min; endpoint is a rolling newest-30
+
+
+async def fetch_dexscreener_boosted_solana() -> list[str]:
+    """DexScreener token-boosts (free, no key): actively-promoted tokens. Returns
+    Solana token addresses. Fail-safe."""
+    out: list[str] = []
+    for path in ("token-boosts/top/v1", "token-boosts/latest/v1"):
+        try:
+            url = f"{DEXSCREENER_API_BASE}/{path}"
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                    if resp.status != 200:
+                        continue
+                    data = await resp.json()
+            for item in (data if isinstance(data, list) else []):
+                if item.get("chainId") == "solana" and item.get("tokenAddress"):
+                    out.append(item["tokenAddress"])
+        except Exception as exc:
+            logger.debug(f"[discovery] dexscreener boosts {path} failed: {exc!r}")
+    return list(dict.fromkeys(out))  # dedup, keep order
+
+
+async def fetch_birdeye_top_volume_solana(limit: int = 30) -> list[str]:
+    """Birdeye v3 token list sorted by 24h volume — 'what's moving on Solana'.
+    Rate-limited via the shared Birdeye throttle. Fail-safe."""
+    if not BIRDEYE_ENABLED:
+        return []
+    data = await _birdeye_get(f"defi/v3/token/list?sort_by=volume_24h_usd&sort_type=desc&offset=0&limit={limit}")
+    if not data:
+        return []
+    items = data.get("items") or []
+    out = []
+    for it in items:
+        addr = it.get("address")
+        # skip SOL/stables/wrapped — only want tradeable memecoins
+        if addr and not addr.startswith("So1111") and it.get("symbol") not in ("SOL", "USDC", "USDT"):
+            out.append(addr)
+    return out
+
+
 async def fetch_dexscreener_info(token_address: str) -> dict[str, Any]:
     """Single DexScreener lookup returning market cap, price, token name/symbol,
     24h volume, 24h buy/sell tx counts, and liquidity. Volume/liquidity matter a
@@ -704,38 +1404,81 @@ async def fetch_dexscreener_info(token_address: str) -> dict[str, Any]:
     blocks non-browser requests, confirmed by testing it directly) are usable
     for that from a server-side process — holder count is not implemented."""
     url = f"{DEXSCREENER_API_BASE}/latest/dex/tokens/{token_address}"
+    # DexScreener rate-limits high-frequency polling and intermittently returns
+    # 429 or an empty pairs list even when the token HAS data — which used to get
+    # stored as mcap 0 and drop the coin out of the gate forever. Retry a couple
+    # of times with backoff so a transient throttle doesn't zero a real coin.
+    for attempt in range(3):
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                    if resp.status == 429:
+                        await asyncio.sleep(0.6 * (attempt + 1))
+                        continue
+                    if resp.status != 200:
+                        return {}
+                    payload = await resp.json()
+                    pairs = payload.get("pairs") or []
+                    if not pairs:
+                        if attempt < 2:
+                            await asyncio.sleep(0.6 * (attempt + 1))
+                            continue
+                        return {}
+                    break
+        except Exception:
+            if attempt < 2:
+                await asyncio.sleep(0.6 * (attempt + 1))
+                continue
+            return {}
+    else:
+        return {}
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                if resp.status != 200:
-                    return {}
-                payload = await resp.json()
-                pairs = payload.get("pairs") or []
-                if not pairs:
-                    return {}
-                pairs.sort(key=lambda p: float((p.get("liquidity") or {}).get("usd") or 0), reverse=True)
-                best = pairs[0]
-                base = best.get("baseToken") or {}
-                volume = best.get("volume") or {}
-                txns_24h = (best.get("txns") or {}).get("h24") or {}
-                # DexScreener only populates `info` once a project has
-                # submitted a token profile — usually null for a brand-new
-                # fair-launch token, populated for anything more established.
-                # Best-effort, not guaranteed coverage; free since this
-                # endpoint is already being polled for every other field here.
-                info = best.get("info") or {}
-                return {
-                    "market_cap": float(best.get("marketCap") or best.get("fdv") or 0.0),
-                    "price_usd": float(best.get("priceUsd") or 0.0),
-                    "symbol": (base.get("symbol") or "").strip(),
-                    "name": (base.get("name") or "").strip(),
-                    "volume_24h": float(volume.get("h24") or 0.0),
-                    "liquidity_usd": float((best.get("liquidity") or {}).get("usd") or 0.0),
-                    "buys_24h": int(txns_24h.get("buys") or 0),
-                    "sells_24h": int(txns_24h.get("sells") or 0),
-                    "txns_24h": int(txns_24h.get("buys") or 0) + int(txns_24h.get("sells") or 0),
-                    "image_url": info.get("imageUrl"),
-                }
+        pairs.sort(key=lambda p: float((p.get("liquidity") or {}).get("usd") or 0), reverse=True)
+        best = pairs[0]
+        base = best.get("baseToken") or {}
+        volume = best.get("volume") or {}
+        txns_24h = (best.get("txns") or {}).get("h24") or {}
+        # DexScreener only populates `info` once a project has
+        # submitted a token profile — usually null for a brand-new
+        # fair-launch token, populated for anything more established.
+        # Best-effort, not guaranteed coverage; free since this
+        # endpoint is already being polled for every other field here.
+        info = best.get("info") or {}
+        raw_socials = info.get("socials") or []
+        raw_websites = info.get("websites") or []
+        boosts_data = best.get("boosts") or {}
+        active_boosts = int(boosts_data.get("active") or 0)
+
+        twitter_url = next((s.get("url") for s in raw_socials if (s.get("type") or "").lower() == "twitter"), None)
+        telegram_url = next((s.get("url") for s in raw_socials if (s.get("type") or "").lower() == "telegram"), None)
+        website_url = (raw_websites[0].get("url") if raw_websites else None) or next(
+            (s.get("url") for s in raw_socials if (s.get("type") or "").lower() in ("website", "web")), None
+        )
+
+        social_dict = {
+            "twitter": twitter_url,
+            "telegram": telegram_url,
+            "website": website_url,
+            "has_twitter": bool(twitter_url),
+            "has_telegram": bool(telegram_url),
+            "has_website": bool(website_url),
+            "social_count": sum(1 for x in [twitter_url, telegram_url, website_url] if x),
+            "active_boosts": active_boosts,
+        }
+
+        return {
+            "market_cap": float(best.get("marketCap") or best.get("fdv") or 0.0),
+            "price_usd": float(best.get("priceUsd") or 0.0),
+            "symbol": (base.get("symbol") or "").strip(),
+            "name": (base.get("name") or "").strip(),
+            "volume_24h": float(volume.get("h24") or 0.0),
+            "liquidity_usd": float((best.get("liquidity") or {}).get("usd") or 0.0),
+            "buys_24h": int(txns_24h.get("buys") or 0),
+            "sells_24h": int(txns_24h.get("sells") or 0),
+            "txns_24h": int(txns_24h.get("buys") or 0) + int(txns_24h.get("sells") or 0),
+            "image_url": info.get("imageUrl"),
+            "socials": social_dict,
+        }
     except Exception as exc:
         logger.debug(f"fetch_dexscreener_info({token_address}) failed: {exc!r}")
         return {}
@@ -762,7 +1505,7 @@ CHAIN_EXPLORER_URLS = {
 DEXSCREENER_CHAIN_SLUGS = {"solana": "solana", "bnb": "bsc", "robinhood": "robinhood"}
 
 
-def build_token_links(chain: str, token_address: str) -> dict[str, str]:
+def build_token_links(chain: str, token_address: str, platform: Optional[str] = None) -> dict[str, str]:
     links = {}
     explorer_tpl = CHAIN_EXPLORER_URLS.get(chain)
     if explorer_tpl:
@@ -770,7 +1513,23 @@ def build_token_links(chain: str, token_address: str) -> dict[str, str]:
     slug = DEXSCREENER_CHAIN_SLUGS.get(chain)
     if slug:
         links["dexscreener"] = f"https://dexscreener.com/{slug}/{token_address}"
+    fomo_chain = chain if chain in ("solana", "bnb", "base", "robinhood") else "solana"
+    links["fomo"] = f"https://fomo.family/tokens/{fomo_chain}/{token_address}"
+    addr_lower = (token_address or "").lower()
+    if chain == "solana":
+        if is_stonkboard_token(token_address, platform):
+            links["stonkboard"] = f"https://thestonkboard.com/coin/{token_address}"
+        links["pumpfun"] = f"https://pump.fun/{token_address}"
+        links["birdeye"] = f"https://birdeye.so/token/{token_address}?chain=solana"
+        links["rugcheck"] = f"https://rugcheck.xyz/tokens/{token_address}"
+    if addr_lower.endswith("pump") or (platform and "pump" in platform.lower()):
+        links["pumpfun"] = f"https://pump.fun/{token_address}"
+    if addr_lower.endswith("4444") or (platform and ("four" in platform.lower() or "4meme" in platform.lower())):
+        links["fourmeme"] = f"https://four.meme/token/{token_address}"
+    if addr_lower.endswith("7777") or (platform and "flap" in platform.lower()):
+        links["flap"] = f"https://flap.sh/{token_address}"
     return links
+
 
 
 # --- Pump.fun bonding curve account decoding (free alternative to PumpPortal's
@@ -800,6 +1559,18 @@ PUMPFUN_BONDING_CURVE_SOL_TARGET = float(os.getenv("PUMPFUN_BONDING_CURVE_SOL_TA
 # is unambiguous and mechanically impossible for a real bonding-curve token,
 # so it's used as a data-integrity tripwire rather than left unexplained.
 PUMPFUN_IMPLAUSIBLE_WATCHING_MCAP_USD = float(os.getenv("PUMPFUN_IMPLAUSIBLE_WATCHING_MCAP_USD", "200000"))
+
+# Established/stock coins keep leaking in as if freshly launched (HYPE, MSTRx,
+# ZEC, xStocks like AAPLx/TSLAx). These are NOT fair-launches — block them.
+# 1) A cross-platform mcap tripwire: a genuinely brand-new fair launch cannot
+#    already be sitting at this mcap the first time we see it, on ANY platform
+#    (the pump.fun-only guard above missed StonkFun/Ember/EVM arrivals).
+IMPLAUSIBLE_NEW_LAUNCH_MCAP_USD = float(os.getenv("IMPLAUSIBLE_NEW_LAUNCH_MCAP_USD", "1000000"))
+# 2) Known established token symbols to hard-block (comma-separated, case-insensitive).
+_default_established = "HYPE,ZEC,BTC,ETH,SOL,BNB,XRP,DOGE,SHIB,PEPE,WIF,BONK,USDC,USDT,LINK,ADA,AVAX,TRX,TON,SUI,APT,ARB,OP,MSTR,JNJ,AAPL,TSLA,NVDA,MSFT,AMZN,META,GOOG,GOOGL,COIN,AMD,NFLX,SPY,QQQ,GME,AMC,PLTR,BABA,DIS,PYPL,SQ,HOOD,KO,PEP,MCD,NKE,WMT,JPM,BAC,V,MA,PFE,XOM,CVX,RDDT,SNAP,RBLX,RIVN,SOFI,ROKU,ABNB,UBER,LYFT,INTC,ORCL,CRM,ADBE,AVGO,QCOM,MU,BA,GE,F,GM,T,VZ,WFC,GS,MS,C,SBUX,LULU,MRNA,SHOP,SQ,DASH,RIOT,MARA,SMCI,ARM,DELL,IBM,CSCO"
+ESTABLISHED_SYMBOL_BLOCKLIST = {
+    s.strip().upper() for s in os.getenv("ESTABLISHED_SYMBOL_BLOCKLIST", _default_established).split(",") if s.strip()
+}
 
 
 def _solana_https_rpc_url() -> str:
@@ -836,7 +1607,7 @@ async def _solana_rpc_post(session: aiohttp.ClientSession, method: str, params: 
 
 
 async def fetch_pumpfun_bonding_curve_state(bonding_curve_key: str) -> dict[str, Any]:
-    if not SOLANA_WS_RPC_URL or not bonding_curve_key:
+    if not (SOLANA_WS_RPC_URL or SOLANA_FALLBACK_RPC_URL) or not bonding_curve_key:
         return {}
     try:
         async with aiohttp.ClientSession() as session:
@@ -867,15 +1638,11 @@ async def fetch_pumpfun_bonding_curve_state(bonding_curve_key: str) -> dict[str,
 PUMPFUN_COIN_API_BASE = "https://frontend-api-v3.pump.fun"
 
 
-async def fetch_pumpfun_image(mint_address: str) -> Optional[str]:
-    """pump.fun's own coin API — undocumented (found by testing directly,
-    not from official docs), but confirmed real: its bonding_curve field
-    matches the address our own on-chain bonding-curve decoder already
-    derives independently. Used for exactly one thing — image_uri — never
-    for scoring-relevant fields (mcap, bonding progress, its own
-    security_verdict), since an unofficial surface that could change without
-    notice shouldn't become load-bearing when DexScreener/on-chain sources
-    already cover that ground."""
+async def fetch_pumpfun_image(mint_address: str) -> Optional[dict[str, Any]]:
+    """pump.fun's own coin API — undocumented but confirmed real. Returns the
+    coin's image_uri, name, and description (the description is the coin's own
+    pitch — exactly the narrative context Jev needs to judge it). Never used for
+    scoring-relevant numeric fields (mcap/bonding), only descriptive metadata."""
     url = f"{PUMPFUN_COIN_API_BASE}/coins/{mint_address}"
     try:
         async with aiohttp.ClientSession() as session:
@@ -885,7 +1652,14 @@ async def fetch_pumpfun_image(mint_address: str) -> Optional[str]:
                 if resp.status != 200:
                     return None
                 data = await resp.json()
-                return data.get("image_uri") or None
+                return {
+                    "image_uri": data.get("image_uri") or None,
+                    "name": (data.get("name") or "").strip() or None,
+                    "description": (data.get("description") or "").strip() or None,
+                    "twitter": data.get("twitter") or None,
+                    "telegram": data.get("telegram") or None,
+                    "website": data.get("website") or None,
+                }
     except Exception as exc:
         logger.debug(f"fetch_pumpfun_image({mint_address}) failed: {exc!r}")
         return None
@@ -897,14 +1671,44 @@ PUMPFUN_IMAGE_MAX_ATTEMPTS = 5  # ~5 poll cycles — pump.fun's own backend can 
 async def _maybe_fetch_pumpfun_image(token_address: str, info: dict[str, Any]) -> None:
     if info.get("pumpfun_image_checked"):
         return
-    if info.get("platform") != "pump.fun" or (TOKEN_FEED.get(token_address) or {}).get("image_url"):
+    fe = TOKEN_FEED.get(token_address) or {}
+    if info.get("platform") != "pump.fun" or (fe.get("image_url") and fe.get("description")):
         info["pumpfun_image_checked"] = True
         return
-    image_url = await fetch_pumpfun_image(token_address)
-    if image_url:
+    meta = await fetch_pumpfun_image(token_address)
+    if meta and (meta.get("image_uri") or meta.get("name") or meta.get("description")):
         info["pumpfun_image_checked"] = True
-        token_feed_upsert(token_address, image_url=image_url)
-        await broadcast_token_card(TOKEN_FEED[token_address])
+        upd = {}
+        if meta.get("image_uri"):
+            upd["image_url"] = meta["image_uri"]
+        if meta.get("name") and not fe.get("name"):
+            upd["name"] = meta["name"]
+        if meta.get("description") and not fe.get("description"):
+            # the coin's own pitch — the narrative context Jev was missing
+            upd["description"] = meta["description"][:1000]
+        if meta.get("twitter") or meta.get("telegram") or meta.get("website"):
+            soc = dict(info.get("socials") or {})
+            if meta.get("twitter"):
+                soc["twitter"] = meta["twitter"]
+                soc["has_twitter"] = True
+            if meta.get("telegram"):
+                soc["telegram"] = meta["telegram"]
+                soc["has_telegram"] = True
+            if meta.get("website"):
+                soc["website"] = meta["website"]
+                soc["has_website"] = True
+            soc["social_count"] = sum(1 for x in [soc.get("twitter"), soc.get("telegram"), soc.get("website")] if x)
+            upd["socials"] = soc
+            info["socials"] = soc
+        if upd:
+            token_feed_upsert(token_address, **upd)
+            await broadcast_token_card(TOKEN_FEED[token_address])
+        # feed the live description stream + trending-word aggregator
+        if meta.get("description"):
+            fe2 = TOKEN_FEED.get(token_address, {})
+            if record_description(fe2.get("ticker"), meta.get("name"),
+                                  meta.get("description"), "pump.fun", token_address):
+                await broadcast_json({"kind": "description_feed", "payload": build_description_feed()})
         return
     # Confirmed empirically: a mint that already exists on-chain (and is
     # independently fetchable moments later) can still 404/miss on pump.fun's
@@ -938,7 +1742,7 @@ async def fetch_solana_holder_stats(mint_address: str) -> dict[str, Any]:
     pipeline expensive enough to warrant its own slow, separately-throttled
     poll cadence (see HOLDER_STATS_POLL_INTERVAL_SECONDS) — a full scan of
     every token account for a mint, not a cheap indexed lookup."""
-    if not SOLANA_WS_RPC_URL:
+    if not (SOLANA_WS_RPC_URL or SOLANA_FALLBACK_RPC_URL):
         return {}
     mint_authority_active = False
     freeze_authority_active = False
@@ -957,6 +1761,41 @@ async def fetch_solana_holder_stats(mint_address: str) -> dict[str, Any]:
             parsed_info = ((mint_value.get("data") or {}).get("parsed") or {}).get("info") or {}
             mint_authority_active = parsed_info.get("mintAuthority") is not None
             freeze_authority_active = parsed_info.get("freezeAuthority") is not None
+
+            # Inspect Token-2022 extensions for transfer hooks, default frozen accounts, or permanent delegates
+            transfer_hook_active = False
+            default_account_frozen = False
+            permanent_delegate_active = False
+            extensions = parsed_info.get("extensions") or []
+            if isinstance(extensions, list):
+                for ext in extensions:
+                    if not isinstance(ext, dict):
+                        continue
+                    ename = ext.get("extension")
+                    estate = ext.get("state") or {}
+                    if ename == "transferHook":
+                        prog = estate.get("programId")
+                        if prog and prog != "11111111111111111111111111111111":
+                            transfer_hook_active = True
+                    elif ename == "defaultAccountState":
+                        if estate.get("accountState") == "frozen":
+                            default_account_frozen = True
+                    elif ename == "permanentDelegate":
+                        if estate.get("delegate"):
+                            permanent_delegate_active = True
+
+            is_honeypot = bool(freeze_authority_active or transfer_hook_active or default_account_frozen or permanent_delegate_active)
+            sell_whitelist = bool(transfer_hook_active or default_account_frozen)
+            honeypot_reason = ""
+            if transfer_hook_active:
+                honeypot_reason = "Token-2022 transfer hook active (sells whitelisted)"
+            elif default_account_frozen:
+                honeypot_reason = "Token-2022 default account state is frozen (whitelisted sells only)"
+            elif freeze_authority_active:
+                honeypot_reason = "Freeze authority active (honeypot risk)"
+            elif permanent_delegate_active:
+                honeypot_reason = "Permanent delegate active (honeypot risk)"
+
             if owner_program not in (SPL_TOKEN_PROGRAM_ID, SPL_TOKEN_2022_PROGRAM_ID):
                 return {}
 
@@ -978,6 +1817,44 @@ async def fetch_solana_holder_stats(mint_address: str) -> dict[str, Any]:
                 timeout=20.0,
             )
             if accounts is None:
+                # Fallback for free/public RPCs that disable getProgramAccounts:
+                # getTokenLargestAccounts is cheap, indexed, and supported on ALL free RPCs.
+                largest_res = await _solana_rpc_post(
+                    session, "getTokenLargestAccounts", [mint_address], timeout=10.0
+                )
+                if largest_res and "value" in largest_res:
+                    largest_accounts = largest_res["value"] or []
+                    supply_res = await _solana_rpc_post(
+                        session, "getTokenSupply", [mint_address], timeout=10.0
+                    )
+                    supply_val = float(((supply_res or {}).get("value") or {}).get("uiAmount") or 1_000_000_000.0)
+                    fallback_balances: dict[str, float] = {}
+                    for item in largest_accounts:
+                        addr = item.get("address")
+                        ui_amt = float(item.get("uiAmount") or 0.0)
+                        if addr and ui_amt > 0:
+                            fallback_balances[addr] = ui_amt
+                    if fallback_balances:
+                        SOLANA_LAST_HOLDER_BALANCES[mint_address] = fallback_balances
+                        sorted_items = sorted(fallback_balances.items(), key=lambda kv: kv[1], reverse=True)
+                        top_holder_pct = (sorted_items[0][1] / supply_val * 100.0) if supply_val > 0 else 0.0
+                        top10_sum = sum(v for _, v in sorted_items[:10])
+                        top10_holder_pct = (top10_sum / supply_val * 100.0) if supply_val > 0 else 0.0
+                        return {
+                            "holder_count": len(fallback_balances),
+                            "top_holder_pct": top_holder_pct,
+                            "top10_holder_pct": top10_holder_pct,
+                            "top_holder_address": sorted_items[0][0],
+                            "top_holder_balance": sorted_items[0][1],
+                            "mint_authority_active": mint_authority_active,
+                            "freeze_authority_active": freeze_authority_active,
+                            "transfer_hook_active": transfer_hook_active,
+                            "default_account_frozen": default_account_frozen,
+                            "permanent_delegate_active": permanent_delegate_active,
+                            "is_honeypot": is_honeypot,
+                            "sell_whitelist": sell_whitelist,
+                            "honeypot_reason": honeypot_reason,
+                        }
                 return {}
     except Exception as exc:
         logger.debug(f"fetch_solana_holder_stats({mint_address}) failed: {exc!r}")
@@ -1005,6 +1882,12 @@ async def fetch_solana_holder_stats(mint_address: str) -> dict[str, Any]:
             "holder_count": 0, "top_holder_pct": 0.0, "top10_holder_pct": 0.0,
             "mint_authority_active": mint_authority_active,
             "freeze_authority_active": freeze_authority_active,
+            "transfer_hook_active": transfer_hook_active,
+            "default_account_frozen": default_account_frozen,
+            "permanent_delegate_active": permanent_delegate_active,
+            "is_honeypot": is_honeypot,
+            "sell_whitelist": sell_whitelist,
+            "honeypot_reason": honeypot_reason,
         }
 
     total = sum(balances.values())
@@ -1020,7 +1903,311 @@ async def fetch_solana_holder_stats(mint_address: str) -> dict[str, Any]:
         "top_holder_balance": sorted_items[0][1],
         "mint_authority_active": mint_authority_active,
         "freeze_authority_active": freeze_authority_active,
+        "transfer_hook_active": transfer_hook_active,
+        "default_account_frozen": default_account_frozen,
+        "permanent_delegate_active": permanent_delegate_active,
+        "is_honeypot": is_honeypot,
+        "sell_whitelist": sell_whitelist,
+        "honeypot_reason": honeypot_reason,
     }
+
+
+TOKEN_SECURITY_CACHE: dict[str, dict[str, Any]] = {}
+TOKEN_SECURITY_CACHE_MAX = 5000
+
+async def check_token_honeypot_and_whitelist(chain: str, token_address: str, entry: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+    """Inspects on-chain state and GoPlus Security APIs to detect whether a token has
+    sell whitelisting, non-transferable rules, transfer hooks, freeze authority,
+    or honeypot behavior. Deemed as honeypot if any sell restriction or whitelist is found."""
+    if not token_address:
+        return {"safe": False, "is_honeypot": False, "sell_whitelist": False, "reason": "", "summary": "Unknown CA", "ts": 0}
+
+    now = time.time()
+    cached = TOKEN_SECURITY_CACHE.get(token_address)
+    if cached and (now - cached.get("ts", 0)) < 300:
+        if entry is not None:
+            entry["goplus"] = cached
+            token_feed_upsert(token_address, goplus=cached)
+        return cached
+
+    # 1. Trading chart honeypot check (fast local heuristic)
+    buys = (entry.get("buys_24h") if entry else 0) or 0
+    sells = (entry.get("sells_24h") if entry else 0) or 0
+    if (buys >= 4 and sells == 0) or (buys >= 15 and sells <= 1):
+        res = {
+            "safe": False,
+            "is_honeypot": True,
+            "sell_whitelist": True,
+            "mintable": False,
+            "freezable": False,
+            "transfer_hook": False,
+            "buy_tax": 0.0,
+            "sell_tax": 0.0,
+            "holder_count": None,
+            "reason": f"Chart honeypot: {buys} buys vs {sells} sells (sells blocked/whitelisted)",
+            "summary": "🚨 Honeypot Chart (Sells Blocked)",
+            "ts": now,
+        }
+        TOKEN_SECURITY_CACHE[token_address] = res
+        if entry is not None:
+            entry["goplus"] = res
+            entry["is_honeypot"] = True
+            entry["sell_whitelist"] = True
+            entry["honeypot_reason"] = res["reason"]
+            token_feed_upsert(token_address, goplus=res, is_honeypot=True, sell_whitelist=True)
+        return res
+
+    # 2. Existing entry flags
+    if entry:
+        if entry.get("freeze_authority_active") is True:
+            res = {
+                "safe": False,
+                "is_honeypot": True,
+                "sell_whitelist": True,
+                "mintable": False,
+                "freezable": True,
+                "transfer_hook": False,
+                "buy_tax": 0.0,
+                "sell_tax": 0.0,
+                "holder_count": entry.get("holder_count"),
+                "reason": "Freeze authority active (honeypot / sell freeze risk)",
+                "summary": "🚨 Freeze Authority Active",
+                "ts": now,
+            }
+            TOKEN_SECURITY_CACHE[token_address] = res
+            entry["goplus"] = res
+            entry["is_honeypot"] = True
+            entry["sell_whitelist"] = True
+            entry["honeypot_reason"] = res["reason"]
+            token_feed_upsert(token_address, goplus=res, is_honeypot=True, sell_whitelist=True)
+            return res
+        if entry.get("sell_whitelist") or entry.get("is_honeypot"):
+            hp_r = entry.get("honeypot_reason") or "Sell whitelist / honeypot detected"
+            res = {
+                "safe": False,
+                "is_honeypot": True,
+                "sell_whitelist": True,
+                "mintable": False,
+                "freezable": False,
+                "transfer_hook": False,
+                "buy_tax": 0.0,
+                "sell_tax": 0.0,
+                "holder_count": entry.get("holder_count"),
+                "reason": hp_r,
+                "summary": f"🚨 {hp_r}",
+                "ts": now,
+            }
+            TOKEN_SECURITY_CACHE[token_address] = res
+            entry["goplus"] = res
+            return res
+
+    chain_norm = (chain or "solana").lower()
+    is_honeypot = False
+    sell_whitelist = False
+    mintable = False
+    freezable = False
+    transfer_hook = False
+    buy_tax_pct = 0.0
+    sell_tax_pct = 0.0
+    holder_count = None
+    reasons = []
+
+    # 3. External Security API check (GoPlus)
+    try:
+        async with aiohttp.ClientSession() as session:
+            if chain_norm == "solana":
+                url = f"https://api.gopluslabs.io/api/v1/solana/token_security?contract_addresses={token_address}"
+                async with session.get(url, timeout=aiohttp.ClientTimeout(total=4)) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        sec = (data.get("result") or {}).get(token_address) or {}
+                        # Mintable
+                        m_st = str((sec.get("mintable") or {}).get("status", "0"))
+                        if m_st == "1":
+                            mintable = True
+                            reasons.append("Mintable")
+                        # Freezable
+                        f_st = str((sec.get("freezable") or {}).get("status", "0"))
+                        if f_st == "1":
+                            freezable = True
+                            is_honeypot = True
+                            reasons.append("Freeze authority active")
+                        # Transfer hook
+                        th = sec.get("transfer_hook")
+                        if th and isinstance(th, list) and len(th) > 0:
+                            transfer_hook = True
+                            is_honeypot = True
+                            sell_whitelist = True
+                            reasons.append("Transfer hook active (sell whitelist)")
+                        # Non-transferable
+                        if str(sec.get("non_transferable", "0")) == "1":
+                            is_honeypot = True
+                            sell_whitelist = True
+                            reasons.append("Non-transferable")
+                        # Default account state (2 = frozen)
+                        if str(sec.get("default_account_state", "1")) == "2":
+                            is_honeypot = True
+                            reasons.append("Default account state frozen")
+                        # Transfer fee
+                        tf = sec.get("transfer_fee") or {}
+                        cfr = tf.get("current_fee_rate") or {}
+                        fee_val = cfr.get("fee_rate")
+                        if fee_val is not None:
+                            try:
+                                sell_tax_pct = round(float(fee_val) * 100, 1)
+                                buy_tax_pct = sell_tax_pct
+                            except Exception:
+                                pass
+                        hc_val = sec.get("holder_count")
+                        if hc_val is not None:
+                            try:
+                                holder_count = int(hc_val)
+                            except Exception:
+                                pass
+            elif chain_norm in ("bnb", "base", "bsc"):
+                cid = "56" if chain_norm in ("bnb", "bsc") else "8453"
+                url = f"https://api.gopluslabs.io/api/v1/token_security/{cid}?contract_addresses={token_address}"
+                async with session.get(url, timeout=aiohttp.ClientTimeout(total=4)) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        sec = (data.get("result") or {}).get(token_address.lower()) or {}
+                        if str(sec.get("is_whitelisted", "0")) == "1":
+                            is_honeypot = True
+                            sell_whitelist = True
+                            reasons.append("Sell/transfer whitelist enabled")
+                        if str(sec.get("cannot_sell_all", "0")) == "1":
+                            is_honeypot = True
+                            sell_whitelist = True
+                            reasons.append("Cannot sell all")
+                        if str(sec.get("is_honeypot", "0")) == "1":
+                            is_honeypot = True
+                            reasons.append("GoPlus verified honeypot")
+                        if str(sec.get("is_mintable", "0")) == "1":
+                            mintable = True
+                            reasons.append("Mintable")
+                        try:
+                            buy_tax_pct = round(float(sec.get("buy_tax") or 0.0) * 100, 1)
+                            sell_tax_pct = round(float(sec.get("sell_tax") or 0.0) * 100, 1)
+                        except Exception:
+                            pass
+                        hc_val = sec.get("holder_count")
+                        if hc_val is not None:
+                            try:
+                                holder_count = int(hc_val)
+                            except Exception:
+                                pass
+    except Exception as exc:
+        logger.debug(f"check_token_honeypot_and_whitelist({token_address}) API error: {exc!r}")
+
+    # Tax does not disqualify a token from being safe; only honeypots, whitelists, freezable, mintable do
+    safe = not (is_honeypot or sell_whitelist or freezable or mintable)
+    reason = "; ".join(reasons)
+
+    if is_honeypot or sell_whitelist:
+        summary = f"🚨 Honeypot ({reason or 'Sells restricted'})"
+    elif freezable or mintable:
+        summary = f"⚠️ {reason}"
+    elif buy_tax_pct > 0 or sell_tax_pct > 0:
+        summary = f"🛡️ Buy {buy_tax_pct:g}% / Sell {sell_tax_pct:g}% Tax"
+    else:
+        summary = "🛡️ Clean · 0% Tax · Renounced"
+
+    res = {
+        "safe": safe,
+        "is_honeypot": is_honeypot,
+        "sell_whitelist": sell_whitelist,
+        "mintable": mintable,
+        "freezable": freezable,
+        "transfer_hook": transfer_hook,
+        "buy_tax": buy_tax_pct,
+        "sell_tax": sell_tax_pct,
+        "holder_count": holder_count,
+        "reason": reason,
+        "summary": summary,
+        "ts": now,
+    }
+    TOKEN_SECURITY_CACHE[token_address] = res
+    if len(TOKEN_SECURITY_CACHE) > TOKEN_SECURITY_CACHE_MAX:
+        TOKEN_SECURITY_CACHE.pop(next(iter(TOKEN_SECURITY_CACHE)), None)
+
+    if entry is not None:
+        entry["goplus"] = res
+        if is_honeypot or sell_whitelist:
+            entry["is_honeypot"] = True
+            entry["sell_whitelist"] = True
+            entry["honeypot_reason"] = reason
+        token_feed_upsert(token_address, goplus=res, is_honeypot=is_honeypot, sell_whitelist=sell_whitelist)
+
+
+DEBOT_API_BASES = ["https://app.debot.ai", "https://debot.ai"]
+DEBOT_STORY_CACHE: dict[str, tuple[float, Optional[dict[str, Any]]]] = {}
+DEBOT_CACHE_TTL = 1800.0  # 30 minutes cache
+
+
+async def fetch_debot_story(token_address: str) -> Optional[dict[str, Any]]:
+    """Fetches narrative origin, source tweet, and AI rating from DeBot AI.
+    Free unauthenticated public API used by Fomo Lens. Returns structured dict or None."""
+    if not token_address:
+        return None
+    now = time.time()
+    cached = DEBOT_STORY_CACHE.get(token_address)
+    if cached and (now - cached[0]) < DEBOT_CACHE_TTL:
+        return cached[1]
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "application/json",
+    }
+    ca_param = token_address.lower() if token_address.startswith("0x") else token_address
+
+    result = None
+    try:
+        async with aiohttp.ClientSession(headers=headers) as session:
+            for base in DEBOT_API_BASES:
+                url = f"{base}/api/v1/nitter/story/latest?ca_address={ca_param}"
+                try:
+                    async with session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                        if resp.status == 200:
+                            body = await resp.json()
+                            if body.get("code") == 0:
+                                history = body.get("data", {}).get("history", {})
+                                story_en = history.get("story_en") or {}
+                                story_zh = history.get("story") or {}
+                                story = story_en if story_en.get("background") else story_zh
+                                origin = story.get("background", {}).get("origin", {})
+                                rating = story.get("rating", {})
+                                distrib = story.get("distribution", {})
+                                bot_check = distrib.get("community_participation", {}).get("text")
+                                celeb_check = distrib.get("celebrity_support", {}).get("text")
+
+                                origin_text = origin.get("text") or ""
+                                if not origin_text and story_zh:
+                                    origin_text = story_zh.get("background", {}).get("origin", {}).get("text") or ""
+
+                                result = {
+                                    "narrative_type": story.get("narrative_type") or story_zh.get("narrative_type"),
+                                    "origin_text": origin_text.strip() if origin_text else None,
+                                    "origin_ref": origin.get("ref") or story_zh.get("background", {}).get("origin", {}).get("ref") or "",
+                                    "rating_score": rating.get("score"),
+                                    "rating_reason": rating.get("reason"),
+                                    "bot_participation": bot_check if bot_check and bot_check.lower() != "none" else None,
+                                    "celebrity_support": celeb_check if celeb_check and celeb_check.lower() != "none" else None,
+                                }
+                                break
+                            elif body.get("code") == -1:
+                                result = None
+                                break
+                except Exception as exc:
+                    logger.debug(f"[debot] fetch from {base} for {token_address} failed: {exc!r}")
+                    continue
+    except Exception as exc:
+        logger.debug(f"[debot] fetch_debot_story({token_address}) failed: {exc!r}")
+
+    DEBOT_STORY_CACHE[token_address] = (now, result)
+    if len(DEBOT_STORY_CACHE) > 500:
+        DEBOT_STORY_CACHE.pop(next(iter(DEBOT_STORY_CACHE)), None)
+    return result
+
 
 
 SOLANA_BUNDLE_MIN_WALLETS = 2  # holders sharing one funder before it counts as a bundle
@@ -1039,7 +2226,7 @@ async def _resolve_solana_wallet_funder(wallet: str) -> Optional[str]:
     isn't a simple funding transfer — e.g. a wallet that already existed
     before ever touching this token, which happens for genuine early buyers
     and shouldn't be forced into a false bundle match."""
-    if not SOLANA_WS_RPC_URL:
+    if not (SOLANA_WS_RPC_URL or SOLANA_FALLBACK_RPC_URL):
         return None
     try:
         async with aiohttp.ClientSession() as session:
@@ -1161,6 +2348,144 @@ def _ticker_starts_lowercase(ticker: Optional[str]) -> bool:
     return False
 
 
+def ticker_is_invalid(ticker: Optional[str]) -> tuple[bool, str]:
+    """Reject low-effort/malformed tickers. Valid = first character is a letter,
+    either full-caps (FOMO) or Title-case (Fomo). Invalid:
+      - starts with '$' (e.g. "$DOGE") — user rule, no-go
+      - first alphabetic character is lowercase ("fomobrain") — low-effort
+    UNKNOWN / not-yet-resolved is not judged (returns valid so it isn't dropped
+    before DexScreener backfills the real symbol)."""
+    if not ticker or ticker == "UNKNOWN":
+        return False, ""
+    t = ticker.strip()
+    if t.startswith("$"):
+        return True, f"ticker \"{ticker}\" starts with '$' — rejected"
+    if _ticker_starts_lowercase(t):
+        return True, f"ticker \"{ticker}\" starts lowercase — low-effort naming, rejected"
+    return False, ""
+
+
+def is_stock_style_ticker(ticker: Optional[str]) -> bool:
+    """Tokenized-equity 'xStocks' pattern: an uppercase stock symbol with a
+    trailing lowercase 'x' (AAPLx, TSLAx, MSTRx, COINx, MCDx, NVDAx). These are
+    real-world equity mirrors, not fair-launch memecoins — the user doesn't
+    want them. Matches 2-5 uppercase letters/digits followed by a single 'x'."""
+    if not ticker or ticker == "UNKNOWN":
+        return False
+    return bool(re.fullmatch(r"[A-Z]{1,5}[0-9]?x", ticker.strip()))
+
+
+def is_probably_established_or_stock(ticker: Optional[str], market_cap: float = 0.0) -> tuple[bool, str]:
+    """True + reason if this looks like an ALREADY-ESTABLISHED coin or a
+    tokenized stock rather than a genuine new fair-launch. Three signals:
+      - a known established symbol (HYPE, ZEC, BTC, ...) — case-insensitive
+      - the xStocks tokenized-equity pattern (MSTRx, AAPLx, ...)
+      - an implausibly high mcap for something we're seeing as 'new'
+    """
+    if ticker:
+        sym = ticker.strip().upper()
+        if sym in ESTABLISHED_SYMBOL_BLOCKLIST:
+            return True, f"'{ticker}' is a known established coin, not a new launch"
+        if is_stock_style_ticker(ticker):
+            return True, f"'{ticker}' looks like a tokenized stock (xStocks pattern), not a memecoin"
+    if market_cap and market_cap >= IMPLAUSIBLE_NEW_LAUNCH_MCAP_USD:
+        return True, f"mcap ${market_cap:,.0f} is implausibly high for a genuinely new launch — likely an established coin mislabeled as new"
+    return False, ""
+
+
+def purge_established_from_jev() -> int:
+    """Remove established-coin / tokenized-stock records that leaked in. HARDENED:
+    a coin is NEVER purged if it has a real outcome (mooned/rugged/dying) or has
+    actually moved (peak_multiple > 1.2) — we only clear obvious, unlabeled,
+    non-moving stock/established leaks so we can't destroy real learning data."""
+    removed = 0
+    def _has_real_history(rec_or_a):
+        # protect anything with an outcome or a genuine price move
+        if rec_or_a.get("outcome") in ("mooned", "rugged", "dying"):
+            return True
+        pm = rec_or_a.get("peak_multiple")
+        return pm is not None and pm > 1.2
+    def _is_stock(rec_or_a):
+        est, _ = is_probably_established_or_stock(rec_or_a.get("ticker"), rec_or_a.get("mcap_at_eval") or 0.0)
+        if est:
+            return True
+        # only the STRONG signal (xStocks pattern / blocklist via est above);
+        # do NOT purge on impersonation_risk alone — that risked deleting real
+        # coins Jev merely found name-similar. Ticker match is the safe gate.
+        return False
+    # recent activity feed
+    keep = deque(maxlen=RECENT_JEV_JUDGMENTS.maxlen)
+    for a in RECENT_JEV_JUDGMENTS:
+        if a.get("kind") != "pvp" and _is_stock(a) and not _has_real_history(a):
+            removed += 1
+            continue
+        keep.append(a)
+    RECENT_JEV_JUDGMENTS.clear()
+    RECENT_JEV_JUDGMENTS.extend(keep)
+    # judgment log (learning ledger)
+    for addr in list(JEV_JUDGMENT_LOG.keys()):
+        rec = JEV_JUDGMENT_LOG[addr]
+        if _is_stock(rec) and not _has_real_history(rec):
+            del JEV_JUDGMENT_LOG[addr]
+            removed += 1
+    if removed:
+        logger.info(f"[jev] purged {removed} established/stock record(s) from Jev feed/log")
+    return removed
+
+
+def extract_social_presence(entry: dict[str, Any]) -> dict[str, Any]:
+    """Derives free social presence data from DexScreener token info/profiles,
+    pump.fun coin metadata, and link URLs. Requires zero paid API keys."""
+    token_address = entry.get("token_address") or ""
+
+    soc = dict(entry.get("socials") or {})
+    has_twitter = bool(soc.get("has_twitter") or soc.get("twitter") or entry.get("twitter"))
+    has_telegram = bool(soc.get("has_telegram") or soc.get("telegram") or entry.get("telegram"))
+    has_website = bool(soc.get("has_website") or soc.get("website") or entry.get("website"))
+    active_boosts = int(soc.get("active_boosts") or entry.get("active_boosts") or 0)
+
+    # Check TOKEN_PROFILES cache (free background DexScreener profile scraper)
+    prof = TOKEN_PROFILES.get(token_address) or {}
+    if prof:
+        prof_soc = prof.get("socials") or []
+        if "twitter" in prof_soc:
+            has_twitter = True
+        if "telegram" in prof_soc:
+            has_telegram = True
+        if "website" in prof_soc:
+            has_website = True
+        if prof.get("boosts"):
+            active_boosts = max(active_boosts, int(prof.get("boosts")))
+
+    # Check links dict on entry
+    links = entry.get("links") or {}
+    for k, v in links.items():
+        v_str = str(v).lower()
+        if "twitter.com" in v_str or "x.com" in v_str:
+            has_twitter = True
+        elif "t.me" in v_str or "telegram" in v_str:
+            has_telegram = True
+        elif "http" in v_str and not any(x in v_str for x in ["dexscreener", "solscan", "bscscan", "rugcheck", "fomo", "thestonkboard"]):
+            has_website = True
+
+    channels = []
+    if has_twitter:
+        channels.append("Twitter/X")
+    if has_telegram:
+        channels.append("Telegram")
+    if has_website:
+        channels.append("Website")
+
+    return {
+        "has_twitter": has_twitter,
+        "has_telegram": has_telegram,
+        "has_website": has_website,
+        "channel_count": len(channels),
+        "channels": channels,
+        "active_boosts": active_boosts,
+    }
+
+
 def compute_opportunity_score(entry: dict[str, Any]) -> tuple[int, list[str]]:
     """A heuristic 0-100 composite of everything this pipeline already knows about
     a token, so a viewer isn't left manually cross-referencing raw numbers to
@@ -1171,6 +2496,18 @@ def compute_opportunity_score(entry: dict[str, Any]) -> tuple[int, list[str]]:
     volume_24h = entry.get("volume_24h", 0.0)
     volume_to_mcap_ratio = (volume_24h / market_cap) if market_cap > 0 else 0.0
 
+    token_address = entry.get("token_address") or ""
+    platform = entry.get("platform")
+
+    # Hard ceiling: strictly under 100k ONLY for thestonkboard.com / StonkFun coins
+    is_stonk = is_stonkboard_token(token_address, platform, entry.get("links"))
+    if is_stonk and market_cap > MAX_OPPORTUNITY_MARKET_CAP_USD:
+        return 0, [
+            f"TheStonkBoard market cap ${market_cap:,.0f} exceeds ${MAX_OPPORTUNITY_MARKET_CAP_USD:,.0f} ceiling (under 100k only)"
+        ]
+    if market_cap > IMPLAUSIBLE_NEW_LAUNCH_MCAP_USD:
+        return 0, [f"Market cap ${market_cap:,.0f} exceeds implausible new launch threshold"]
+
     # Hard floor: dust-level mcap/volume disqualifies a token outright,
     # regardless of what other signals fired. No dev-trust or narrative flag
     # should be able to outrank "this barely has any real activity."
@@ -1180,18 +2517,17 @@ def compute_opportunity_score(entry: dict[str, Any]) -> tuple[int, list[str]]:
             f"— too little real activity to be considered"
         ]
 
+    # Launchpad & Contract suffix filter (7777, pump, 4444)
+    qualifies_launch, launch_reason = is_launchpad_or_target_suffix(platform, token_address)
+    if not qualifies_launch:
+        return 0, [launch_reason]
+
+
     ticker = entry.get("ticker")
     if not ticker or ticker == "UNKNOWN":
-        # Some platforms (StonkFun, some Ember events) don't supply a symbol
-        # at creation — DexScreener backfills it once indexed (see
-        # _process_watchlist_token). Surfacing an "opportunity" the viewer
-        # can't even identify by name isn't useful, and unresolved tickers
-        # correlate with exactly the kind of bogus/mislabeled event
-        # PUMPFUN_IMPLAUSIBLE_WATCHING_MCAP_USD was added to catch (that
-        # $187M ghost graduation was also ticker "UNKNOWN").
         return 0, ["Ticker not yet resolved — not considered until a real name is known"]
-    if _ticker_starts_lowercase(ticker):
-        return 0, [f"Ticker \"{ticker}\" starts lowercase — low-effort naming, not considered"]
+    if ticker_is_invalid(ticker)[0]:
+        return 0, [ticker_is_invalid(ticker)[1]]
 
     # mcap is just price × supply — a $50k mcap with $1k volume (2% ratio) is
     # exactly the "obvious rug, price is fake" pattern: the number looks big
@@ -1206,6 +2542,16 @@ def compute_opportunity_score(entry: dict[str, Any]) -> tuple[int, list[str]]:
     score = 0
     reasons: list[str] = []
 
+    # Honeypot, sell whitelisting & freeze authority check
+    buys_24h = entry.get("buys_24h") or 0
+    sells_24h = entry.get("sells_24h") or 0
+    if entry.get("is_honeypot") or entry.get("sell_whitelist"):
+        return 0, [f"Honeypot / sell whitelisting detected ({entry.get('honeypot_reason', 'sells restricted')}) — discarded"]
+    if entry.get("freeze_authority_active") is True:
+        return 0, ["Freeze authority active (honeypot risk) — discarded"]
+    if (buys_24h >= 4 and sells_24h == 0) or (buys_24h >= 15 and sells_24h <= 1):
+        return 0, [f"Honeypot chart detected ({buys_24h} buys / {sells_24h} sells) — no sells possible (discarded)"]
+
     dev_wallet = entry.get("dev_wallet", "")
     is_infra_wallet = dev_wallet.lower() in KNOWN_INFRASTRUCTURE_ADDRESSES
 
@@ -1213,27 +2559,40 @@ def compute_opportunity_score(entry: dict[str, Any]) -> tuple[int, list[str]]:
         reasons.append("Dev field is a shared router/multicall contract, not a trackable individual — reputation ignored")
     else:
         dev_rep = DEV_REPUTATION_DATABASE.get(dev_wallet)
-        if dev_rep and dev_rep.get("is_blacklisted"):
-            # Shouldn't normally reach here (blacklisted devs get SKIPPED at
-            # launch), but this dev could have been blacklisted by a LATER
-            # rug of a different token after this one already launched.
-            score -= 40
-            reasons.append("Dev has since been blacklisted (-40)")
-        elif dev_rep and dev_rep.get("failed_spams", 0) > 0:
-            penalty = min(30, dev_rep["failed_spams"] * 15)
-            score -= penalty
-            reasons.append(f"Dev has {dev_rep['failed_spams']} prior rug(s) on record (-{penalty})")
-        elif entry.get("dev_decision") == "ELITE":
-            # Halved from the original +30: "ELITE" only ever meant "crossed the
-            # graduation bar once before," which turned out to say little about
-            # whether *this* launch takes off — narrative and volume are the
-            # stronger signals for that. It's still a real, mildly-informative
-            # prior (and post-graduation rugs now retroactively strip it, see
-            # the GRADUATED branch in post_trade_feedback_worker), just no
-            # longer weighted as if it were.
-            score += 15
-            grad_count = dev_rep.get("successful_launches", 0) if dev_rep else 0
-            reasons.append(f"Elite dev — {grad_count} prior graduation(s) on record, 0 rugs (+15)")
+        dev_total = dev_rep.get("total_launches", 0) if dev_rep else (entry.get("dev_total_launches") or 0)
+        dev_rugs = dev_rep.get("failed_spams", 0) if dev_rep else (entry.get("dev_rugs") or 0)
+        is_bl = (dev_rep.get("is_blacklisted") if dev_rep else False) or bool(entry.get("dev_blacklisted"))
+
+        if dev_total > 1:
+            return 0, [f"Dev has launched {dev_total} tokens — discarded (only single-launch devs allowed)"]
+        if is_bl:
+            return 0, ["Dev is blacklisted — discarded"]
+        if dev_rugs > 0 or len(DEV_RUG_HISTORY.get(dev_wallet, [])) > 0:
+            return 0, [f"Dev has prior rug history ({dev_rugs} rugs) — serial rugger discarded"]
+        # Note: Elite dev scoring removed because it contradicts the strict single-launch rule
+
+    # Free social presence & community engagement score (DexScreener/PumpPortal/TokenProfiles)
+    soc_data = extract_social_presence(entry)
+    social_count = soc_data["channel_count"]
+    channels_str = ", ".join(soc_data["channels"])
+    active_boosts = soc_data["active_boosts"]
+
+    if social_count >= 3:
+        score += 15
+        reasons.append(f"Full social footprint ({channels_str}) (+15)")
+    elif social_count == 2:
+        score += 10
+        reasons.append(f"Established socials ({channels_str}) (+10)")
+    elif social_count == 1:
+        score += 5
+        reasons.append(f"Active social link ({channels_str}) (+5)")
+    else:
+        reasons.append("No official socials found (0)")
+
+    if active_boosts > 0:
+        boost_pts = min(5, active_boosts)
+        score += boost_pts
+        reasons.append(f"DexScreener community boosts ({active_boosts} active, +{boost_pts})")
 
     signals = entry.get("signals", [])
     signal_ts = entry.get("signal_ts", {})
@@ -1435,6 +2794,17 @@ def compute_opportunity_score(entry: dict[str, Any]) -> tuple[int, list[str]]:
         else:
             reasons.append(f"{entry.get('bundle_wallet_count', 0)} wallets bundled by one operator at launch ({bundle_supply_pct or 0:.0f}% of supply) — common practice, not inherently a red flag")
 
+    # --- Jev semantic layer (see SECTION 5.5) -------------------------------
+    # Blended LAST so it adjusts an otherwise-complete deterministic score.
+    # A high impersonation-risk judgment hard-vetoes to 0, matching the other
+    # hard floors above. All other Jev dimensions are confidence-scaled points.
+    jev_points, jev_reasons, jev_veto = jev_score_contribution(entry)
+    if jev_veto:
+        return 0, reasons + jev_reasons
+    if jev_points:
+        score += jev_points
+    reasons.extend(jev_reasons)
+
     return max(0, min(100, score)), reasons
 
 
@@ -1467,11 +2837,26 @@ def compute_early_momentum_score(entry: dict[str, Any]) -> tuple[int, list[str]]
     if market_cap <= 0 or (volume_24h <= 0 and txns_24h <= 0):
         return 0, ["No real market data yet — too early to evaluate"]
 
+    token_address = entry.get("token_address") or ""
+    platform = entry.get("platform")
+
+    is_stonk = is_stonkboard_token(token_address, platform, entry.get("links"))
+    if is_stonk and market_cap > MAX_OPPORTUNITY_MARKET_CAP_USD:
+        return 0, [f"TheStonkBoard coin market cap ${market_cap:,.0f} exceeds $100k ceiling"]
+    if market_cap > IMPLAUSIBLE_NEW_LAUNCH_MCAP_USD:
+        return 0, [f"Market cap ${market_cap:,.0f} exceeds implausible new launch threshold"]
+
+    # Launchpad & Contract suffix filter (7777, pump, 4444)
+    qualifies_launch, launch_reason = is_launchpad_or_target_suffix(platform, token_address)
+    if not qualifies_launch:
+        return 0, [launch_reason]
+
+
     ticker = entry.get("ticker")
     if not ticker or ticker == "UNKNOWN":
         return 0, ["Ticker not yet resolved — not considered until a real name is known"]
-    if _ticker_starts_lowercase(ticker):
-        return 0, [f"Ticker \"{ticker}\" starts lowercase — low-effort naming, not considered"]
+    if ticker_is_invalid(ticker)[0]:
+        return 0, [ticker_is_invalid(ticker)[1]]
 
     score = 0
     reasons: list[str] = []
@@ -1505,21 +2890,38 @@ def compute_early_momentum_score(entry: dict[str, Any]) -> tuple[int, list[str]]
             score += 4
             reasons.append(f"Buy-leaning: {buys_24h} buys vs {sells_24h} sells (+4)")
 
+    # Honeypot chart & freeze authority check
+    if entry.get("is_honeypot") or entry.get("sell_whitelist"):
+        return 0, [f"Honeypot / sell whitelisting detected ({entry.get('honeypot_reason', 'sells restricted')}) — discarded"]
+    if entry.get("freeze_authority_active") is True:
+        return 0, ["Freeze authority active (honeypot risk) — discarded"]
+    if (buys_24h >= 4 and sells_24h == 0) or (buys_24h >= 15 and sells_24h <= 1):
+        return 0, [f"Honeypot chart detected ({buys_24h} buys / {sells_24h} sells) — no sells possible (discarded)"]
+
     dev_wallet = entry.get("dev_wallet", "")
     is_infra_wallet = dev_wallet.lower() in KNOWN_INFRASTRUCTURE_ADDRESSES
     if not is_infra_wallet:
         dev_rep = DEV_REPUTATION_DATABASE.get(dev_wallet)
-        if dev_rep and dev_rep.get("is_blacklisted"):
-            score -= 40
-            reasons.append("Dev has since been blacklisted (-40)")
-        elif dev_rep and dev_rep.get("failed_spams", 0) > 0:
-            penalty = min(30, dev_rep["failed_spams"] * 15)
-            score -= penalty
-            reasons.append(f"Dev has {dev_rep['failed_spams']} prior rug(s) on record (-{penalty})")
-        elif entry.get("dev_decision") == "ELITE":
-            score += 15
-            grad_count = dev_rep.get("successful_launches", 0) if dev_rep else 0
-            reasons.append(f"Elite dev — {grad_count} prior graduation(s) on record, 0 rugs (+15)")
+        dev_total = dev_rep.get("total_launches", 0) if dev_rep else (entry.get("dev_total_launches") or 0)
+        dev_rugs = dev_rep.get("failed_spams", 0) if dev_rep else (entry.get("dev_rugs") or 0)
+        is_bl = (dev_rep.get("is_blacklisted") if dev_rep else False) or bool(entry.get("dev_blacklisted"))
+
+        if dev_total > 1:
+            return 0, [f"Dev has launched {dev_total} tokens — discarded (only single-launch devs allowed)"]
+        if is_bl:
+            return 0, ["Dev is blacklisted — discarded"]
+        # Elite dev removed to resolve contradiction with single-launch requirement
+
+    # Free early social presence score
+    soc_data = extract_social_presence(entry)
+    social_count = soc_data["channel_count"]
+    channels_str = ", ".join(soc_data["channels"])
+    if social_count >= 2:
+        score += 15
+        reasons.append(f"Early verified socials ({channels_str}) (+15)")
+    elif social_count == 1:
+        score += 8
+        reasons.append(f"Early social link ({channels_str}) (+8)")
 
     # Smart money weighted HIGHER than in the main score — a tracked wallet
     # already buying into a token this small/new is a stronger "someone sees
@@ -1608,6 +3010,32 @@ def compute_early_momentum_score(entry: dict[str, Any]) -> tuple[int, list[str]]
             reasons.append(f"Same operator bundled {entry.get('bundle_wallet_count', 0)} wallets on another launch too — not necessarily bad, but worth extra scrutiny (-10)")
         else:
             reasons.append(f"{entry.get('bundle_wallet_count', 0)} wallets bundled by one operator at launch ({bundle_supply_pct or 0:.0f}% of supply) — common practice, not inherently a red flag")
+
+    # Stage-1 Jev qualitative screening bonus/penalty (narrative coherence & originality)
+    screen = entry.get("jev_screen") or (entry.get("jev", {}).get("dimensions"))
+    if screen:
+        nq = screen.get("narrative_quality", {})
+        nq_score = nq.get("score")
+        if nq_score is not None:
+            nq_conf = nq.get("confidence")
+            nq_conf = 1.0 if nq_conf is None else max(0.0, min(1.0, nq_conf))
+            # Rubric levels: 0=Gibberish, 1=Low-effort copy, 2=Coherent, 3=Distinctive
+            if nq_score >= 3:
+                pts = round(12 * nq_conf)
+                score += pts
+                reasons.append(f"Jev screened: distinctive narrative (+{pts})")
+            elif nq_score == 2:
+                pts = round(6 * nq_conf)
+                score += pts
+                reasons.append(f"Jev screened: coherent narrative (+{pts})")
+            elif nq_score == 1:
+                pts = round(6 * nq_conf)
+                score -= pts
+                reasons.append(f"Jev screened: low-effort copycat meme (-{pts})")
+            elif nq_score == 0:
+                pts = round(15 * nq_conf)
+                score -= pts
+                reasons.append(f"Jev screened: gibberish/spam launch (-{pts})")
 
     return max(0, min(100, score)), reasons
 
@@ -1804,6 +3232,1989 @@ async def estimate_solana_trade(client: JsonRpcWsClient, signature: str, wallet:
 
 
 # ============================================================================
+# SECTION 5.5 — TYPESAFE "JEV" SEMANTIC REASONER + LEARNING LOOP
+# ============================================================================
+# Jev judges the qualitative things the arithmetic above can't: is the launch
+# coherent/serious, is it impersonating something, does the theme have staying
+# power. One batched request per candidate (docs: batching every question into
+# one call is ~12x cheaper / ~10x faster with identical answers). Everything
+# here fails safe: any error, missing key, or exhausted budget → the token
+# still scores normally on the deterministic signals, Jev just contributes 0.
+
+# The questions Jev answers about a token. Score levels/Noul criteria are
+# concrete and self-standing (docs: "Score levels must describe concrete
+# situations and stand on their own"). Ask one narrow judgment per question;
+# all run in parallel over the same state.
+JEV_QUESTIONS: dict[str, Any] = {
+    "moon_potential": {
+        "type": "score",
+        "instructions": (
+            "How much realistic potential does this coin have to run SIGNIFICANTLY higher from its "
+            "CURRENT market cap? Judge upside from where it is now, using its name/narrative, launchpad, "
+            "market cap, volume, holders and momentum in `market`, `holders`, `trust` and `momentum`. "
+            "A small coin with a strong, spreading narrative has high upside; a coin that has already "
+            "had its big run and stalled has little left. Size alone isn't the answer — a larger coin "
+            "that's still climbing on a strong narrative can still have room, a tiny dead one does not."
+        ),
+        "criteria": [
+            "No potential — dead/spam/rug pattern, or already ran and stalled with nothing left",
+            "Weak — little to suggest further upside, likely fades",
+            "Some potential — a plausible setup but nothing standout",
+            "Strong potential — coherent narrative + real demand, room to run further",
+            "Exceptional — the profile of a coin that could run big from here (distinctive narrative, accelerating real demand)",
+        ],
+    },
+    "narrative_quality": {
+        "type": "score",
+        "instructions": (
+            "Judging only by the token's name, ticker, platform and any description, how much "
+            "genuine effort and coherence does this memecoin/fair-launch project show?"
+        ),
+        "criteria": [
+            "Gibberish or spam — random characters, obvious throwaway, no discernible idea",
+            "Low-effort copy — a generic or derivative meme with nothing distinctive",
+            "Coherent — a clear, recognizable theme executed competently",
+            "Distinctive — an original or clever angle that stands out from typical launches",
+        ],
+    },
+    "legitimacy": {
+        "type": "noul",
+        "instructions": "Does this look like a serious launch rather than a low-effort cash-grab or scam? Consider its social presence in `socials` (a real Twitter/website/Telegram is a mild positive; none at all is typical of throwaway launches).",
+        "criteria": {
+            "true": "Presents as a genuine project someone put thought into",
+            "false": "Looks like a throwaway cash-grab, rug setup, or spam",
+        },
+    },
+    "narrative_durability": {
+        "type": "score",
+        "instructions": (
+            "How likely is this token's theme/narrative to have staying power beyond a brief hype "
+            "spike, rather than being a fleeting copycat of a trend that will die within hours?"
+        ),
+        "criteria": [
+            "Pure fad — tied to a momentary trend that will be forgotten almost immediately",
+            "Short-lived — mild interest but little reason to persist",
+            "Some staying power — a theme people may keep caring about",
+            "Durable — a concept with real, lasting appeal",
+        ],
+    },
+    "impersonation_risk": {
+        "type": "noul",
+        "instructions": (
+            "Does this appear to impersonate, or be confusable with, an established token, brand, "
+            "company, or real-world asset (e.g. tickers mimicking real stocks or major coins)?"
+        ),
+        "criteria": {
+            "true": "Name/ticker mimics an established asset, brand, or well-known token",
+            "false": "Clearly its own identity, not riding on an established name",
+        },
+    },
+    "trap_risk": {
+        "type": "noul",
+        "instructions": (
+            "Considering the on-chain picture in `holders`, `trust`, `market` and `momentum` — "
+            "holder concentration, whether real ($1k+) positions exist, bundled wallets, dev rug "
+            "history, and the buy/sell pattern — does this look like a coordinated pump, bundle, "
+            "or rug trap rather than organic demand from genuine buyers?"
+        ),
+        "criteria": {
+            "true": "Signals point to a trap: concentrated supply, bundled/sybil wallets, prior-rug dev, or one-sided bot buying with no real positions",
+            "false": "Looks like organic participation: distributed holders, real positions, no rug fingerprints",
+        },
+    },
+    "sufficient_info": {
+        "type": "noul",
+        "instructions": (
+            "Setting aside the coin's quality — did you have ENOUGH information here to judge its "
+            "potential well, or is important context missing (e.g. no description, no holder data, "
+            "no volume/momentum, unclear what the project actually is)?"
+        ),
+        "criteria": {
+            "true": "There was enough context to make a confident judgment",
+            "false": "Key information was missing — the judgment is a guess with important gaps",
+        },
+    },
+}
+
+
+def _jev_reset_day_if_needed() -> None:
+    """Roll the per-day counters when the date changes."""
+    today = _today_key(time.time())
+    if JEV_USAGE.get("day_key") != today:
+        JEV_USAGE["day_key"] = today
+        JEV_USAGE["calls_today"] = 0
+        JEV_BUDGET_BLOCKED_SEEN.clear()
+        # a new day re-opens the daily gate; the lifetime cap still applies
+        if JEV_USAGE["calls_total"] < JEV_MAX_CALLS_TOTAL:
+            JEV_USAGE["budget_exhausted"] = False
+
+
+def jev_emit_event(event_type: str, *, ticker: Optional[str] = None,
+                   token_address: Optional[str] = None, reason: str = "",
+                   detail: Optional[dict[str, Any]] = None) -> None:
+    """Record ONE Jev action of any kind and live-broadcast it, so nothing Jev
+    does is invisible. event_type is one of: evaluated, skipped, vetoed, error,
+    pvp_pick, pvp_skip. Safe to call from sync code — the broadcast is fired as
+    a background task when a running loop exists, else it's just logged+stored."""
+    evt = {
+        "type": event_type,
+        "ticker": ticker,
+        "token_address": token_address,
+        "reason": reason,
+        "detail": detail or {},
+        "ts": time.time(),
+    }
+    RECENT_JEV_EVENTS.append(evt)
+    try:
+        loop = asyncio.get_running_loop()
+        loop.create_task(broadcast_json({"kind": "jev_event", "payload": evt}))
+    except RuntimeError:
+        pass  # no running loop (e.g. unit test) — stored + will show on snapshot
+    logger.debug(f"[jev/event] {event_type} {ticker or ''} {reason}")
+
+
+# --- >$500k big-runner history (the reference set for PvP judgments) --------
+def record_big_runner_if_qualified(token_address: str, entry: dict[str, Any], peak_mcap: float) -> None:
+    """Called on peak updates. Once a coin's peak crosses BIG_RUNNER_MCAP_USD,
+    record it (once) into the per-chain history Jev compares new cohorts to."""
+    if peak_mcap < BIG_RUNNER_MCAP_USD or token_address in BIG_RUNNERS_SEEN:
+        return
+    chain = entry.get("chain") or "?"
+    ticker = entry.get("ticker") or ""
+    if not ticker or ticker == "UNKNOWN":
+        return
+    BIG_RUNNERS_SEEN.add(token_address)
+    runners = BIG_RUNNERS[chain]
+    runners.append({
+        "token_address": token_address,
+        "ticker": ticker,
+        "narrative_key": narrative_cluster_key(normalize_ticker(ticker)),
+        "platform": entry.get("platform") or "?",
+        "peak_mcap": round(peak_mcap),
+        "first_seen": entry.get("created_at"),
+        "recorded_at": time.time(),
+    })
+    # keep newest / highest, bounded
+    if len(runners) > BIG_RUNNERS_MAX_PER_CHAIN:
+        runners.sort(key=lambda r: r.get("peak_mcap", 0), reverse=True)
+        del runners[BIG_RUNNERS_MAX_PER_CHAIN:]
+    logger.info(f"[big-runner] recorded {ticker} on {chain}/{entry.get('platform')} @ ${peak_mcap:,.0f}")
+
+
+def _seed_big_runners() -> None:
+    """Load BIG_RUNNERS_SEED ("chain:TICKER:platform,...") so history is useful
+    before the tracker has observed its own big runs."""
+    if not BIG_RUNNERS_SEED.strip():
+        return
+    for item in BIG_RUNNERS_SEED.split(","):
+        parts = [p.strip() for p in item.split(":")]
+        if len(parts) < 2 or not parts[0] or not parts[1]:
+            continue
+        chain, ticker = parts[0], parts[1].upper()
+        platform = parts[2] if len(parts) > 2 else "?"
+        BIG_RUNNERS[chain].append({
+            "token_address": f"seed:{chain}:{ticker}",
+            "ticker": ticker,
+            "narrative_key": narrative_cluster_key(normalize_ticker(ticker)),
+            "platform": platform,
+            "peak_mcap": None,   # unknown for seeds
+            "first_seen": None,
+            "recorded_at": time.time(),
+            "seed": True,
+        })
+    logger.info(f"[big-runner] seeded {sum(len(v) for v in BIG_RUNNERS.values())} reference runner(s)")
+
+
+def big_runners_for_narrative(chain: str, narrative_key: str) -> list[dict[str, Any]]:
+    """Past >$500k runners on this chain, same-name first, then the rest — the
+    evidence block handed to Jev for a PvP comparison."""
+    same_name = [r for r in BIG_RUNNERS.get(chain, []) if r.get("narrative_key") == narrative_key]
+    others = [r for r in BIG_RUNNERS.get(chain, []) if r.get("narrative_key") != narrative_key]
+    others.sort(key=lambda r: (r.get("peak_mcap") or 0), reverse=True)
+    return same_name + others[:8]  # cap context size
+
+
+def jev_budget_status() -> tuple[bool, Optional[str]]:
+    """(can_call, reason_if_not). Central gate for all Jev spending."""
+    if not JEV_ENABLED:
+        return False, "TypeSafe API key not configured — Jev disabled"
+    _jev_reset_day_if_needed()
+    if JEV_USAGE["calls_total"] >= JEV_MAX_CALLS_TOTAL:
+        return False, f"Lifetime call cap reached ({JEV_MAX_CALLS_TOTAL})"
+    if JEV_USAGE["calls_today"] >= JEV_MAX_CALLS_PER_DAY:
+        return False, f"Daily call cap reached ({JEV_MAX_CALLS_PER_DAY}/day)"
+    # Not capped — clear any stale disabled_reason from an earlier cap/restart.
+    if JEV_USAGE.get("disabled_reason"):
+        JEV_USAGE["disabled_reason"] = None
+    return True, None
+
+
+async def jev_call_system_one(state: Any, questions: dict[str, Any]) -> Optional[dict[str, Any]]:
+    """POST one batched evaluation to Jev. Returns the parsed JSON body, or None
+    on ANY failure (never raises into the hot loop). Retries 429/529 with
+    exponential backoff, as the docs recommend. Records token usage on success."""
+    url = f"{TYPESAFE_API_BASE.rstrip('/')}/v1/systemone"
+    headers = {
+        "Authorization": f"Bearer {TYPESAFE_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    payload = {"state": state, "model": TYPESAFE_MODEL, "questions": questions}
+    backoff = 1.0
+    for attempt in range(1, JEV_MAX_RETRIES + 1):
+        try:
+            timeout = aiohttp.ClientTimeout(total=JEV_REQUEST_TIMEOUT)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.post(url, headers=headers, json=payload) as resp:
+                    if resp.status == 200:
+                        body = await resp.json()
+                        usage = body.get("usage", {}) or {}
+                        JEV_USAGE["calls_total"] += 1
+                        JEV_USAGE["calls_today"] += 1
+                        JEV_USAGE["input_tokens_total"] += int(usage.get("input_tokens", 0) or 0)
+                        JEV_USAGE["output_tokens_total"] += int(usage.get("output_tokens", 0) or 0)
+                        if JEV_USAGE["calls_total"] >= JEV_MAX_CALLS_TOTAL:
+                            JEV_USAGE["budget_exhausted"] = True
+                            JEV_USAGE["disabled_reason"] = f"Lifetime call cap reached ({JEV_MAX_CALLS_TOTAL})"
+                        return body
+                    if resp.status in (429, 529) and attempt < JEV_MAX_RETRIES:
+                        logger.warning(f"[jev] {resp.status} (attempt {attempt}) — backing off {backoff:.1f}s")
+                        await asyncio.sleep(backoff)
+                        backoff *= 2
+                        continue
+                    # 401/422/other — non-retryable, log and fail safe
+                    text = (await resp.text())[:300]
+                    JEV_USAGE["errors"] += 1
+                    JEV_USAGE["last_error"] = f"HTTP {resp.status}: {text}"
+                    logger.warning(f"[jev] non-OK response {resp.status}: {text}")
+                    return None
+        except Exception as exc:
+            JEV_USAGE["errors"] += 1
+            JEV_USAGE["last_error"] = repr(exc)
+            if attempt < JEV_MAX_RETRIES:
+                await asyncio.sleep(backoff)
+                backoff *= 2
+                continue
+            logger.warning(f"[jev] request failed after {attempt} attempts: {exc!r}")
+            return None
+    return None
+
+
+def _jev_build_state(entry: dict[str, Any]) -> dict[str, Any]:
+    """Assemble the token metadata + on-chain reality Jev reasons over. Named
+    JSON fields, as the docs advise for multi-part context. Only observed
+    facts. This is the big upgrade: Jev now sees holder quality, concentration,
+    dev history, buy/sell pressure and momentum — not just the name."""
+    state: dict[str, Any] = {
+        "name": entry.get("name") or entry.get("token_name") or "",
+        "ticker": entry.get("ticker") or "",
+        "chain": entry.get("chain") or "",
+        "platform": entry.get("platform") or "",
+    }
+    desc = entry.get("description") or entry.get("token_description")
+    # free social/profile data from DexScreener token-profiles cache
+    prof = TOKEN_PROFILES.get(entry.get("token_address") or "")
+    if not desc and prof and prof.get("description"):
+        desc = prof["description"]   # fall back to the profile's description
+    if desc:
+        state["description"] = str(desc)[:1000]
+    # social presence — a coin with real socials (twitter/website/telegram) is
+    # more legit than one with none. Not sentiment (X API isn't free), but a
+    # genuine presence signal Jev can weigh.
+    if prof is not None:
+        state["socials"] = {
+            "has_twitter": "twitter" in prof.get("socials", []),
+            "has_telegram": "telegram" in prof.get("socials", []),
+            "has_website": ("website" in prof.get("socials", []) or "web" in prof.get("socials", [])),
+            "link_count": prof.get("link_count", 0),
+        }
+    else:
+        state["socials"] = {"has_twitter": False, "has_telegram": False, "has_website": False, "link_count": 0, "note": "no social profile found"}
+
+    mcap = entry.get("market_cap") or 0.0
+    vol = entry.get("volume_24h") or 0.0
+    market = {
+        "market_cap_usd": round(mcap),
+        "volume_24h_usd": round(vol),
+        "volume_to_mcap_ratio": round(vol / mcap, 3) if mcap > 0 else None,
+        "liquidity_usd": round(entry.get("liquidity_usd") or 0),
+        "age_minutes": round((time.time() - (entry.get("created_at") or time.time())) / 60, 1),
+    }
+    buys = entry.get("buys_24h") or 0
+    sells = entry.get("sells_24h") or 0
+    if buys or sells:
+        market["buys_vs_sells"] = f"{buys} buys / {sells} sells"
+    state["market"] = market
+
+    # Holder quality — including the substantial-holder ($1k+ position) signal.
+    holders: dict[str, Any] = {}
+    if entry.get("holder_count") is not None:
+        holders["holder_count"] = entry.get("holder_count")
+    if entry.get("top_holder_pct") is not None:
+        holders["top_holder_pct_of_supply"] = round(entry.get("top_holder_pct"), 1)
+    if entry.get("substantial_holders_1k") is not None:
+        holders["holders_with_1k_plus_position"] = entry.get("substantial_holders_1k")
+        holders["holders_with_10k_plus_position"] = entry.get("substantial_holders_10k")
+    if entry.get("top_holder_selling"):
+        holders["top_holder_is_selling_down"] = True
+    if holders:
+        state["holders"] = holders
+
+    # Bundle / dev-trust facts.
+    trust: dict[str, Any] = {}
+    if entry.get("bundle_detected"):
+        trust["bundled_wallets_at_launch"] = entry.get("bundle_wallet_count", 0)
+        trust["bundle_supply_pct"] = round(entry.get("bundle_supply_pct") or 0, 1)
+        if entry.get("bundle_known_bad_operator"):
+            trust["bundle_operator_linked_to_prior_rug"] = True
+    if entry.get("dev_rugs"):
+        trust["dev_prior_rugs"] = entry.get("dev_rugs")
+    if entry.get("dev_moons"):
+        trust["dev_prior_graduations"] = entry.get("dev_moons")
+    if trust:
+        state["trust"] = trust
+
+    # Momentum trajectory from the sparkline (mcap over recent polls).
+    spark = entry.get("sparkline") or []
+    if len(spark) >= 2:
+        first, last = spark[0][1], spark[-1][1]
+        if first and first > 0:
+            state["momentum"] = {
+                "mcap_trajectory_usd": [round(p[1]) for p in spark[-6:]],
+                "pct_change_recent": round((last - first) / first * 100),
+            }
+    return state
+
+
+def _jev_parse_answers(body: dict[str, Any]) -> dict[str, Any]:
+    """Turn the raw API response into a compact, display-ready judgment dict:
+    per-dimension value + confidence + probabilities, kept for the learning loop."""
+    answers = body.get("answers", {}) or {}
+    parsed: dict[str, Any] = {
+        "model": body.get("model"),
+        "evaluated_at": time.time(),
+        "dimensions": {},
+        "usage": body.get("usage", {}) or {},
+    }
+    for qid, ans in answers.items():
+        atype = ans.get("type")
+        if atype == "score":
+            parsed["dimensions"][qid] = {
+                "type": "score",
+                "score": ans.get("score"),
+                "legend": ans.get("legend", {}),
+                "probabilities": ans.get("probabilities", {}),
+                "confidence": ans.get("confidence"),
+                "n_levels": len(ans.get("legend", {}) or {}),
+            }
+        elif atype == "noul":
+            parsed["dimensions"][qid] = {
+                "type": "noul",
+                "noul": ans.get("noul"),
+            }
+    return parsed
+
+
+async def maybe_screen_early_momentum_with_jev(token_address: str, entry: dict[str, Any]) -> None:
+    """Stage-1 Jev Screening Cascade: A fast, lightweight 2-question pre-evaluation
+    (impersonation_risk + narrative_quality) on early micro-cap tokens ($15k-$30k mcap)
+    that show early traction before clearing the full $30k/40-score opportunity gate.
+    Catches viral narratives 10 minutes earlier, vetoes disguised impersonators before
+    they reach the main feed, and primes the semantic cache."""
+    if not JEV_ENABLED or entry.get("status") != "WATCHING":
+        return
+    if token_address in JEV_SCREENED_TOKENS or token_address in JEV_EVALUATED_TOKENS:
+        return
+
+    ticker = entry.get("ticker")
+    if not ticker or ticker == "UNKNOWN" or ticker_is_invalid(ticker)[0]:
+        return
+
+    mcap = entry.get("market_cap") or 0.0
+    early_score = entry.get("early_momentum_score") or 0
+    # Gate: micro-cap with early relative momentum ($15k-$30k band, score >= 35)
+    if mcap < 15000 or mcap >= JEV_MIN_MCAP_TO_EVALUATE or early_score < 35:
+        return
+
+    can_call, reason = jev_budget_status()
+    if not can_call:
+        return
+
+    # Check semantic cache first (instant 0-token resolution!)
+    sem_hash = _compute_semantic_hash(ticker, entry.get("name"), entry.get("description"))
+    cached = JEV_SEMANTIC_CACHE.get(sem_hash)
+    if cached and (time.time() - cached.get("cached_at", 0)) < JEV_SEMANTIC_CACHE_TTL:
+        dims = dict(cached.get("dimensions", {}))
+        imp = dims.get("impersonation_risk", {}).get("noul")
+        if imp is not None and imp >= JEV_IMPERSONATION_VETO:
+            info = TOKEN_WATCHLIST.get(token_address)
+            if info is not None:
+                await _kick_out_watchlist_token(
+                    token_address, info, time.time(), "JEV_IMPERSONATION",
+                    f"SKIPPED - NOT A NEW LAUNCH (Jev cached: {imp:.0%} impersonation risk)",
+                )
+            jev_emit_event("vetoed", ticker=ticker, token_address=token_address,
+                           reason=f"Stage-1 cached screen veto — {imp:.0%} impersonation risk")
+            return
+        entry["jev_screen"] = dims
+        JEV_SCREENED_TOKENS[token_address] = time.time()
+        _rescore_token(token_address)
+        return
+
+    # Not in cache — perform a 2-question Stage-1 call
+    JEV_SCREENED_TOKENS[token_address] = time.time()
+    if len(JEV_SCREENED_TOKENS) > JEV_SCREENED_MAX:
+        JEV_SCREENED_TOKENS.pop(next(iter(JEV_SCREENED_TOKENS)), None)
+
+    # Ensure description is checked if pump.fun
+    if entry.get("platform") == "pump.fun" and not entry.get("description"):
+        try:
+            meta = await fetch_pumpfun_image(token_address)
+            if meta:
+                upd = {}
+                if meta.get("name") and not entry.get("name"):
+                    upd["name"] = meta["name"]
+                if meta.get("description"):
+                    upd["description"] = meta["description"][:1000]
+                if upd:
+                    token_feed_upsert(token_address, **upd)
+                    entry.update(upd)
+        except Exception:
+            pass
+
+    state = _jev_build_state(entry)
+    screening_questions = {
+        "impersonation_risk": JEV_QUESTIONS["impersonation_risk"],
+        "narrative_quality": JEV_QUESTIONS["narrative_quality"],
+    }
+    body = await jev_call_system_one(state, screening_questions)
+    if not body:
+        JEV_SCREENED_TOKENS.pop(token_address, None)
+        return
+
+    judgment = _jev_parse_answers(body)
+    dims = judgment.get("dimensions", {})
+
+    # Populate semantic cache with invariant dimensions
+    JEV_SEMANTIC_CACHE[sem_hash] = {
+        "dimensions": dims,
+        "cached_at": time.time(),
+        "ticker": ticker,
+    }
+    if len(JEV_SEMANTIC_CACHE) > JEV_SEMANTIC_CACHE_MAX:
+        JEV_SEMANTIC_CACHE.pop(next(iter(JEV_SEMANTIC_CACHE)), None)
+
+    # Check impersonation veto
+    imp = dims.get("impersonation_risk", {}).get("noul")
+    if imp is not None and imp >= JEV_IMPERSONATION_VETO:
+        info = TOKEN_WATCHLIST.get(token_address)
+        if info is not None:
+            await _kick_out_watchlist_token(
+                token_address, info, time.time(), "JEV_IMPERSONATION",
+                f"SKIPPED - NOT A NEW LAUNCH (Jev Stage-1: {imp:.0%} impersonation risk)",
+            )
+        jev_emit_event("vetoed", ticker=ticker, token_address=token_address,
+                       reason=f"Stage-1 screen veto — Jev flagged {imp:.0%} impersonation risk")
+        return
+
+    entry["jev_screen"] = dims
+    _rescore_token(token_address)
+    logger.info(f"[jev/screen] Stage-1 screened {ticker} ({token_address[:8]}) — narrative_quality={dims.get('narrative_quality', {}).get('score')}")
+
+
+async def maybe_evaluate_token_with_jev(token_address: str, entry: dict[str, Any]) -> None:
+    """Gate + call + cache. Called from the rescore path. Spends AT MOST one Jev
+    call per token, and only for candidates that clear the cost gate. Mutates
+    entry['jev'] in place and logs the judgment for the learning loop."""
+    if token_address in JEV_EVALUATED_TOKENS:
+        return  # already judged once — reuse the cached entry['jev'] (no event: not an action)
+
+    ticker = entry.get("ticker")
+    can_call, reason = jev_budget_status()
+    if not can_call:
+        JEV_USAGE["disabled_reason"] = reason
+        # Emit a budget-block event only ONCE per token — otherwise a capped day
+        # floods the log with the same token every poll. Count the rest silently.
+        if token_address not in JEV_BUDGET_BLOCKED_SEEN:
+            JEV_BUDGET_BLOCKED_SEEN.add(token_address)
+            jev_emit_event("skipped", ticker=ticker, token_address=token_address,
+                           reason=f"budget/disabled: {reason}")
+        else:
+            JEV_USAGE["skipped_budget"] = JEV_USAGE.get("skipped_budget", 0) + 1
+        return  # fail-safe / budget guard: token scores on deterministic signals only
+
+    # Cost gate: only genuinely promising, identifiable candidates cost a call.
+    # NOTE: "not ready yet" skips (no ticker / mcap or score below gate) are the
+    # overwhelming majority and are NOT meaningful Jev decisions — they'd drown
+    # the event log. We count them in a summary counter but don't emit an event.
+    if not ticker or ticker == "UNKNOWN":
+        JEV_USAGE["skipped_not_ready"] = JEV_USAGE.get("skipped_not_ready", 0) + 1
+        return
+    # Safety net: never evaluate established coins / tokenized stocks even if one
+    # leaked into the feed — these aren't new fair-launches (user doesn't want them).
+    est, est_reason = is_probably_established_or_stock(ticker, entry.get("market_cap") or 0.0)
+    if est:
+        jev_emit_event("skipped", ticker=ticker, token_address=token_address,
+                       reason=f"not a new launch: {est_reason}")
+        return
+    if (entry.get("market_cap") or 0) < JEV_MIN_MCAP_TO_EVALUATE:
+        JEV_USAGE["skipped_not_ready"] = JEV_USAGE.get("skipped_not_ready", 0) + 1
+        return
+    if (entry.get("opportunity_score") or 0) < JEV_MIN_SCORE_TO_EVALUATE:
+        JEV_USAGE["skipped_not_ready"] = JEV_USAGE.get("skipped_not_ready", 0) + 1
+        return
+
+    # Mark BEFORE the call so a slow/failed call can't cause a duplicate spend
+    # if this token is rescored again while the request is in flight.
+    JEV_EVALUATED_TOKENS[token_address] = time.time()
+    if len(JEV_EVALUATED_TOKENS) > JEV_EVALUATED_MAX:
+        JEV_EVALUATED_TOKENS.pop(next(iter(JEV_EVALUATED_TOKENS)), None)
+
+    # Make sure Jev actually SEES the coin's description before judging it.
+    # The pump.fun description is normally fetched fire-and-forget by the poll
+    # loop, which often hasn't completed by the time a coin clears the gate — so
+    # Jev was judging narrative/quality blind. Fetch it now (awaited, fail-safe)
+    # so the description informs the judgment, then rebuild state with it.
+    if entry.get("platform") == "pump.fun" and not entry.get("description"):
+        try:
+            meta = await fetch_pumpfun_image(token_address)
+            if meta:
+                upd = {}
+                if meta.get("name") and not entry.get("name"):
+                    upd["name"] = meta["name"]
+                if meta.get("description"):
+                    upd["description"] = meta["description"][:1000]
+                if upd:
+                    token_feed_upsert(token_address, **upd)
+                    entry.update(upd)
+        except Exception:
+            pass
+
+    # Semantic deduplication check: reuse invariant qualitative dimensions if cached
+    sem_hash = _compute_semantic_hash(ticker, entry.get("name"), entry.get("description"))
+    cached_sem = JEV_SEMANTIC_CACHE.get(sem_hash)
+    cached_dims: dict[str, Any] = {}
+    if cached_sem and (time.time() - cached_sem.get("cached_at", 0)) < JEV_SEMANTIC_CACHE_TTL:
+        cached_dims = dict(cached_sem.get("dimensions", {}))
+        # If cached impersonation is already a veto, execute veto immediately with 0 API tokens spent!
+        cached_imp = cached_dims.get("impersonation_risk", {}).get("noul")
+        if cached_imp is not None and cached_imp >= JEV_IMPERSONATION_VETO:
+            info = TOKEN_WATCHLIST.get(token_address)
+            if info is not None:
+                await _kick_out_watchlist_token(
+                    token_address, info, time.time(), "JEV_IMPERSONATION",
+                    f"SKIPPED - NOT A NEW LAUNCH (Jev cached: {cached_imp:.0%} impersonation risk)",
+                )
+            jev_emit_event("vetoed", ticker=ticker, token_address=token_address,
+                           reason=f"Cached veto — {cached_imp:.0%} impersonation risk")
+            return
+
+    state = _jev_build_state(entry)
+    # Merge in any candidate (proposed) questions being tested — they ride the
+    # same single call at no extra request cost (docs: batch everything).
+    proposed = jev_active_proposed_questions()
+
+    # Invariant questions (narrative quality/durability/impersonation) can be skipped if already cached
+    questions_sent: dict[str, Any] = {}
+    for qid, q in JEV_QUESTIONS.items():
+        if qid in cached_dims and qid in ("narrative_quality", "narrative_durability", "impersonation_risk"):
+            continue
+        questions_sent[qid] = q
+    questions_sent.update(proposed)
+
+    body = await jev_call_system_one(state, questions_sent)
+    if body is None:
+        # Failed — allow a future retry by clearing the mark (still budget-gated).
+        JEV_EVALUATED_TOKENS.pop(token_address, None)
+        jev_emit_event("error", ticker=ticker, token_address=token_address,
+                       reason=JEV_USAGE.get("last_error") or "API call failed")
+        return
+
+    judgment = _jev_parse_answers(body)
+    # Merge cached invariant dimensions back into judgment
+    if cached_dims:
+        for k, v in cached_dims.items():
+            if k not in judgment["dimensions"]:
+                judgment["dimensions"][k] = v
+
+    # Update semantic cache with invariant dimensions
+    new_invariants = {
+        k: judgment["dimensions"][k]
+        for k in ("narrative_quality", "narrative_durability", "impersonation_risk")
+        if k in judgment["dimensions"]
+    }
+    if new_invariants:
+        JEV_SEMANTIC_CACHE[sem_hash] = {
+            "dimensions": new_invariants,
+            "cached_at": time.time(),
+            "ticker": ticker,
+        }
+        if len(JEV_SEMANTIC_CACHE) > JEV_SEMANTIC_CACHE_MAX:
+            JEV_SEMANTIC_CACHE.pop(next(iter(JEV_SEMANTIC_CACHE)), None)
+
+    # GATEKEEPER: if Jev flags high impersonation risk, this is an established
+    # coin / tokenized stock / brand impersonator (e.g. RBLX, NVDA, RDDT) that
+    # slipped past the cheap pre-filters. Purge it — don't show it as an
+    # evaluation, don't log it, kick it from the watchlist. Jev IS the real
+    # gatekeeper here; the hardcoded blocklist is just a cheap first pass.
+    imp = (judgment.get("dimensions", {}).get("impersonation_risk") or {}).get("noul")
+    if imp is not None and imp >= JEV_IMPERSONATION_VETO:
+        JEV_JUDGMENT_LOG.pop(token_address, None)
+        info = TOKEN_WATCHLIST.get(token_address)
+        if info is not None:
+            await _kick_out_watchlist_token(
+                token_address, info, time.time(), "JEV_IMPERSONATION",
+                f"SKIPPED - NOT A NEW LAUNCH (Jev: {imp:.0%} impersonation risk)",
+            )
+        jev_emit_event("vetoed", ticker=ticker, token_address=token_address,
+                       reason=f"purged — Jev flagged {imp:.0%} impersonation risk (established/stock/brand)")
+        await broadcast_json({"kind": "jev_stats", "payload": build_jev_stats()})
+        logger.info(f"[jev] purged {ticker} ({token_address[:8]}) — impersonation {imp:.0%}")
+        return
+    entry["jev"] = judgment
+    _jev_log_judgment(token_address, entry, judgment)
+    # Record proposed-question answers for measurement against outcome.
+    if proposed:
+        _jev_record_proposed_answers(token_address, judgment.get("dimensions", {}))
+    # Recompute so the Jev contribution lands in the visible score immediately.
+    _rescore_token(token_address)
+    # Build a rich, display-ready activity record and push it to the dashboard
+    # so the operator can see EXACTLY what Jev looked at and concluded — including
+    # the RAW request (state + questions) that was sent.
+    activity = _jev_build_activity_record(token_address, entry, judgment)
+    activity["raw_request"] = {"state": state, "questions": questions_sent}
+    RECENT_JEV_JUDGMENTS.append(activity)
+    jev_emit_event("vetoed" if activity["veto"] else "evaluated", ticker=ticker,
+                   token_address=token_address,
+                   reason=("VETO — " + (activity["reasons"][0] if activity["reasons"] else "")) if activity["veto"]
+                          else f"contribution {activity['contribution']:+d} pts",
+                   detail={"contribution": activity["contribution"], "dimensions": activity["dimensions"],
+                           "links": entry.get("links") or {}})
+    await broadcast_json({"kind": "jev_judgment", "payload": activity})
+    await broadcast_json({"kind": "jev_stats", "payload": build_jev_stats()})
+    logger.info(
+        f"[jev] evaluated {ticker} ({token_address[:8]}) — "
+        f"{len(judgment['dimensions'])} dims, contribution {activity['contribution']:+d}"
+        f"{' VETO' if activity['veto'] else ''}"
+    )
+
+
+def _jev_build_activity_record(token_address: str, entry: dict[str, Any], judgment: dict[str, Any]) -> dict[str, Any]:
+    """Flatten one judgment into everything the UI needs to show it in full:
+    the input state Jev saw, each dimension's value/confidence/probabilities,
+    the points it contributed, the reasons, and the verdict."""
+    pts, reasons, veto = jev_score_contribution(entry)
+    dims_out: dict[str, Any] = {}
+    for qid, d in judgment.get("dimensions", {}).items():
+        if d.get("type") == "score":
+            dims_out[qid] = {
+                "type": "score",
+                "score": d.get("score"),
+                "n_levels": d.get("n_levels"),
+                "confidence": d.get("confidence"),
+                "legend": d.get("legend", {}),
+                "probabilities": d.get("probabilities", {}),
+            }
+        elif d.get("type") == "noul":
+            dims_out[qid] = {"type": "noul", "noul": d.get("noul")}
+    return {
+        "token_address": token_address,
+        "ticker": entry.get("ticker"),
+        "chain": entry.get("chain"),
+        "platform": entry.get("platform"),
+        "model": judgment.get("model"),
+        "evaluated_at": judgment.get("evaluated_at"),
+        "state_seen": _jev_build_state(entry),   # exactly what Jev was shown
+        "mcap_at_eval": entry.get("market_cap"),
+        "opportunity_score": entry.get("opportunity_score"),
+        "dimensions": dims_out,
+        "contribution": int(pts),
+        "reasons": reasons,
+        "veto": veto,
+        "usage": judgment.get("usage", {}),
+        "image_url": entry.get("image_url"),
+        "links": entry.get("links") or {},
+    }
+
+
+# --- PvP: same-name cohort assembly + comparative CHOICE --------------------
+def assemble_same_name_cohort(entry: dict[str, Any]) -> list[dict[str, Any]]:
+    """Gather same-name candidates from NARRATIVE_CACHE — the coins competing
+    for this narrative. Only coins that have ALREADY had their run are excluded:
+    GRADUATED (the move already happened) and RUGGED (dead). A coin that's still
+    live is kept even if it's already sizable — a big-but-climbing coin with a
+    strong narrative can still be a play, and Jev's moon_potential judgment
+    decides that, not a blunt mcap cutoff."""
+    ticker = entry.get("ticker") or ""
+    key = narrative_cluster_key(normalize_ticker(ticker))
+    if not key:
+        return []
+    events = NARRATIVE_CACHE.get(key, [])
+    cohort: dict[str, dict[str, Any]] = {}
+    now = time.time()
+    for ts, chain, platform, dev_wallet, token_address in events:
+        fe = TOKEN_FEED.get(token_address, {})
+        status = fe.get("status", "WATCHING")
+        mcap = fe.get("market_cap", 0.0)
+        # Only exclude coins whose run is already over — not big live ones.
+        if status in ("GRADUATED", "RUGGED"):
+            continue
+        cohort[token_address] = {
+            "token_address": token_address,
+            "ticker": fe.get("ticker") or ticker,
+            "chain": chain,
+            "platform": platform,
+            "age_seconds": now - (fe.get("created_at") or ts),
+            "market_cap": mcap,
+            "volume_24h": fe.get("volume_24h", 0.0),
+            "status": status,
+            "links": fe.get("links") or build_token_links(chain, token_address),
+        }
+    return sorted(cohort.values(), key=lambda c: c.get("market_cap", 0), reverse=True)
+
+
+def _cohort_signature(cohort: list[dict[str, Any]]) -> str:
+    """Stable signature so a PvP call is re-spent only when the cohort changes
+    materially (membership or leader). Buckets mcap so tiny drifts don't churn."""
+    parts = []
+    for c in sorted(cohort, key=lambda x: x["token_address"]):
+        parts.append(f"{c['token_address'][:10]}:{int((c.get('market_cap') or 0) // 50000)}")
+    return "|".join(parts)
+
+
+def _build_pvp_state(entry: dict[str, Any], cohort: list[dict[str, Any]], history: list[dict[str, Any]]) -> dict[str, Any]:
+    """State for the comparative call: the same-name cohort as options + the
+    per-chain >$500k runner history as grounding evidence."""
+    return {
+        "narrative": entry.get("ticker") or "",
+        "chain": entry.get("chain"),
+        "candidates": [
+            {
+                "id": f"opt_{i}",
+                "platform": c["platform"],
+                "chain": c["chain"],
+                "age_minutes": round((c["age_seconds"] or 0) / 60, 1),
+                "market_cap_usd": round(c.get("market_cap") or 0),
+                "volume_24h_usd": round(c.get("volume_24h") or 0),
+                "status": c["status"],
+                "is_oldest": False,  # set below
+            }
+            for i, c in enumerate(cohort)
+        ],
+        "past_500k_runners_same_name": [
+            {"platform": r["platform"], "peak_mcap_usd": r.get("peak_mcap")}
+            for r in history if r.get("narrative_key") == narrative_cluster_key(normalize_ticker(entry.get("ticker") or ""))
+        ],
+        "past_500k_runners_this_chain": [
+            {"ticker": r["ticker"], "platform": r["platform"], "peak_mcap_usd": r.get("peak_mcap")}
+            for r in history
+        ],
+    }
+
+
+async def maybe_run_pvp_choice(token_address: str, entry: dict[str, Any]) -> None:
+    """When a same-name cohort exists (PvP), ask Jev to PICK which coin is the
+    best play, grounded in the chain's >$500k runner history. Cost-gated +
+    cached per cohort signature so it only spends when the field changes."""
+    can_call, reason = jev_budget_status()
+    if not can_call:
+        return
+    cohort = assemble_same_name_cohort(entry)
+    if len(cohort) < JEV_PVP_MIN_COHORT:
+        return  # not a PvP situation — a single coin needs no comparison (normal, no event)
+
+    # Gate: at least one cohort member must have real mcap — no point spending a
+    # comparative call to pick between several dust coins.
+    if max((c.get("market_cap") or 0) for c in cohort) < JEV_PVP_MIN_MCAP:
+        return
+
+    sig = _cohort_signature(cohort)
+    key = narrative_cluster_key(normalize_ticker(entry.get("ticker") or ""))
+    cached = JEV_PVP_CACHE.get(key)
+    if cached and cached.get("signature") == sig:
+        return  # cohort unchanged since last pick — reuse (cached, no re-spend, no event)
+    # Cooldown: even if the cohort drifted, don't re-run the same narrative too
+    # often — a churning cohort was re-spending PvP calls every poll.
+    if cached and (time.time() - (cached.get("evaluated_at") or 0)) < JEV_PVP_COOLDOWN_SECONDS:
+        return
+    # RACE GUARD: the Jev call below is awaited (~1-2s). Without reserving the
+    # key NOW, several cohort members rescored in the same instant all pass the
+    # checks above (cache still empty) and each fires a duplicate call for the
+    # SAME narrative. Reserve synchronously before any await.
+    if key in JEV_PVP_INFLIGHT:
+        return
+    JEV_PVP_INFLIGHT.add(key)
+
+    # mark the oldest candidate (the "old coin might have the edge" case)
+    if cohort:
+        oldest_idx = max(range(len(cohort)), key=lambda i: cohort[i]["age_seconds"])
+    else:
+        oldest_idx = -1
+    chain = entry.get("chain") or "?"
+    history = big_runners_for_narrative(chain, key)
+    state = _build_pvp_state(entry, cohort, history)
+    if oldest_idx >= 0 and oldest_idx < len(state["candidates"]):
+        state["candidates"][oldest_idx]["is_oldest"] = True
+
+    # Build a dynamic CHOICE: one option per cohort member + an explicit "none".
+    criteria: dict[str, Any] = {}
+    for i, c in enumerate(cohort):
+        criteria[f"opt_{i}"] = (
+            f"{c['platform']} on {c['chain']}, "
+            f"{'OLDEST/pre-existing' if i == oldest_idx else 'newer'}, "
+            f"mcap ${round(c.get('market_cap') or 0):,}, vol ${round(c.get('volume_24h') or 0):,}"
+        )
+    criteria["none"] = "None is a clear pick yet — too early or none stands out"
+    questions = {
+        "best_pick": {
+            "type": "choice",
+            "instructions": (
+                "Several coins share this narrative/name across launchpads (platform-vs-platform). "
+                "Considering each candidate's launchpad, age, market cap and volume — and the history "
+                "of coins that previously ran above $500k on this chain — which single coin is the best "
+                "play? Note that an older, pre-existing coin of the same name often captures the "
+                "attention better than a fresh copycat."
+            ),
+            "criteria": criteria,
+        }
+    }
+    body = await jev_call_system_one(state, questions)
+    if body is None:
+        JEV_PVP_INFLIGHT.discard(key)
+        jev_emit_event("error", ticker=entry.get("ticker"), token_address=token_address,
+                       reason=f"PvP call failed: {JEV_USAGE.get('last_error') or 'unknown'}")
+        return
+    ans = (body.get("answers") or {}).get("best_pick", {})
+    picked_id = ans.get("choice")
+    picked_idx = int(picked_id.split("_")[1]) if (picked_id or "").startswith("opt_") else None
+    picked_addr = cohort[picked_idx]["token_address"] if picked_idx is not None and picked_idx < len(cohort) else None
+
+    # Jev's CHOICE returns typed answers, not prose — so derive the reasoning
+    # from WHAT distinguished the pick: age (old-coin edge), mcap lead, and
+    # whether same-name history exists on this chain, plus the probability gap.
+    probs = ans.get("probabilities", {})
+    reasoning = ""
+    if picked_idx is not None and picked_idx < len(cohort):
+        pk = cohort[picked_idx]
+        factors = []
+        if oldest_idx == picked_idx:
+            factors.append("it's the OLDEST/pre-existing coin of this name (attention tends to flow to the established one, not fresh copycats)")
+        leader = max(range(len(cohort)), key=lambda i: cohort[i].get("market_cap") or 0)
+        if leader == picked_idx:
+            factors.append(f"it has the highest market cap of the cohort (${round(pk.get('market_cap') or 0):,})")
+        same_name_hist = [r for r in history if r.get("narrative_key") == key]
+        if same_name_hist:
+            factors.append(f"this name has run >$500k before on {chain} ({len(same_name_hist)} time(s))")
+        # probability margin over runner-up
+        sorted_p = sorted((v for v in probs.values()), reverse=True)
+        if len(sorted_p) >= 2:
+            factors.append(f"Jev assigned it {sorted_p[0]*100:.0f}% vs {sorted_p[1]*100:.0f}% for the next best")
+        reasoning = (
+            f"Jev picked the {pk['platform']} coin"
+            + (" — " + "; ".join(factors) if factors else "")
+            + "."
+        )
+    elif picked_id == "none":
+        reasoning = "Jev judged no coin in this cohort a clear pick yet (too early or none stands out)."
+
+    result = {
+        "signature": sig,
+        "model": body.get("model"),
+        "evaluated_at": time.time(),
+        "narrative_key": key,
+        "chain": chain,
+        "picked_id": picked_id,
+        "picked_address": picked_addr,
+        "probabilities": probs,
+        "confidence": ans.get("confidence"),
+        "reasoning": reasoning,
+        "cohort": cohort,
+        "state_seen": state,
+        "usage": body.get("usage", {}),
+    }
+    JEV_PVP_CACHE[key] = result
+    _jev_log_pvp(key, result)
+    if len(JEV_PVP_CACHE) > JEV_PVP_CACHE_MAX:
+        JEV_PVP_CACHE.pop(next(iter(JEV_PVP_CACHE)), None)
+
+    # Tag every cohort member's feed entry with the pick so scoring + UI see it.
+    for i, c in enumerate(cohort):
+        fe = TOKEN_FEED.get(c["token_address"])
+        if fe is not None:
+            fe["jev_pvp"] = {
+                "is_pick": (c["token_address"] == picked_addr),
+                "picked_ticker": entry.get("ticker"),
+                "picked_platform": (cohort[picked_idx]["platform"] if picked_idx is not None and picked_idx < len(cohort) else None),
+                "confidence": result["confidence"],
+                "cohort_size": len(cohort),
+                "probability": result["probabilities"].get(f"opt_{i}"),
+            }
+        _rescore_token(c["token_address"])
+
+    RECENT_JEV_JUDGMENTS.append({
+        "kind": "pvp",
+        "token_address": picked_addr or token_address,
+        "ticker": entry.get("ticker"),
+        "chain": chain,
+        "model": result["model"],
+        "evaluated_at": result["evaluated_at"],
+        "picked_platform": (cohort[picked_idx]["platform"] if picked_idx is not None and picked_idx < len(cohort) else "none"),
+        "picked_address": picked_addr,
+        "confidence": result["confidence"],
+        "reasoning": result["reasoning"],
+        "probabilities": result["probabilities"],
+        "cohort": cohort,
+        "history_count": len(history),
+        "usage": result["usage"],
+        "raw_request": {"state": state, "questions": questions},
+        "links": (TOKEN_FEED.get(picked_addr) or {}).get("links") or (entry.get("links") or {}),
+    })
+    picked_platform = (cohort[picked_idx]["platform"] if picked_idx is not None and picked_idx < len(cohort) else "none")
+    jev_emit_event("pvp_pick", ticker=entry.get("ticker"), token_address=picked_addr or token_address,
+                   reason=f"picked {picked_platform} out of {len(cohort)} same-name coins (conf {(result['confidence'] or 0):.0%})",
+                   detail={"cohort_size": len(cohort), "picked_platform": picked_platform,
+                           "probabilities": result["probabilities"],
+                           "links": (TOKEN_FEED.get(picked_addr) or {}).get("links") or {}})
+    await broadcast_json({"kind": "jev_pvp", "payload": RECENT_JEV_JUDGMENTS[-1]})
+    await broadcast_json({"kind": "jev_stats", "payload": build_jev_stats()})
+    logger.info(
+        f"[jev/pvp] {entry.get('ticker')} cohort={len(cohort)} → pick={picked_id} "
+        f"({'none' if not picked_addr else picked_addr[:8]}) conf={result['confidence']}"
+    )
+    JEV_PVP_INFLIGHT.discard(key)
+
+
+def jev_score_contribution(entry: dict[str, Any]) -> tuple[int, list[str], bool]:
+    """Convert a cached Jev judgment into signed, confidence-scaled opportunity
+    points + human-readable reasons. Returns (points, reasons, hard_veto).
+    Policy (weights, veto) lives here in code, not in the model."""
+    jev = entry.get("jev")
+    pvp = entry.get("jev_pvp")
+    # Nothing from Jev at all → no contribution. But a token can have a PvP
+    # pick without its own per-token judgment (it's part of a cohort), so we
+    # only bail when BOTH are absent.
+    if (not jev or not jev.get("dimensions")) and not pvp:
+        return 0, [], False
+    dims = (jev or {}).get("dimensions", {}) if jev else {}
+    points = 0
+    reasons: list[str] = []
+
+    # Impersonation is the hard-veto path (like blacklist / implausible mcap).
+    imp = dims.get("impersonation_risk", {})
+    imp_p = imp.get("noul")
+    if imp_p is not None and imp_p >= JEV_IMPERSONATION_VETO:
+        reasons.append(f"Jev: high impersonation risk ({imp_p:.0%}) — looks like it mimics an established asset (VETO)")
+        return 0, reasons, True
+
+    # Trap/rug risk — a second hard-veto path, grounded in the enriched
+    # on-chain state; below the veto it contributes scaled negative points.
+    trap = dims.get("trap_risk", {})
+    trap_p = trap.get("noul")
+    if trap_p is not None:
+        if trap_p >= JEV_TRAP_RISK_VETO:
+            reasons.append(f"Jev: high trap/rug risk ({trap_p:.0%}) — on-chain signals look like a coordinated pump/rug (VETO)")
+            return 0, reasons, True
+        if trap_p > 0.5:
+            pts = round((trap_p - 0.5) * 2 * JEV_WEIGHT_TRAP_RISK * JEV_LEARNED_WEIGHTS.get("trap_risk", 1.0))
+            if pts:
+                points -= pts
+                reasons.append(f"Jev: elevated trap/rug risk ({trap_p:.0%}) (-{pts})")
+
+    def _score_points(qid: str, weight: float, label: str) -> None:
+        nonlocal points
+        d = dims.get(qid)
+        if not d or d.get("score") is None:
+            return
+        n_levels = d.get("n_levels") or 0
+        if n_levels < 2:
+            return
+        # Normalize the 0..(n-1) level to a -1..+1 axis (bottom levels negative,
+        # top levels positive), then scale by weight, learned multiplier, and conf.
+        norm = (d["score"] / (n_levels - 1)) * 2 - 1  # -1..+1
+        conf = d.get("confidence")
+        conf = 1.0 if conf is None else max(0.0, min(1.0, conf))
+        mult = JEV_LEARNED_WEIGHTS.get(qid, 1.0)  # Level C auto-tune (1.0 until learned)
+        pts = round(norm * weight * mult * conf)
+        if pts:
+            points += pts
+            sign = "+" if pts > 0 else ""
+            mtxt = f", ×{mult:g} learned" if mult != 1.0 else ""
+            reasons.append(
+                f"Jev: {label} {d['score']:.1f}/{n_levels - 1} (conf {conf:.0%}{mtxt}) ({sign}{pts})"
+            )
+
+    _score_points("narrative_quality", JEV_WEIGHT_NARRATIVE_QUALITY, "narrative quality")
+    _score_points("narrative_durability", JEV_WEIGHT_DURABILITY, "narrative durability")
+    _score_points("moon_potential", JEV_WEIGHT_MOON_POTENTIAL, "moon potential")
+
+    # Legitimacy is a Noul (0..1): map to a -weight..+weight band around 0.5.
+    legit = dims.get("legitimacy", {})
+    legit_p = legit.get("noul")
+    if legit_p is not None:
+        _lm = JEV_LEARNED_WEIGHTS.get("legitimacy", 1.0)
+        pts = round((legit_p - 0.5) * 2 * JEV_WEIGHT_LEGITIMACY * _lm)
+        if pts:
+            points += pts
+            sign = "+" if pts > 0 else ""
+            reasons.append(f"Jev: legitimacy {legit_p:.0%} ({sign}{pts})")
+
+    # PvP comparative pick (see maybe_run_pvp_choice): if this coin is part of a
+    # same-name cohort, reward it for being Jev's pick and lightly penalize the
+    # ones it wasn't — confidence-scaled.
+    pvp = entry.get("jev_pvp")
+    if pvp and pvp.get("cohort_size", 0) >= 2:
+        conf = pvp.get("confidence")
+        conf = 1.0 if conf is None else max(0.0, min(1.0, conf))
+        if pvp.get("is_pick"):
+            pts = round(JEV_WEIGHT_PVP_PICK * conf)
+            if pts:
+                points += pts
+                reasons.append(
+                    f"Jev PvP: best pick of {pvp['cohort_size']} same-name coins "
+                    f"(conf {conf:.0%}) (+{pts})"
+                )
+        else:
+            pts = round(JEV_WEIGHT_PVP_PICK * 0.5 * conf)
+            if pts:
+                points -= pts
+                pick = pvp.get("picked_platform") or "another platform"
+                reasons.append(
+                    f"Jev PvP: not the pick — {pick} coin favored for this name (-{pts})"
+                )
+
+    # Data context sufficiency (sufficient_info Noul) confidence-gating:
+    # If the model judged that key context was missing (unindexed, no description, sparse data),
+    # scale down the qualitative contribution or suppress it if critically low (TypeSafe confidence-routing pattern).
+    suff = dims.get("sufficient_info", {})
+    suff_p = suff.get("noul")
+    if suff_p is not None and suff_p < 0.5:
+        if suff_p <= 0.2:
+            reasons.append(f"Jev: critical context missing ({suff_p:.0%} sufficiency) — qualitative points suppressed")
+            return 0, reasons, False
+        discount_factor = max(0.2, suff_p)
+        discounted = round(points * discount_factor)
+        diff = points - discounted
+        points = discounted
+        reasons.append(f"Jev: sparse context ({suff_p:.0%} sufficiency) — points discounted by {round((1 - discount_factor) * 100)}% (-{diff} pts)")
+
+    return points, reasons, False
+
+
+# --- Learning loop (Level A + B) --------------------------------------------
+# Jev itself does NOT learn. This is where the system learns: log every judgment
+# with the token's eventual outcome, then report which dimensions track winners.
+
+def _jev_log_judgment(token_address: str, entry: dict[str, Any], judgment: dict[str, Any]) -> None:
+    """Persist a judgment record; outcome filled in later by jev_record_outcome."""
+    dims = judgment.get("dimensions", {})
+    record = {
+        "token": token_address,
+        "ticker": entry.get("ticker"),
+        "chain": entry.get("chain"),
+        "platform": entry.get("platform"),
+        "evaluated_at": judgment.get("evaluated_at"),
+        "mcap_at_eval": entry.get("market_cap"),
+        "opportunity_score_at_eval": entry.get("opportunity_score"),
+        # flatten the numeric signals for correlation
+        "moon_potential": (dims.get("moon_potential") or {}).get("score"),
+        "narrative_quality": (dims.get("narrative_quality") or {}).get("score"),
+        "narrative_durability": (dims.get("narrative_durability") or {}).get("score"),
+        "legitimacy": (dims.get("legitimacy") or {}).get("noul"),
+        "impersonation_risk": (dims.get("impersonation_risk") or {}).get("noul"),
+        "trap_risk": (dims.get("trap_risk") or {}).get("noul"),
+        "sufficient_info": (dims.get("sufficient_info") or {}).get("noul"),
+        # --- real-trajectory tracking (graded over time, see jev_update_trajectory) ---
+        "flag_mcap": entry.get("market_cap") or 0.0,   # mcap when Jev flagged it
+        "peak_mcap": entry.get("market_cap") or 0.0,
+        "peak_at": judgment.get("evaluated_at") or time.time(),
+        "last_mcap": entry.get("market_cap") or 0.0,
+        "peak_multiple": 1.0,                           # best mcap/flag_mcap seen
+        "tier_reached": 0.0,                            # highest tier multiple touched
+        "tier_reached_at": None,
+        "tier_sustained": 0.0,                          # highest tier held >= sustain
+        "outcome": None,          # 'mooned' | 'rugged' | 'dying' | 'flat' — set later
+        "outcome_at": None,
+        "tracking_done": False,
+    }
+    JEV_JUDGMENT_LOG[token_address] = record
+    if len(JEV_JUDGMENT_LOG) > JEV_JUDGMENT_LOG_MAX:
+        JEV_JUDGMENT_LOG.pop(next(iter(JEV_JUDGMENT_LOG)), None)
+
+
+def jev_record_outcome(token_address: str, outcome: str) -> None:
+    """Label a logged judgment with its eventual outcome. Idempotent-ish: a
+    terminal outcome (mooned/rugged) is not overwritten by a later 'flat'."""
+    rec = JEV_JUDGMENT_LOG.get(token_address)
+    if rec is None:
+        return
+    # terminal outcomes (mooned/rugged/dying) aren't downgraded to 'flat'
+    if rec.get("outcome") in ("mooned", "rugged", "dying") and outcome == "flat":
+        return
+    rec["outcome"] = outcome
+    rec["outcome_at"] = time.time()
+    # Also stamp the visible activity-feed card so the UI shows which coin
+    # mooned/rugged/faded (not just an unlabeled evaluation).
+    for a in RECENT_JEV_JUDGMENTS:
+        if a.get("kind") != "pvp" and a.get("token_address") == token_address:
+            if a.get("outcome") in ("mooned", "rugged", "dying") and outcome == "flat":
+                continue
+            a["outcome"] = outcome
+
+
+def jev_update_trajectory(token_address: str, market_cap: float) -> None:
+    """Called on every poll for a coin Jev flagged. Tracks the real mcap move
+    from the flag point and grades the outcome:
+      MOONED = held a tier multiple (3x/5x/10x) for >= sustain minutes
+      RUGGED = instant >=80% crash from peak (within the rug window of the peak)
+      DYING  = >=60% down from peak but slowly (not a sharp crash)
+    Terminal outcomes stick; ALIVE coins keep being graded until the window ends."""
+    rec = JEV_JUDGMENT_LOG.get(token_address)
+    if rec is None or rec.get("tracking_done"):
+        return
+    if not market_cap or market_cap <= 0:
+        return
+    now = time.time()
+    flag = rec.get("flag_mcap") or 0.0
+    rec["last_mcap"] = market_cap
+
+    # update peak
+    if market_cap > (rec.get("peak_mcap") or 0.0):
+        rec["peak_mcap"] = market_cap
+        rec["peak_at"] = now
+
+    if flag > 0:
+        mult = market_cap / flag
+        if mult > (rec.get("peak_multiple") or 1.0):
+            rec["peak_multiple"] = round(mult, 2)
+        # tier touched
+        touched = max([t for t in JEV_MOON_TIERS if mult >= t], default=0.0)
+        if touched > (rec.get("tier_reached") or 0.0):
+            rec["tier_reached"] = touched
+            rec["tier_reached_at"] = now
+        # --- continuous tier-hold tracking (fix): track how long the coin has
+        # stayed AT/ABOVE the lowest tier without dropping below it. Reset the
+        # hold-start whenever it falls under. A moon = held the tier continuously
+        # for >= sustain, judged from this hold-start (not a single-poll snapshot,
+        # which almost always missed fast movers).
+        lowest_tier = min(JEV_MOON_TIERS) if JEV_MOON_TIERS else 3.0
+        if mult >= lowest_tier:
+            if not rec.get("tier_hold_start"):
+                rec["tier_hold_start"] = now
+        else:
+            rec["tier_hold_start"] = None  # dropped below tier — reset the clock
+
+    peak = rec.get("peak_mcap") or 0.0
+    drawdown = (peak - market_cap) / peak if peak > 0 else 0.0
+    secs_since_peak = now - (rec.get("peak_at") or now)
+
+    # already terminal? keep peak/last updated but don't reclassify away from a win
+    if rec.get("outcome") in ("mooned", "rugged"):
+        return
+
+    # MOON: held a tier continuously for >= sustain. Checked FIRST (before rug)
+    # so a coin that sustained a real run then later dumped is still credited the
+    # moon. Uses the continuous hold-start, and grades against the HIGHEST tier
+    # the current mcap still satisfies.
+    hold_start = rec.get("tier_hold_start")
+    if hold_start and flag > 0 and (now - hold_start) >= JEV_MOON_SUSTAIN_SECONDS:
+        mult_now = market_cap / flag
+        sustained_tier = max([t for t in JEV_MOON_TIERS if mult_now >= t], default=0.0)
+        if sustained_tier > 0:
+            rec["tier_sustained"] = sustained_tier
+            jev_record_outcome(token_address, "mooned")
+            jev_record_pvp_outcome(token_address, "mooned")
+            jev_record_proposed_outcome(token_address, "mooned")
+            # don't mark tracking_done — a mooned coin can still be watched for a rug after
+            return
+
+    # RUG: sharp, large drop shortly after the peak
+    if drawdown >= JEV_RUG_DROP_PCT and secs_since_peak <= JEV_RUG_WINDOW_SECONDS:
+        jev_record_outcome(token_address, "rugged")
+        jev_record_pvp_outcome(token_address, "rugged")
+        jev_record_proposed_outcome(token_address, "rugged")
+        rec["tracking_done"] = True
+        return
+
+    # DYING: big but slow bleed (not a sharp rug) — soft negative, non-terminal
+    # until the window ends so it could still recover.
+    if drawdown >= JEV_DYING_DROP_PCT and secs_since_peak > JEV_RUG_WINDOW_SECONDS and rec.get("outcome") is None:
+        rec["outcome"] = "dying"
+        for a in RECENT_JEV_JUDGMENTS:
+            if a.get("kind") != "pvp" and a.get("token_address") == token_address and a.get("outcome") is None:
+                a["outcome"] = "dying"
+
+    # window elapsed with no moon/rug: finalize
+    if now - (rec.get("evaluated_at") or now) >= JEV_TRACK_WINDOW_SECONDS:
+        rec["tracking_done"] = True
+        if rec.get("outcome") is None:
+            jev_record_outcome(token_address, "flat")
+            jev_record_pvp_outcome(token_address, "flat")
+            jev_record_proposed_outcome(token_address, "flat")
+
+
+def build_jev_correlation_stats() -> dict[str, Any]:
+    """Level B: for each labeled dimension, mean value among winners vs losers,
+    so the system tells you which Jev signals actually predict on YOUR data.
+    Pure arithmetic over JEV_JUDGMENT_LOG — no API cost."""
+    labeled = [r for r in JEV_JUDGMENT_LOG.values() if r.get("outcome")]
+    winners = [r for r in labeled if r["outcome"] == "mooned"]
+    losers = [r for r in labeled if r["outcome"] == "rugged"]
+    non_winners = [r for r in labeled if r["outcome"] in ("rugged", "flat", "dying")]  # everything that didn't moon
+    dims = ["moon_potential", "narrative_quality", "narrative_durability", "legitimacy", "impersonation_risk", "trap_risk"]
+
+    def _mean(rows: list[dict[str, Any]], key: str) -> Optional[float]:
+        vals = [r[key] for r in rows if r.get(key) is not None]
+        return round(sum(vals) / len(vals), 3) if vals else None
+
+    per_dim = {}
+    for d in dims:
+        per_dim[d] = {
+            "winner_avg": _mean(winners, d),
+            "loser_avg": _mean(losers, d),
+            "non_winner_avg": _mean(non_winners, d),  # rugged+flat: 'didn't win'
+            "overall_avg": _mean(labeled, d),
+        }
+    return {
+        "judgments_total": len(JEV_JUDGMENT_LOG),
+        "labeled": len(labeled),
+        "winners": len(winners),
+        "losers": len(losers),
+        "flat": sum(1 for r in labeled if r["outcome"] == "flat"),
+        "dying": sum(1 for r in labeled if r["outcome"] == "dying"),
+        "tiers": {  # how many mooned coins hit each tier (sustained)
+            f"{int(t)}x": sum(1 for r in winners if (r.get("tier_sustained") or 0) >= t)
+            for t in JEV_MOON_TIERS
+        },
+        "best_multiple": round(max([r.get("peak_multiple") or 1.0 for r in JEV_JUDGMENT_LOG.values()], default=1.0), 2),
+        "per_dimension": per_dim,
+    }
+
+
+# --- Level C: auto-tune weight multipliers from outcomes --------------------
+def jev_recompute_learned_weights() -> dict[str, Any]:
+    """Derive a per-dimension weight MULTIPLIER from how well each dimension
+    separated winners (mooned) from non-winners (rugged/dying/flat). Gated on
+    sample size. Score dims use 0..(n-1); noul dims use 0..1 — both normalized
+    so separation is comparable. Predictive dims (winners score higher) get
+    multiplier >1; useless or inverted dims get <1. Clamped. Updates
+    JEV_LEARNED_WEIGHTS + JEV_AUTOTUNE_STATUS in place."""
+    if not JEV_AUTOTUNE_ENABLED:
+        JEV_AUTOTUNE_STATUS.update({"active": False, "reason": "auto-tune disabled"})
+        return JEV_AUTOTUNE_STATUS
+    labeled = [r for r in JEV_JUDGMENT_LOG.values() if r.get("outcome")]
+    winners = [r for r in labeled if r["outcome"] == "mooned"]
+    non_winners = [r for r in labeled if r["outcome"] in ("rugged", "dying", "flat")]
+    if len(labeled) < JEV_AUTOTUNE_MIN_OUTCOMES or len(winners) < JEV_AUTOTUNE_MIN_WINNERS:
+        JEV_AUTOTUNE_STATUS.update({
+            "active": False,
+            "reason": f"need ≥{JEV_AUTOTUNE_MIN_OUTCOMES} outcomes & ≥{JEV_AUTOTUNE_MIN_WINNERS} moons "
+                      f"(have {len(labeled)} outcomes, {len(winners)} moons)",
+            "labeled": len(labeled), "winners": len(winners), "updated_at": time.time(),
+        })
+        return JEV_AUTOTUNE_STATUS
+
+    # dimension -> (is it a "higher is better" signal? and its value range)
+    # score dims are graded 0..(n-1); we normalize by dividing by a nominal max.
+    score_dims = {"moon_potential": 4, "narrative_quality": 3, "narrative_durability": 3}
+    noul_pos = ["legitimacy"]                 # higher = better
+    noul_neg = ["trap_risk", "impersonation_risk"]  # higher = worse
+
+    def _norm_mean(rows, key, denom):
+        vals = [r[key] for r in rows if r.get(key) is not None]
+        return (sum(vals) / len(vals) / denom) if vals else None
+
+    learned = {}
+    detail = {}
+    for d, maxlvl in score_dims.items():
+        w = _norm_mean(winners, d, maxlvl); l = _norm_mean(non_winners, d, maxlvl)
+        if w is None or l is None:
+            continue
+        sep = w - l  # -1..+1; positive => predictive of moons
+        mult = max(JEV_AUTOTUNE_CLAMP_LOW, min(JEV_AUTOTUNE_CLAMP_HIGH, 1.0 + sep * 2.0))
+        learned[d] = round(mult, 3); detail[d] = {"winner": round(w,3), "loser": round(l,3), "sep": round(sep,3), "mult": round(mult,3)}
+    for d in noul_pos:
+        w = _norm_mean(winners, d, 1); l = _norm_mean(non_winners, d, 1)
+        if w is None or l is None: continue
+        sep = w - l
+        mult = max(JEV_AUTOTUNE_CLAMP_LOW, min(JEV_AUTOTUNE_CLAMP_HIGH, 1.0 + sep * 2.0))
+        learned[d] = round(mult, 3); detail[d] = {"winner": round(w,3), "loser": round(l,3), "sep": round(sep,3), "mult": round(mult,3)}
+    for d in noul_neg:
+        # for "bad" signals, predictive means LOSERS score higher; flip the sep
+        w = _norm_mean(winners, d, 1); l = _norm_mean(non_winners, d, 1)
+        if w is None or l is None: continue
+        sep = l - w
+        mult = max(JEV_AUTOTUNE_CLAMP_LOW, min(JEV_AUTOTUNE_CLAMP_HIGH, 1.0 + sep * 2.0))
+        learned[d] = round(mult, 3); detail[d] = {"winner": round(w,3), "loser": round(l,3), "sep": round(sep,3), "mult": round(mult,3)}
+
+    changed = learned != JEV_LEARNED_WEIGHTS
+    JEV_LEARNED_WEIGHTS.clear(); JEV_LEARNED_WEIGHTS.update(learned)
+    JEV_AUTOTUNE_STATUS.update({
+        "active": True, "reason": "active", "labeled": len(labeled), "winners": len(winners),
+        "detail": detail, "updated_at": time.time(),
+    })
+    if changed:
+        jev_emit_event("proposed", reason=f"auto-tuned weights from {len(labeled)} outcomes: "
+                       + ", ".join(f"{k}×{v}" for k, v in learned.items()),
+                       detail={"learned_weights": learned})
+        logger.info(f"[jev/autotune] learned weights updated: {learned}")
+    return JEV_AUTOTUNE_STATUS
+
+
+def _jev_log_pvp(narrative_key: str, result: dict[str, Any]) -> None:
+    """Record a PvP pick into the learning ledger so its correctness can be
+    graded once cohort members reach terminal outcomes."""
+    cohort = result.get("cohort", [])
+    record = {
+        "narrative_key": narrative_key,
+        "ticker": (cohort[0]["ticker"] if cohort else None),
+        "picked_address": result.get("picked_address"),
+        "picked_platform": None,
+        "confidence": result.get("confidence"),
+        "evaluated_at": result.get("evaluated_at"),
+        "members": [
+            {"token_address": c["token_address"], "platform": c["platform"],
+             "chain": c["chain"], "mcap_at_pick": round(c.get("market_cap") or 0),
+             "outcome": None}
+            for c in cohort
+        ],
+        "pick_was_correct": None,   # True/False once a member moons, else None
+        "resolved_at": None,
+    }
+    # fill picked_platform
+    for m in record["members"]:
+        if m["token_address"] == record["picked_address"]:
+            record["picked_platform"] = m["platform"]
+    JEV_PVP_LOG[narrative_key] = record
+    if len(JEV_PVP_LOG) > JEV_PVP_LOG_MAX:
+        JEV_PVP_LOG.pop(next(iter(JEV_PVP_LOG)), None)
+    # index every member so a later outcome finds this record
+    for m in record["members"]:
+        JEV_PVP_TOKEN_INDEX[m["token_address"]].add(narrative_key)
+
+
+def jev_record_pvp_outcome(token_address: str, outcome: str) -> None:
+    """A cohort member reached a terminal outcome — update the PvP record(s) it
+    belongs to. The pick is scored 'correct' if the moon'd coin is the one Jev
+    picked; 'incorrect' if a coin it rejected moon'd instead."""
+    keys = JEV_PVP_TOKEN_INDEX.get(token_address)
+    if not keys:
+        return
+    for key in list(keys):
+        rec = JEV_PVP_LOG.get(key)
+        if rec is None:
+            continue
+        for m in rec["members"]:
+            if m["token_address"] == token_address:
+                # keep terminal outcome, don't let 'flat' overwrite moon/rug
+                if m["outcome"] in ("mooned", "rugged") and outcome == "flat":
+                    continue
+                m["outcome"] = outcome
+        # score the pick the first time ANY member moons
+        if rec.get("pick_was_correct") is None:
+            mooned = [m for m in rec["members"] if m["outcome"] == "mooned"]
+            if mooned:
+                rec["pick_was_correct"] = any(m["token_address"] == rec["picked_address"] for m in mooned)
+                rec["resolved_at"] = time.time()
+
+
+def build_jev_pvp_stats() -> dict[str, Any]:
+    """How well the PvP picks are doing: resolved count + hit rate."""
+    resolved = [r for r in JEV_PVP_LOG.values() if r.get("pick_was_correct") is not None]
+    correct = sum(1 for r in resolved if r["pick_was_correct"])
+    return {
+        "picks_total": len(JEV_PVP_LOG),
+        "resolved": len(resolved),
+        "correct": correct,
+        "hit_rate": round(correct / len(resolved), 3) if resolved else None,
+    }
+
+
+def _build_jev_evaluated_coins(limit: int = 40) -> list[dict[str, Any]]:
+    """Every coin Jev evaluated, with its REAL peak multiple + outcome, ranked by
+    peak multiple — so the operator can see which coins ran (e.g. 5.5x) even if
+    they didn't formally 'moon' (a big wick that didn't hold = flat, not mooned).
+    Includes still-tracking coins so in-progress runners are visible."""
+    rows = []
+    for addr, r in JEV_JUDGMENT_LOG.items():
+        pm = r.get("peak_multiple") or 1.0
+        rows.append({
+            "token_address": addr,
+            "ticker": r.get("ticker"),
+            "peak_multiple": round(pm, 2),
+            "tier_sustained": r.get("tier_sustained") or 0,
+            "outcome": r.get("outcome") or "tracking",
+            "flag_mcap": round(r.get("flag_mcap") or 0),
+            "peak_mcap": round(r.get("peak_mcap") or 0),
+            "last_mcap": round(r.get("last_mcap") or 0),
+            "chain": r.get("chain"),
+            "evaluated_at": r.get("evaluated_at"),
+        })
+    rows.sort(key=lambda x: -x["peak_multiple"])
+    return rows[:limit]
+
+
+# --- #3 Question-proposal & measurement -------------------------------------
+def _slug(name: str) -> str:
+    base = "".join(c if c.isalnum() else "_" for c in (name or "").lower()).strip("_")
+    return ("prop_" + base)[:40] or "prop_q"
+
+
+def jev_add_proposed_question(instructions: str, qtype: str = "noul",
+                              criteria: Any = None, proposed_by: str = "manual",
+                              name: Optional[str] = None) -> tuple[bool, str]:
+    """Add a candidate question to be tested live. Returns (ok, id_or_error)."""
+    if qtype not in ("noul", "score"):
+        return False, "type must be 'noul' or 'score'"
+    if not instructions or len(instructions) < 8:
+        return False, "instructions too short"
+    active = [q for q in JEV_PROPOSED_QUESTIONS.values() if q.get("active")]
+    if len(active) >= JEV_PROPOSED_MAX:
+        return False, f"max {JEV_PROPOSED_MAX} active proposals — retire one first"
+    qid = _slug(name or instructions[:24])
+    n = 2
+    base = qid
+    while qid in JEV_PROPOSED_QUESTIONS:
+        qid = f"{base}_{n}"; n += 1
+    if qtype == "score" and not isinstance(criteria, list):
+        criteria = ["Not at all", "Somewhat", "Strongly"]
+    if qtype == "noul" and not isinstance(criteria, dict):
+        criteria = {"true": "yes", "false": "no"}
+    JEV_PROPOSED_QUESTIONS[qid] = {
+        "type": qtype, "instructions": instructions, "criteria": criteria,
+        "active": True, "status": "testing", "proposed_by": proposed_by,
+        "proposed_at": time.time(), "answers": {},
+    }
+    logger.info(f"[jev/propose] added candidate question {qid} by {proposed_by}")
+    return True, qid
+
+
+def jev_active_proposed_questions() -> dict[str, Any]:
+    """The proposed questions to include in the batched Jev call right now."""
+    out = {}
+    for qid, q in JEV_PROPOSED_QUESTIONS.items():
+        if q.get("active"):
+            out[qid] = {"type": q["type"], "instructions": q["instructions"], "criteria": q["criteria"]}
+    return out
+
+
+def _jev_record_proposed_answers(token_address: str, answers: dict[str, Any]) -> None:
+    """Store each proposed question's answer for this token so its predictive
+    value can be measured against the token's eventual outcome."""
+    for qid, q in JEV_PROPOSED_QUESTIONS.items():
+        if not q.get("active"):
+            continue
+        a = answers.get(qid)
+        if not isinstance(a, dict):
+            continue
+        val = a.get("noul") if a.get("type") == "noul" else a.get("score")
+        if val is not None:
+            q["answers"][token_address] = {"val": val, "outcome": None}
+
+
+def jev_record_proposed_outcome(token_address: str, outcome: str) -> None:
+    """Label proposed-question answers for this token with its outcome."""
+    for q in JEV_PROPOSED_QUESTIONS.values():
+        rec = q.get("answers", {}).get(token_address)
+        if rec is not None:
+            if rec.get("outcome") in ("mooned", "rugged") and outcome == "flat":
+                continue
+            rec["outcome"] = outcome
+
+
+def build_jev_proposal_stats() -> list[dict[str, Any]]:
+    """For each proposed question: how well its answer separates winners from
+    losers (the empirical 'is this question useful?' measurement)."""
+    out = []
+    for qid, q in JEV_PROPOSED_QUESTIONS.items():
+        labeled = [(r["val"], r["outcome"]) for r in q.get("answers", {}).values() if r.get("outcome") in ("mooned", "rugged")]
+        winners = [v for v, o in labeled if o == "mooned"]
+        losers = [v for v, o in labeled if o == "rugged"]
+        wa = round(sum(winners)/len(winners), 3) if winners else None
+        la = round(sum(losers)/len(losers), 3) if losers else None
+        separation = round(wa - la, 3) if (wa is not None and la is not None) else None
+        out.append({
+            "id": qid, "type": q["type"], "instructions": q["instructions"],
+            "status": q["status"], "active": q["active"], "proposed_by": q["proposed_by"],
+            "answered": len(q.get("answers", {})), "labeled": len(labeled),
+            "winner_avg": wa, "loser_avg": la, "separation": separation,
+        })
+    return out
+
+
+# --- Semantic narrative theme tagging (DeepSeek) ----------------------------
+def _theme_slug(s: str) -> str:
+    s = "".join(c if (c.isalnum() or c == "-") else "-" for c in (s or "").lower()).strip("-")
+    while "--" in s:
+        s = s.replace("--", "-")
+    return s[:32] or "other"
+
+
+async def jev_tag_narrative_theme(token_address: str, entry: dict[str, Any]) -> Optional[str]:
+    """Ask DeepSeek for the coin's canonical NARRATIVE THEME (a short slug like
+    'ai-agents', 'politics', 'dog-meme'), then group it with other coins of the
+    same theme across different tickers. This is the semantic replacement for
+    the regex ticker-suffix clustering. Gated: only called for coins that have
+    already passed the Jev gate, once each. Fail-safe (returns None on error)."""
+    if not _jev_proposer_configured():
+        return None
+    if token_address in JEV_THEME_TAGGED:
+        return TOKEN_THEME.get(token_address)
+    JEV_THEME_TAGGED[token_address] = time.time()
+    if len(JEV_THEME_TAGGED) > JEV_THEME_TAGGED_MAX:
+        JEV_THEME_TAGGED.pop(next(iter(JEV_THEME_TAGGED)), None)
+
+    name = entry.get("name") or ""
+    ticker = entry.get("ticker") or ""
+    desc = (entry.get("description") or "")[:400]
+    # known themes so DeepSeek reuses existing slugs instead of inventing dupes
+    known = sorted(NARRATIVE_THEMES.keys())[:40]
+    prompt = (
+        "Classify this newly-launched memecoin into a single canonical NARRATIVE THEME — the broad "
+        "meme/cultural category it belongs to, so coins sharing a theme group together even with "
+        "different names. Return STRICT JSON: {\"slug\": \"kebab-case-theme\", \"label\": \"Human Label\"}.\n"
+        "Reuse an existing slug if it fits.\n"
+        f"Existing themes: {', '.join(known) or '(none yet)'}\n\n"
+        f"Coin — name: {name!r}, ticker: {ticker!r}, description: {desc!r}\n"
+        "Examples of good slugs: ai-agents, politics-trump, dog-meme, cat-meme, celebrity, "
+        "tech-parody, finance-parody, sports, gaming, tokenized-culture. JSON only."
+    )
+    payload = {"model": JEV_PROPOSER_LLM_MODEL, "messages": [{"role": "user", "content": prompt}],
+               "temperature": 0.3, "max_tokens": 120, "response_format": {"type": "json_object"}}
+    headers = {"Authorization": f"Bearer {JEV_PROPOSER_LLM_KEY}", "Content-Type": "application/json",
+               "Accept-Encoding": "gzip, deflate"}
+    try:
+        timeout = aiohttp.ClientTimeout(total=30)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(JEV_PROPOSER_LLM_URL, headers=headers, json=payload) as resp:
+                if resp.status != 200:
+                    return None
+                body = await resp.json()
+        content = (((body.get("choices") or [{}])[0].get("message") or {}).get("content") or "").strip()
+        content = re.sub(r"^```(?:json)?|```$", "", content, flags=re.MULTILINE).strip()
+        data = json.loads(content)
+        slug = _theme_slug(data.get("slug") or "")
+        label = (data.get("label") or slug.replace("-", " ").title())[:48]
+        if not slug:
+            return None
+        # register / group
+        theme = NARRATIVE_THEMES.setdefault(slug, {"label": label, "coins": [], "first_seen": time.time(), "chains": []})
+        if token_address not in theme["coins"]:
+            theme["coins"].append(token_address)
+        ch = entry.get("chain")
+        if ch and ch not in theme["chains"]:
+            theme["chains"].append(ch)
+        TOKEN_THEME[token_address] = slug
+        # tag the feed entry + judgment record so UI/learning can use it
+        fe = TOKEN_FEED.get(token_address)
+        if fe is not None:
+            fe["narrative_theme"] = slug
+            fe["narrative_theme_label"] = label
+        rec = JEV_JUDGMENT_LOG.get(token_address)
+        if rec is not None:
+            rec["narrative_theme"] = slug
+        # emit an event if this theme now has multiple coins (a real cluster)
+        if len(theme["coins"]) >= 2:
+            jev_emit_event("proposed", ticker=ticker, token_address=token_address,
+                           reason=f"narrative theme '{label}' now has {len(theme['coins'])} coins across {len(theme['chains'])} chain(s)",
+                           detail={"theme": slug})
+        logger.info(f"[jev/theme] {ticker} -> {slug} ({len(theme['coins'])} in theme)")
+        return slug
+    except Exception as exc:
+        logger.warning(f"[jev/theme] failed: {exc!r}")
+        return None
+
+
+def build_jev_theme_stats() -> list[dict[str, Any]]:
+    """Semantic narrative clusters, biggest first — for the dashboard."""
+    out = []
+    for slug, th in NARRATIVE_THEMES.items():
+        live = [addr for addr in th["coins"] if (TOKEN_FEED.get(addr, {}).get("status") == "WATCHING")]
+        out.append({
+            "slug": slug, "label": th.get("label", slug),
+            "coin_count": len(th["coins"]), "live_count": len(live),
+            "chains": th.get("chains", []),
+            "tickers": [TOKEN_FEED.get(a, {}).get("ticker") for a in th["coins"][-8:]],
+        })
+    out.sort(key=lambda t: t["coin_count"], reverse=True)
+    return out[:25]
+
+
+# --- Auto-proposer: a generative LLM (e.g. DeepSeek) invents new questions ---
+def _jev_proposer_configured() -> bool:
+    return bool(JEV_PROPOSER_LLM_KEY and JEV_PROPOSER_LLM_URL and JEV_PROPOSER_LLM_MODEL)
+
+
+async def jev_auto_propose() -> list[str]:
+    """Ask the generative LLM to propose NEW candidate questions, informed by
+    the current question set and which ones actually separate winners from
+    losers on our data. Returns list of added question ids. Fail-safe."""
+    if not _jev_proposer_configured():
+        return []
+    # Build the brief: current questions + measured performance so far.
+    current = [f"- {qid} ({q['type']}): {q['instructions']}" for qid, q in JEV_QUESTIONS.items()]
+    stats = build_jev_proposal_stats()
+    perf_lines = []
+    for s in stats:
+        if s["labeled"] >= 1:
+            perf_lines.append(f"- {s['id']}: separation={s['separation']} over {s['labeled']} labeled")
+    corr = build_jev_correlation_stats()
+    active_props = [q["instructions"] for q in JEV_PROPOSED_QUESTIONS.values() if q.get("active")]
+
+    # Extract concrete prediction misses (TypeSafe Autoresearch Feature Discovery cookbook pattern):
+    # - False positives: predicted high potential / cleared gate, but RUGGED
+    # - False negatives: predicted low potential / overlooked, but MOONED
+    false_positives = []
+    false_negatives = []
+    for addr, rec in list(JEV_JUDGMENT_LOG.items()):
+        outcome = rec.get("outcome")
+        if not outcome:
+            continue
+        dims = rec.get("judgment", {}).get("dimensions", {})
+        moon_score = dims.get("moon_potential", {}).get("score")
+        ticker_name = f"${rec.get('ticker', 'UNKNOWN')}"
+        if outcome == "rugged" and moon_score is not None and moon_score >= 3:
+            false_positives.append(f"{ticker_name} (Jev moon_potential={moon_score}/4, outcome=RUGGED)")
+        elif outcome == "mooned" and moon_score is not None and moon_score <= 1:
+            false_negatives.append(f"{ticker_name} (Jev moon_potential={moon_score}/4, outcome=MOONED)")
+
+    misses_section = ""
+    if false_positives:
+        misses_section += f"\nRecent False Positives (predicted high potential, but RUGGED):\n" + "\n".join(f"- {fp}" for fp in false_positives[-4:]) + "\n"
+    if false_negatives:
+        misses_section += f"\nRecent False Negatives (predicted low potential, but MOONED):\n" + "\n".join(f"- {fn}" for fn in false_negatives[-4:]) + "\n"
+
+    prompt = (
+        "You design yes/no (noul) and graded (score) questions for a fast judgment model called Jev "
+        "that rates newly-launched crypto memecoins for their potential to run higher. Jev sees, per "
+        "coin: name, ticker, launchpad, market cap, volume, liquidity, holder count/concentration, "
+        "whether holders have real ($1k+) positions, bundle/dev-rug flags, and recent mcap momentum. "
+        "Propose NEW questions that would add predictive signal NOT already covered.\n\n"
+        f"Existing questions:\n{chr(10).join(current)}\n\n"
+        f"Currently-testing questions:\n{chr(10).join('- '+a for a in active_props) or '(none)'}\n\n"
+        f"Measured performance (separation = winner_avg - loser_avg, higher=better):\n{chr(10).join(perf_lines) or '(no labeled outcomes yet)'}\n\n"
+        f"Outcome data so far: {corr['winners']} mooned, {corr['losers']} rugged.\n"
+        f"{misses_section}\n"
+        "Following the TypeSafe Autoresearch pattern, propose questions that specifically target the blind spots "
+        "revealed by the false positives and false negatives above.\n\n"
+        f"Return STRICT JSON: {{\"questions\": [{{\"name\": short_id, \"type\": \"noul\"|\"score\", "
+        "\"instructions\": the question text, \"criteria\": for noul {\"true\":..,\"false\":..} or for "
+        "score an array of 3-5 ordered level descriptions}}]}. "
+        f"Propose at most {JEV_PROPOSER_MAX_NEW_PER_ROUND} questions. Each must be answerable from the "
+        "data Jev sees, vary across coins, and be genuinely different from existing ones. JSON only."
+    )
+    payload = {
+        "model": JEV_PROPOSER_LLM_MODEL,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0.7,
+        "max_tokens": 900,
+        "response_format": {"type": "json_object"},
+    }
+    headers = {"Authorization": f"Bearer {JEV_PROPOSER_LLM_KEY}", "Content-Type": "application/json",
+               "Accept-Encoding": "gzip, deflate"}  # not 'br' — aiohttp can't decode brotli without the extra dep
+    added: list[str] = []
+    try:
+        timeout = aiohttp.ClientTimeout(total=60)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(JEV_PROPOSER_LLM_URL, headers=headers, json=payload) as resp:
+                if resp.status != 200:
+                    logger.warning(f"[jev/proposer] LLM {resp.status}: {(await resp.text())[:200]}")
+                    return []
+                body = await resp.json()
+        content = (((body.get("choices") or [{}])[0].get("message") or {}).get("content") or "").strip()
+        # tolerate ```json fences
+        content = re.sub(r"^```(?:json)?|```$", "", content, flags=re.MULTILINE).strip()
+        data = json.loads(content)
+        for q in (data.get("questions") or [])[:JEV_PROPOSER_MAX_NEW_PER_ROUND]:
+            ok, res = jev_add_proposed_question(
+                instructions=q.get("instructions", ""),
+                qtype=q.get("type", "noul"),
+                criteria=q.get("criteria"),
+                proposed_by="deepseek-auto",
+                name=q.get("name"),
+            )
+            if ok:
+                added.append(res)
+        if added:
+            details = [{"id": qid, "type": JEV_PROPOSED_QUESTIONS[qid]["type"],
+                        "instructions": JEV_PROPOSED_QUESTIONS[qid]["instructions"]}
+                       for qid in added if qid in JEV_PROPOSED_QUESTIONS]
+            # reason carries the actual question text so the event log/history
+            # shows WHAT was proposed, not just an id.
+            first_q = details[0]["instructions"] if details else ""
+            reason = f"auto-proposed {len(added)}: “{first_q[:80]}{'…' if len(first_q) > 80 else ''}”"
+            if len(added) > 1:
+                reason += f" (+{len(added)-1} more)"
+            jev_emit_event("proposed", reason=reason, detail={"ids": added, "questions": details})
+            logger.info(f"[jev/proposer] added {len(added)} question(s): {added}")
+    except Exception as exc:
+        logger.warning(f"[jev/proposer] failed: {exc!r}")
+    return added
+
+
+def jev_prune_proposals() -> list[str]:
+    """Auto-retire proposals that clearly don't help once they have enough
+    labeled outcomes (separation <= 0). Returns retired ids."""
+    retired = []
+    for s in build_jev_proposal_stats():
+        if not s["active"] or s["status"] == "promoted":
+            continue
+        if s["labeled"] >= JEV_PROPOSAL_MIN_LABELS_TO_JUDGE and s["separation"] is not None and s["separation"] <= 0:
+            q = JEV_PROPOSED_QUESTIONS.get(s["id"])
+            if q:
+                q["active"] = False
+                q["status"] = "retired-poor"
+                retired.append(s["id"])
+    if retired:
+        jev_emit_event("proposed", reason=f"auto-retired {len(retired)} underperforming question(s): {', '.join(retired)}",
+                       detail={"retired": retired})
+    return retired
+
+
+async def jev_auto_proposer_worker() -> None:
+    """Periodic: prune poor proposals, then (if room) ask the LLM for new ones."""
+    if not _jev_proposer_configured():
+        logger.info("[jev/proposer] no generative LLM configured — auto-proposer idle")
+        return
+    # small initial delay so startup settles
+    await asyncio.sleep(30)
+    while True:
+        try:
+            jev_prune_proposals()
+            active = sum(1 for q in JEV_PROPOSED_QUESTIONS.values() if q.get("active"))
+            if active < JEV_PROPOSED_MAX:
+                await jev_auto_propose()
+        except Exception as exc:
+            logger.warning(f"[jev/proposer] worker error: {exc!r}")
+        await asyncio.sleep(JEV_PROPOSER_INTERVAL_SECONDS)
+
+
+async def jev_trajectory_worker() -> None:
+    """Independently poll the mcap of every Jev-flagged coin that's still being
+    graded, and update its outcome — CRUCIALLY this continues even after the
+    coin would normally expire from the main watchlist, so a moon/rug that
+    happens later is still caught (the old graduation-only labeling missed these).
+    Batches DexScreener lookups and respects the tracking window."""
+    if not JEV_ENABLED:
+        return
+    await asyncio.sleep(20)
+    while True:
+        try:
+            active = [addr for addr, rec in list(JEV_JUDGMENT_LOG.items())
+                      if not rec.get("tracking_done")]
+            for addr in active:
+                rec = JEV_JUDGMENT_LOG.get(addr)
+                if rec is None or rec.get("tracking_done"):
+                    continue
+                # Prefer the live feed mcap if the coin is still actively polled;
+                # otherwise fetch fresh so lifecycle tracking survives expiry.
+                fe = TOKEN_FEED.get(addr)
+                mcap = (fe.get("market_cap") if fe else 0.0) or 0.0
+                if mcap <= 0 or (fe is None):
+                    try:
+                        mcap = await fetch_token_market_cap_usd(addr)
+                    except Exception:
+                        mcap = mcap or 0.0
+                if mcap and mcap > 0:
+                    jev_update_trajectory(addr, mcap)
+                await asyncio.sleep(0.15)  # gentle pacing on DexScreener
+        except Exception as exc:
+            logger.warning(f"[jev/trajectory] worker error: {exc!r}")
+        await asyncio.sleep(JEV_TRACK_POLL_SECONDS)
+
+
+async def jev_autotune_worker() -> None:
+    """Periodically recompute learned weight multipliers from accumulated
+    outcomes. No-op (stays at 1.0x) until enough moons/rugs exist."""
+    if not (JEV_ENABLED and JEV_AUTOTUNE_ENABLED):
+        return
+    await asyncio.sleep(60)
+    while True:
+        try:
+            jev_recompute_learned_weights()
+        except Exception as exc:
+            logger.warning(f"[jev/autotune] worker error: {exc!r}")
+        await asyncio.sleep(JEV_AUTOTUNE_INTERVAL_SECONDS)
+
+
+async def run_discovery_scan() -> int:
+    """Find already-trading Solana coins the launch listeners missed and inject
+    qualifying ones into the watchlist. Sources: DexScreener boosts + Birdeye
+    top-volume. Filters: not already tracked, Solana, mcap/volume floors, valid
+    non-stock ticker. Returns count injected. Fail-safe."""
+    if not DISCOVERY_ENABLED:
+        return 0
+    try:
+        boosted = await fetch_dexscreener_boosted_solana()
+        top_vol = await fetch_birdeye_top_volume_solana(limit=30)
+    except Exception as exc:
+        logger.warning(f"[discovery] source fetch failed: {exc!r}")
+        return 0
+    # merge + dedup, skip anything already known
+    # also fold in coins that recently submitted a DexScreener profile (free,
+    # already cached) — another stream of active coins, useful when Birdeye's
+    # volume list is rate-limited/empty.
+    profile_addrs = list(TOKEN_PROFILES.keys())
+    candidates = list(dict.fromkeys(boosted + top_vol + profile_addrs))
+    injected = 0
+    for addr in candidates:
+        if injected >= DISCOVERY_MAX_PER_SCAN:
+            break
+        if (addr in TOKEN_WATCHLIST or addr in TOKEN_FEED or addr in DISCOVERED_TOKENS
+                or addr in LONG_TAIL_WATCHLIST):
+            continue
+        # verify via DexScreener that it clears the floors + is real
+        info = await fetch_dexscreener_info(addr)
+        mcap = info.get("market_cap") or 0
+        vol = info.get("volume_24h") or 0
+        symbol = (info.get("symbol") or "").strip()
+        if mcap < DISCOVERY_MIN_MCAP or vol < DISCOVERY_MIN_VOLUME_24H:
+            continue
+        if is_stonkboard_token(addr) and mcap > MAX_OPPORTUNITY_MARKET_CAP_USD:
+            continue
+        if mcap > IMPLAUSIBLE_NEW_LAUNCH_MCAP_USD:
+            continue
+
+        # Discovered coins are outside launchpad streams, so require qualifying contract suffix
+        if not any(addr.lower().endswith(s) for s in QUALIFYING_CONTRACT_SUFFIXES):
+            continue
+        if not symbol or symbol == "UNKNOWN":
+            continue
+        if ticker_is_invalid(symbol)[0]:
+            continue
+        est, _ = is_probably_established_or_stock(symbol, mcap)
+        if est:
+            continue
+        # inject into the normal pipeline. dev_wallet unknown for discovered
+        # coins (we didn't see the launch) — use a sentinel so dev-trust treats
+        # it as neutral/unknown rather than crediting/blaming a real wallet.
+        DISCOVERED_TOKENS[addr] = time.time()
+        if len(DISCOVERED_TOKENS) > DISCOVERED_TOKENS_MAX:
+            DISCOVERED_TOKENS.pop(next(iter(DISCOVERED_TOKENS)), None)
+        try:
+            await process_new_token_event(
+                chain="solana", platform="discovered", token_address=addr,
+                ticker_raw=symbol, dev_wallet=f"discovered:{addr[:8]}", ts=time.time(),
+                extra={"discovered": True},
+            )
+            # seed its mcap/name immediately so it isn't stuck at 0 for a cycle
+            token_feed_upsert(addr, market_cap=mcap, volume_24h=vol,
+                              liquidity_usd=info.get("liquidity_usd", 0.0),
+                              price_usd=info.get("price_usd", 0.0),
+                              name=info.get("name") or "")
+            injected += 1
+        except Exception as exc:
+            logger.warning(f"[discovery] inject {symbol} failed: {exc!r}")
+        await asyncio.sleep(0.2)  # gentle pacing on DexScreener
+    if injected:
+        logger.info(f"[discovery] injected {injected} already-trading coin(s) into the watchlist")
+    return injected
+
+
+async def discovery_worker() -> None:
+    """Periodic discovery scan for missed-at-launch coins."""
+    if not DISCOVERY_ENABLED:
+        logger.info("[discovery] disabled")
+        return
+    await asyncio.sleep(45)  # let launch listeners settle first
+    while True:
+        try:
+            await run_discovery_scan()
+        except Exception as exc:
+            logger.warning(f"[discovery] worker error: {exc!r}")
+        await asyncio.sleep(DISCOVERY_INTERVAL_SECONDS)
+
+
+def build_jev_stats() -> dict[str, Any]:
+    """Aggregate Jev usage + learning stats for the dashboard/API."""
+    _jev_reset_day_if_needed()
+    can_call, reason = jev_budget_status()
+    return {
+        "enabled": JEV_ENABLED,
+        "model": TYPESAFE_MODEL,
+        "can_call": can_call,
+        "reason": reason,
+        "usage": dict(JEV_USAGE),
+        "caps": {
+            "per_day": JEV_MAX_CALLS_PER_DAY,
+            "total": JEV_MAX_CALLS_TOTAL,
+            "min_score_to_evaluate": JEV_MIN_SCORE_TO_EVALUATE,
+            "min_mcap_to_evaluate": JEV_MIN_MCAP_TO_EVALUATE,
+        },
+        "evaluated_tokens": len(JEV_EVALUATED_TOKENS),
+        "correlation": build_jev_correlation_stats(),
+        "pvp_learning": build_jev_pvp_stats(),
+        "evaluated_coins": _build_jev_evaluated_coins(),
+        "data_gap": _build_jev_data_gap_stats(),
+        "autotune": {**JEV_AUTOTUNE_STATUS, "learned_weights": dict(JEV_LEARNED_WEIGHTS),
+                     "min_outcomes": JEV_AUTOTUNE_MIN_OUTCOMES, "min_winners": JEV_AUTOTUNE_MIN_WINNERS},
+        "gate_funnel": _build_jev_gate_funnel(),
+        "questions": _build_jev_questions_view(),
+        "proposals": build_jev_proposal_stats(),
+        "proposer_llm": bool(JEV_PROPOSER_LLM_KEY and JEV_PROPOSER_LLM_URL and JEV_PROPOSER_LLM_MODEL),
+        "recent_judgments": list(RECENT_JEV_JUDGMENTS)[-15:],
+        "recent_events": list(RECENT_JEV_EVENTS)[-20:],
+    }
+
+
+def _build_jev_data_gap_stats() -> dict[str, Any]:
+    """How often Jev felt it LACKED enough info to judge — i.e. what data it
+    needs more of. Aggregated from the sufficient_info self-assessment."""
+    vals = [r.get("sufficient_info") for r in JEV_JUDGMENT_LOG.values() if r.get("sufficient_info") is not None]
+    if not vals:
+        return {"judged": 0, "avg_sufficiency": None, "low_info_count": 0, "low_info_pct": None}
+    low = sum(1 for v in vals if v < 0.5)
+    return {
+        "judged": len(vals),
+        "avg_sufficiency": round(sum(vals) / len(vals), 3),
+        "low_info_count": low,
+        "low_info_pct": round(low / len(vals) * 100, 1),
+    }
+
+
+def _build_jev_questions_view() -> list[dict[str, Any]]:
+    """The exact questions Jev is being asked, for display in the UI. Combines
+    the fixed JEV_QUESTIONS with any active proposed questions (see #3)."""
+    out = []
+    for qid, q in JEV_QUESTIONS.items():
+        out.append({
+            "id": qid,
+            "type": q.get("type"),
+            "instructions": q.get("instructions"),
+            "criteria": q.get("criteria"),
+            "source": "core",
+        })
+    for qid, q in JEV_PROPOSED_QUESTIONS.items():
+        if q.get("active"):
+            out.append({
+                "id": qid,
+                "type": q.get("type"),
+                "instructions": q.get("instructions"),
+                "criteria": q.get("criteria"),
+                "source": "proposed",
+                "status": q.get("status"),
+            })
+    return out
+
+
+def _build_jev_gate_funnel() -> dict[str, Any]:
+    """Live snapshot of WHY Jev is or isn't evaluating right now: of the tokens
+    currently WATCHING, how many pass each gate stage. Makes 'no activity'
+    self-explanatory instead of a mystery."""
+    watching = [e for e in TOKEN_FEED.values() if e.get("status") == "WATCHING"]
+    with_ticker = [e for e in watching if e.get("ticker") and e.get("ticker") != "UNKNOWN"]
+    over_mcap = [e for e in with_ticker if (e.get("market_cap") or 0) >= JEV_MIN_MCAP_TO_EVALUATE]
+    over_score = [e for e in over_mcap if (e.get("opportunity_score") or 0) >= JEV_MIN_SCORE_TO_EVALUATE]
+    return {
+        "watching": len(watching),
+        "ticker_resolved": len(with_ticker),
+        "over_mcap_gate": len(over_mcap),
+        "qualifies_for_jev": len(over_score),
+        "mcap_gate": JEV_MIN_MCAP_TO_EVALUATE,
+        "score_gate": JEV_MIN_SCORE_TO_EVALUATE,
+        "skipped_not_ready_total": JEV_USAGE.get("skipped_not_ready", 0),
+    }
+
+
+# ============================================================================
 # SECTION 6 — DASHBOARD BROADCAST & PERSISTENCE
 # ============================================================================
 
@@ -1883,6 +5294,16 @@ def _write_state_sync(snapshot: dict[str, Any]) -> None:
     tmp_path = path + ".tmp"
     with open(tmp_path, "w") as f:
         json.dump(snapshot, f, indent=2, default=str)
+    # Keep a rolling backup of the PREVIOUS good state before overwriting, so a
+    # bad save/purge can be recovered. Only back up if the current state still
+    # had learning data (don't let an already-empty state clobber a good backup).
+    try:
+        if os.path.exists(path):
+            prev = json.load(open(path))
+            if prev.get("jev_judgment_log") or prev.get("dev_reputation"):
+                os.replace(path, path + ".bak")
+    except Exception:
+        pass
     os.replace(tmp_path, path)
 
 
@@ -1911,6 +5332,21 @@ async def persist_state() -> None:
         "opportunity_recorded_tokens": dict(OPPORTUNITY_RECORDED_TOKENS),
         "mock_portfolio": {addr: dict(pos) for addr, pos in MOCK_PORTFOLIO.items()},
         "wallet_track_record": dict(WALLET_TRACK_RECORD),
+        "jev_usage": dict(JEV_USAGE),
+        "jev_judgment_log": {addr: dict(rec) for addr, rec in JEV_JUDGMENT_LOG.items()},
+        "jev_evaluated_tokens": dict(JEV_EVALUATED_TOKENS),
+        "jev_screened_tokens": dict(JEV_SCREENED_TOKENS),
+        "jev_semantic_cache": dict(JEV_SEMANTIC_CACHE),
+        "jev_recent_judgments": list(RECENT_JEV_JUDGMENTS),
+        "jev_recent_events": list(RECENT_JEV_EVENTS)[-80:],
+        "jev_pvp_log": {k: v for k, v in JEV_PVP_LOG.items()},
+        "jev_pvp_token_index": {k: list(v) for k, v in JEV_PVP_TOKEN_INDEX.items()},
+        "jev_proposed_questions": {k: v for k, v in JEV_PROPOSED_QUESTIONS.items()},
+        "narrative_themes": {k: v for k, v in NARRATIVE_THEMES.items()},
+        "token_theme": dict(TOKEN_THEME),
+        "jev_learned_weights": dict(JEV_LEARNED_WEIGHTS),
+        "big_runners": {chain: list(rs) for chain, rs in BIG_RUNNERS.items()},
+        "big_runners_seen": list(BIG_RUNNERS_SEEN),
         "saved_at": time.time(),
     }
     await asyncio.to_thread(_write_state_sync, snapshot)
@@ -1941,7 +5377,15 @@ def _load_state_sync() -> None:
         loaded_rugs = saved.get("recent_rugs", [])
         RECENT_RUGS.extend(loaded_rugs)
         loaded_opportunities = saved.get("recent_opportunities", [])
-        RECENT_OPPORTUNITIES.extend(loaded_opportunities)
+        for opp in loaded_opportunities:
+            mc = opp.get("market_cap_usd") or 0.0
+            plat = opp.get("platform")
+            addr = opp.get("token_address") or ""
+            qualifies, _ = is_launchpad_or_target_suffix(plat, addr)
+            is_stonk = is_stonkboard_token(addr, plat, opp.get("links"))
+            mc_ok = (mc <= MAX_OPPORTUNITY_MARKET_CAP_USD) if is_stonk else (mc <= IMPLAUSIBLE_NEW_LAUNCH_MCAP_USD)
+            if mc_ok and qualifies:
+                RECENT_OPPORTUNITIES.append(opp)
         loaded_bundle_history = saved.get("bundle_operator_history", {})
         for k, v in loaded_bundle_history.items():
             BUNDLE_OPERATOR_HISTORY[k] = v
@@ -1960,10 +5404,53 @@ def _load_state_sync() -> None:
             OPPORTUNITY_RECORDED_TOKENS[k] = v
         loaded_mock_portfolio = saved.get("mock_portfolio", {})
         for k, v in loaded_mock_portfolio.items():
-            MOCK_PORTFOLIO[k] = v
+            entry_mc = v.get("entry_market_cap") or 0.0
+            plat = v.get("platform")
+            qualifies, _ = is_launchpad_or_target_suffix(plat, k)
+            is_stonk = is_stonkboard_token(k, plat, v.get("links"))
+            mc_ok = (entry_mc <= MAX_OPPORTUNITY_MARKET_CAP_USD) if is_stonk else (entry_mc <= IMPLAUSIBLE_NEW_LAUNCH_MCAP_USD)
+            if mc_ok and qualifies:
+                MOCK_PORTFOLIO[k] = v
+
         loaded_wallet_track_record = saved.get("wallet_track_record", {})
         for k, v in loaded_wallet_track_record.items():
             WALLET_TRACK_RECORD[k] = v
+        # Jev: restore usage (so lifetime cap survives restart) + judgment log.
+        loaded_jev_usage = saved.get("jev_usage", {})
+        for k, v in loaded_jev_usage.items():
+            if k in JEV_USAGE:
+                JEV_USAGE[k] = v
+        loaded_jev_log = saved.get("jev_judgment_log", {})
+        for k, v in loaded_jev_log.items():
+            JEV_JUDGMENT_LOG[k] = v
+        loaded_jev_evaluated = saved.get("jev_evaluated_tokens", {})
+        for k, v in loaded_jev_evaluated.items():
+            JEV_EVALUATED_TOKENS[k] = v
+        loaded_jev_screened = saved.get("jev_screened_tokens", {})
+        for k, v in loaded_jev_screened.items():
+            JEV_SCREENED_TOKENS[k] = v
+        loaded_jev_semantic = saved.get("jev_semantic_cache", {})
+        for k, v in loaded_jev_semantic.items():
+            JEV_SEMANTIC_CACHE[k] = v
+        for rec in saved.get("jev_recent_judgments", []):
+            RECENT_JEV_JUDGMENTS.append(rec)
+        for evt in saved.get("jev_recent_events", []):
+            RECENT_JEV_EVENTS.append(evt)
+        for k, v in saved.get("jev_pvp_log", {}).items():
+            JEV_PVP_LOG[k] = v
+        for k, v in saved.get("jev_pvp_token_index", {}).items():
+            JEV_PVP_TOKEN_INDEX[k] = set(v)
+        for k, v in saved.get("jev_proposed_questions", {}).items():
+            JEV_PROPOSED_QUESTIONS[k] = v
+        for k, v in saved.get("narrative_themes", {}).items():
+            NARRATIVE_THEMES[k] = v
+        for k, v in saved.get("token_theme", {}).items():
+            TOKEN_THEME[k] = v
+        for k, v in saved.get("jev_learned_weights", {}).items():
+            JEV_LEARNED_WEIGHTS[k] = v
+        for chain, rs in saved.get("big_runners", {}).items():
+            BIG_RUNNERS[chain] = rs
+        BIG_RUNNERS_SEEN.update(saved.get("big_runners_seen", []))
         logger.info(
             f"Loaded persisted dev reputation state for {len(loaded_devs)} dev wallet(s), "
             f"rug history for {len(loaded_rug_history)} dev wallet(s), "
@@ -1994,27 +5481,54 @@ def get_or_create_dev(dev_wallet: str, chain: str) -> dict[str, Any]:
             "chain": chain,
             "successful_launches": 0,
             "failed_spams": 0,
+            "total_launches": 0,
             "is_blacklisted": False,
             "last_launch_time": 0.0,
         }
-    return DEV_REPUTATION_DATABASE[dev_wallet]
+    entry = DEV_REPUTATION_DATABASE[dev_wallet]
+    if "total_launches" not in entry:
+        entry["total_launches"] = max(
+            entry.get("successful_launches", 0) + entry.get("failed_spams", 0),
+            len(DEV_SPAM_LOG.get(dev_wallet, [])),
+            1,
+        )
+    return entry
 
 
 def dev_rep_badge_fields(dev_wallet: str) -> dict[str, Any]:
     """Compact dev track-record summary attached to token cards, narrative
     launches, and alerts — so a wallet address is never the only thing shown.
     What matters is whether this dev has rugged or graduated something before,
-    not the raw hex string."""
+    how many total coins they have launched, and whether they are blacklisted."""
     if dev_wallet.lower() in KNOWN_INFRASTRUCTURE_ADDRESSES:
-        return {"dev_alias": "shared infra (not a person)", "dev_moons": 0, "dev_rugs": 0, "dev_blacklisted": False}
+        return {
+            "dev_alias": "shared infra (not a person)",
+            "dev_moons": 0,
+            "dev_rugs": 0,
+            "dev_total_launches": 0,
+            "dev_blacklisted": False,
+        }
     dev = DEV_REPUTATION_DATABASE.get(dev_wallet)
+    spam_count = len(DEV_SPAM_LOG.get(dev_wallet, []))
+    rug_history_count = len(DEV_RUG_HISTORY.get(dev_wallet, []))
     if not dev:
-        return {"dev_alias": None, "dev_moons": 0, "dev_rugs": 0, "dev_blacklisted": False}
+        return {
+            "dev_alias": None,
+            "dev_moons": 0,
+            "dev_rugs": max(rug_history_count, 0),
+            "dev_total_launches": max(spam_count, 1),
+            "dev_blacklisted": rug_history_count > 0,
+        }
+    moons = dev.get("successful_launches", 0)
+    rugs = max(dev.get("failed_spams", 0), rug_history_count)
+    total = max(dev.get("total_launches", 0), spam_count, moons + rugs, 1)
+    is_bl = bool(dev.get("is_blacklisted", False) or rugs > 0 or total > 1 or rug_history_count > 0)
     return {
         "dev_alias": dev.get("alias"),
-        "dev_moons": dev.get("successful_launches", 0),
-        "dev_rugs": dev.get("failed_spams", 0),
-        "dev_blacklisted": dev.get("is_blacklisted", False),
+        "dev_moons": moons,
+        "dev_rugs": rugs,
+        "dev_total_launches": total,
+        "dev_blacklisted": is_bl,
     }
 
 
@@ -2046,15 +5560,24 @@ def stage_a_dev_trust(dev_wallet: str, chain: str, ts: float) -> dict[str, Any]:
         # it as one identity) would let one bad actor's multicall-routed rug
         # blacklist every unrelated future launch that happens to route through
         # the same generic infrastructure.
-        return {"decision": "PASS", "reason": "SHARED_INFRASTRUCTURE", "dev": {"alias": "shared-infrastructure", "is_blacklisted": False, "successful_launches": 0}}
+        return {"decision": "PASS", "reason": "SHARED_INFRASTRUCTURE", "dev": {"alias": "shared-infrastructure", "is_blacklisted": False, "successful_launches": 0, "total_launches": 0}}
 
     dev = get_or_create_dev(dev_wallet, chain)
+    dev["total_launches"] = dev.get("total_launches", 0) + 1
 
     recent_spam = [t for t in DEV_SPAM_LOG[dev_wallet] if ts - t <= SPAM_WINDOW_SECONDS]
     DEV_SPAM_LOG[dev_wallet] = recent_spam
 
     if dev["is_blacklisted"]:
-        return {"decision": "SKIP", "reason": "BLACKLISTED", "dev": dev}
+        return {"decision": "SKIP", "reason": "BLACKLISTED_DEV", "dev": dev}
+
+    if dev.get("failed_spams", 0) > 0 or len(DEV_RUG_HISTORY.get(dev_wallet, [])) > 0:
+        dev["is_blacklisted"] = True
+        return {"decision": "SKIP", "reason": "SERIAL_RUGGER_HISTORY", "dev": dev}
+
+    # Strict single-launch dev rule: discard any dev who has launched > 1 token
+    if dev["total_launches"] > 1:
+        return {"decision": "SKIP", "reason": f"DEV_MULTI_LAUNCH_DISCARDED ({dev['total_launches']} launches)", "dev": dev}
 
     if len(recent_spam) >= SPAM_THRESHOLD:
         dev["is_blacklisted"] = True
@@ -2062,10 +5585,7 @@ def stage_a_dev_trust(dev_wallet: str, chain: str, ts: float) -> dict[str, Any]:
 
     dev["last_launch_time"] = ts
 
-    if dev["successful_launches"] >= 1:
-        return {"decision": "ELITE", "reason": "PROVEN_DEV", "dev": dev}
-
-    return {"decision": "PASS", "reason": "NEUTRAL", "dev": dev}
+    return {"decision": "PASS", "reason": "SINGLE_LAUNCH_DEV", "dev": dev}
 
 
 # ============================================================================
@@ -2380,6 +5900,30 @@ async def process_new_token_event(
     await bump_hourly_launch_stat(ts)
 
     dev_verdict = stage_a_dev_trust(dev_wallet, chain, ts)
+
+    # Reject established coins / tokenized stocks at the door — these are NOT
+    # new fair-launches (HYPE, ZEC, MSTRx, AAPLx...). Blocking here keeps them
+    # out of narrative clustering, scoring, and Jev entirely. The mcap arm of
+    # the detector fires later in the poll loop once DexScreener fills mcap in.
+    est, est_reason = is_probably_established_or_stock(ticker_raw, 0.0)
+    _tinv, _treason = ticker_is_invalid(ticker_raw)
+    if est or _tinv:
+        _reason = est_reason if est else _treason
+        _title = "SKIPPED - NOT A NEW LAUNCH (established/stock coin)" if est else "SKIPPED - INVALID TICKER"
+        TOKEN_WATCHLIST[token_address]["status"] = "SKIPPED"
+        TOKEN_WATCHLIST[token_address]["dev_decision"] = "SKIPPED"
+        token_feed_upsert(token_address, status="SKIPPED", dev_decision="SKIPPED")
+        await broadcast_token_card(TOKEN_FEED[token_address])
+        await bump_daily_stat(ts, "skipped")
+        await broadcast_alert({
+            "type": "SKIPPED",
+            "severity": "info",
+            "title": _title,
+            "chain": chain, "platform": platform, "token_address": token_address,
+            "ticker": ticker_raw, "dev_wallet": dev_wallet, "reason": _reason,
+            "timestamp": ts,
+        })
+        return
 
     if dev_verdict["decision"] == "SKIP":
         TOKEN_WATCHLIST[token_address]["status"] = "SKIPPED"
@@ -2878,7 +6422,7 @@ async def longxyz_listener() -> None:
 # SECTION 13 — WALLET LOG MONITORING (SMART_WALLETS across all chains)
 # ============================================================================
 
-async def handle_solana_wallet_log(client: JsonRpcWsClient, value: dict, tracked_wallets: list[str]) -> None:
+async def handle_solana_wallet_log(client: JsonRpcWsClient, value: dict, tracked_wallets: list[str], sub_wallet: Optional[str] = None) -> None:
     if value.get("err"):
         return
     logs = value.get("logs", [])
@@ -2886,11 +6430,17 @@ async def handle_solana_wallet_log(client: JsonRpcWsClient, value: dict, tracked
     if not signature:
         return
     log_text = " ".join(logs)
-    mentioned = [w for w in tracked_wallets if w in log_text]
-    is_swap_like = any(kw in log_text for kw in ("Buy", "buy", "Swap", "swap"))
-    if not mentioned or not is_swap_like:
+    is_swap_like = any(kw in log_text for kw in ("Buy", "buy", "Swap", "swap", "Trade", "trade"))
+    if not is_swap_like:
         return
+    # The wallet is resolved from the per-wallet subscription (the mentions
+    # filter guarantees it's involved) — the old code tried to find the wallet
+    # ADDRESS as a substring of the program LOG TEXT, which never matched (logs
+    # are program messages, not account keys), so NO buy was ever detected.
+    mentioned = [sub_wallet] if sub_wallet else [w for w in tracked_wallets if w in log_text]
     for wallet in mentioned:
+        if not wallet:
+            continue
         token_address, trade_size_usd = await estimate_solana_trade(client, signature, wallet)
         if not token_address:
             continue
@@ -2916,17 +6466,15 @@ async def solana_wallet_monitor() -> None:
     client = JsonRpcWsClient(SOLANA_WS_RPC_URL)
     await client.connect()
     subscribed: set[str] = set()
+    sub_to_wallet: dict[Any, str] = {}  # logsSubscribe subscription id -> wallet
     try:
         while True:
-            # SMART_WALLETS can grow at runtime now (see _maybe_promote_smart_wallet)
-            # — logsSubscribe supports many independent subscriptions on one
-            # client, so a newly-promoted wallet just adds one, no need to
-            # tear down and rebuild existing subscriptions the way EVM's
-            # single combined address-list filter requires.
             current = {w for w, info in SMART_WALLETS.items() if info.get("chain") == "solana"}
             new_wallets = current - subscribed
             for wallet in new_wallets:
-                await client.subscribe("logsSubscribe", [{"mentions": [wallet]}, {"commitment": "confirmed"}])
+                sub_id = await client.subscribe("logsSubscribe", [{"mentions": [wallet]}, {"commitment": "confirmed"}])
+                if sub_id is not None:
+                    sub_to_wallet[sub_id] = wallet
             if new_wallets:
                 subscribed |= new_wallets
                 logger.info(f"[wallet/solana] subscribed to {len(new_wallets)} new wallet(s), {len(subscribed)} total")
@@ -2937,7 +6485,10 @@ async def solana_wallet_monitor() -> None:
                 continue
             value = result.get("value", {})
             if value:
-                await handle_solana_wallet_log(client, value, list(subscribed))
+                # resolve which wallet this log belongs to via the subscription
+                # id (the mentions filter guarantees the wallet is involved).
+                sub_wallet = sub_to_wallet.get(result.get("_subscription"))
+                await handle_solana_wallet_log(client, value, list(subscribed), sub_wallet)
     finally:
         await client.close()
 
@@ -3135,6 +6686,12 @@ async def long_tail_revival_watcher() -> None:
 def _update_feed_sparkline(token_address: str, market_cap: float, ts: float) -> list[tuple[float, float]]:
     entry = TOKEN_FEED.get(token_address)
     points = list(entry.get("sparkline", [])) if entry else []
+    # Don't record transient 0/blip mcaps — a DexScreener hiccup that returns 0
+    # for one poll would otherwise inject a $0 point mid-trajectory, making the
+    # momentum Jev sees look nonsensical ($11k -> $0 -> $43k). Skip non-positive
+    # readings if we already have real history; keep the last good curve.
+    if market_cap <= 0 and points:
+        return points
     points.append((ts, market_cap))
     if len(points) > SPARKLINE_MAX_POINTS:
         points = points[-SPARKLINE_MAX_POINTS:]
@@ -3157,6 +6714,7 @@ def _identity_fields(token_address: str, info: dict[str, Any]) -> dict[str, Any]
         "created_at": info["created_at"],
         "dev_decision": info.get("dev_decision", "PASS"),
         "links": build_token_links(info["chain"], token_address),
+        "socials": info.get("socials"),
         **dev_rep_badge_fields(info["dev_wallet"]),
     }
 
@@ -3193,8 +6751,19 @@ async def mark_token_graduated(token_address: str, source: str) -> None:
 
     if market_cap > info["peak_market_cap"]:
         info["peak_market_cap"] = market_cap
+    record_big_runner_if_qualified(token_address, TOKEN_FEED.get(token_address, info), info["peak_market_cap"])
     info["status"] = "GRADUATED"
     _credit_early_buyers(token_address, info["chain"], "graduations")
+
+    if token_address in MOCK_PORTFOLIO:
+        mock_pos = MOCK_PORTFOLIO[token_address]
+        if market_cap > 0:
+            mock_pos["last_known_market_cap"] = market_cap
+            if market_cap > mock_pos.get("peak_market_cap", 0.0):
+                mock_pos["peak_market_cap"] = market_cap
+                mock_pos["peak_ts"] = now
+        mock_pos["last_known_status"] = "GRADUATED"
+        mock_pos["last_known_ts"] = now
 
     dev = DEV_REPUTATION_DATABASE.get(info["dev_wallet"])
     if dev:
@@ -3247,6 +6816,13 @@ async def mark_token_graduated(token_address: str, source: str) -> None:
     }
     RECENT_GRADUATIONS.append(grad_alert)
     await broadcast_alert(grad_alert)
+    # NOTE: graduation is NO LONGER treated as "mooned" — a coin can graduate
+    # and still rug. Outcome is graded on real mcap trajectory (see
+    # jev_update_trajectory). We just record graduation as a milestone.
+    rec_grad = JEV_JUDGMENT_LOG.get(token_address)
+    if rec_grad is not None:
+        rec_grad["graduated"] = True
+        rec_grad["graduated_at"] = time.time()
     await persist_state()
 
 
@@ -3284,146 +6860,317 @@ def _mark_telegram_early_pinged(token_address: str) -> None:
             del TELEGRAM_EARLY_PINGED_TOKENS[oldest_key]
 
 
+def _clean_signal_reason(r: Any) -> str:
+    """Strips score adjustments like (+15) or (-25) for clean, readable bullet points."""
+    return re.sub(r"\s*\([+-]\d+\)$", "", str(r).strip())
+
+
+def _fit_telegram_caption(text: str, max_len: int = 1024) -> str:
+    """Guarantees a Telegram HTML message or photo caption stays within max_len (1024).
+    Progressively trims non-essential trailing sections without breaking open HTML tags."""
+    text = text.strip()
+    if len(text) <= max_len:
+        return text
+    paras = text.split("\n\n")
+    while len("\n\n".join(paras)) > max_len and len(paras) > 3:
+        paras.pop()
+    res = "\n\n".join(paras).strip()
+    if len(res) <= max_len:
+        return res
+    clean = re.sub(r"<[^>]+>", "", text)
+    if len(clean) > max_len:
+        clean = clean[:max_len - 3] + "..."
+    return clean
+
+
 def _format_telegram_opportunity_message(entry: dict[str, Any]) -> str:
-    """Pulls every field this pipeline tracks for a token into one message —
-    the whole point of an "opportunity ping" is not needing to tab over to
-    the dashboard to see why it fired. HTML-escaped throughout: ticker/dev
-    alias/platform are arbitrary strings a token's own dev fully controls,
-    and Telegram's parse_mode=HTML will render unescaped markup from them."""
+    """Ultra-clean, high-signal Telegram format for opportunity calls.
+    Features a dedicated 1-tap copy/paste CA box, clean metrics, security,
+    DeBot narrative origin, trade signals, and organized research/social links."""
     def esc(v: Any) -> str:
         return html.escape(str(v)) if v is not None else ""
 
     ticker = entry.get("ticker") or "UNKNOWN"
-    chain = entry.get("chain") or "?"
-    platform = entry.get("platform") or "?"
-    score = entry.get("opportunity_score", 0)
-    market_cap = entry.get("market_cap") or 0.0
-    volume_24h = entry.get("volume_24h") or 0.0
-    liquidity_usd = entry.get("liquidity_usd") or 0.0
+    token_address = entry.get("token_address") or ""
+    chain = (entry.get("chain") or "?").upper()
+    platform = infer_launchpad_platform(entry.get("platform"), token_address) or entry.get("platform") or "?"
+
+    market_cap = float(entry.get("market_cap") or entry.get("market_cap_usd") or 0.0)
+    volume_24h = float(entry.get("volume_24h") or entry.get("volume_24h_usd") or entry.get("volume") or 0.0)
+    liquidity_usd = float(entry.get("liquidity_usd") or entry.get("liquidity") or 0.0)
     buys_24h = entry.get("buys_24h") or 0
     sells_24h = entry.get("sells_24h") or 0
+
+    mcap_str = f"${market_cap/1_000:.1f}K" if market_cap < 1_000_000 else f"${market_cap/1_000_000:.2f}M"
+    vol_str = f"${volume_24h/1_000:.1f}K" if volume_24h < 1_000_000 else f"${volume_24h/1_000_000:.2f}M"
+    liq_str = f"${liquidity_usd/1_000:.1f}K" if liquidity_usd < 1_000_000 else f"${liquidity_usd/1_000_000:.2f}M"
 
     holder_count = entry.get("holder_count")
     top_holder_pct = entry.get("top_holder_pct")
     if holder_count is not None:
-        holder_line = f"👥 {holder_count} holders"
+        holders_str = f"{holder_count}"
         if top_holder_pct is not None:
-            holder_line += f" (top holder {top_holder_pct:.0f}%)"
-        if entry.get("bundle_detected"):
-            holder_line += f" · 🎭 bundle detected ({entry.get('bundle_wallet_count', 0)} wallets)"
-        if entry.get("top_holder_selling"):
-            holder_line += " · ⚠ top holder selling"
+            holders_str += f" (top {top_holder_pct:.1f}%)"
     else:
-        holder_line = "👥 holder data: not yet available"
+        holders_str = "n/a"
 
-    dev_alias = entry.get("dev_alias") or f"unknown-{esc(entry.get('dev_wallet', ''))[:6]}"
+    dev_alias = entry.get("dev_alias") or (esc(entry.get("dev_wallet", ""))[:6] + "..." if entry.get("dev_wallet") else "Unknown")
     dev_moons = entry.get("dev_moons") or 0
     dev_rugs = entry.get("dev_rugs") or 0
-    dev_line = f"🧑‍💻 Dev: {esc(dev_alias)} (🚀{dev_moons} graduated, 💀{dev_rugs} rugged)"
+    dev_str = f"{esc(dev_alias)} (🚀{dev_moons}/💀{dev_rugs})"
 
+    # GoPlus security status
+    gp = entry.get("goplus") or {}
+    gp_raw = gp.get("summary")
+    if not gp_raw:
+        if entry.get("freeze_authority_active") is False:
+            gp_raw = "Clean · Freeze Renounced"
+        else:
+            gp_raw = "Clean"
+    clean_gp = gp_raw.replace("🛡️", "").strip() or "Clean"
+
+    buy_tax = float(gp.get("buy_tax") or entry.get("buy_tax") or 0.0)
+    sell_tax = float(gp.get("sell_tax") or entry.get("sell_tax") or 0.0)
+    if buy_tax > 0 or sell_tax > 0:
+        tax_str = f"Buy {buy_tax:g}% / Sell {sell_tax:g}%"
+    else:
+        tax_str = "0% / 0%"
+
+    # DeBot narrative origin
+    debot = entry.get("debot") or {}
+    origin_text = debot.get("origin_text")
+    debot_line = ""
+    if origin_text:
+        clean_orig = origin_text.strip()
+        if len(clean_orig) > 105:
+            clean_orig = clean_orig[:102] + "..."
+        ntype = debot.get("narrative_type")
+        type_tag = f"<i>[{esc(ntype)}]</i> " if ntype else ""
+        ref_link = f' · <a href="{esc(debot["origin_ref"])}">🔗 Source</a>' if debot.get("origin_ref") else ""
+        debot_line = f"📖 <b>Narrative:</b> {type_tag}{esc(clean_orig)}{ref_link}\n\n"
+
+    # Key driving signals as neat bullet points (top 2 for high signal & guaranteed fit)
     reasons = entry.get("score_reasons") or []
-    reasons_block = "\n".join(f"• {esc(r)}" for r in reasons) or "• (no individual signals — baseline score)"
+    signal_bullets = []
+    for r in reasons:
+        cleaned = _clean_signal_reason(r)
+        if not cleaned or any(x in cleaned for x in ["Ticker not yet resolved", "Volume/mcap ratio", "Contract suffix", "Not from a launchpad"]):
+            continue
+        signal_bullets.append(f"• {esc(cleaned)}")
+    if not signal_bullets:
+        signal_bullets.append("• Strong launch momentum & volume activity")
+    signals_block = "\n".join(signal_bullets[:2])
 
+    # Research links
     links = entry.get("links") or {}
-    link_url = links.get("dexscreener") or links.get("explorer")
-    link_line = f'\n🔗 <a href="{esc(link_url)}">View on DexScreener</a>' if link_url else ""
+    dex_url = links.get("dexscreener") or links.get("explorer")
+    fomo_url = links.get("fomo")
+    stonk_url = links.get("stonkboard")
+    flap_url = links.get("flap") or (f"https://flap.sh/{token_address}" if token_address.lower().endswith("7777") else None)
+    four_url = links.get("fourmeme") or (f"https://four.meme/token/{token_address}" if token_address.lower().endswith("4444") else None)
+    pump_url = links.get("pumpfun") or (f"https://pump.fun/{token_address}" if token_address.lower().endswith("pump") else None)
+
+    research_items = []
+    if flap_url:
+        research_items.append(f'<a href="{esc(flap_url)}">🥞 flap.sh</a>')
+    if four_url:
+        research_items.append(f'<a href="{esc(four_url)}">4️⃣ four.meme</a>')
+    if pump_url:
+        research_items.append(f'<a href="{esc(pump_url)}">💊 pump.fun</a>')
+    if fomo_url:
+        research_items.append(f'<a href="{esc(fomo_url)}">🦄 FOMO</a>')
+    if dex_url:
+        research_items.append(f'<a href="{esc(dex_url)}">📊 DexScreener</a>')
+    if stonk_url:
+        research_items.append(f'<a href="{esc(stonk_url)}">📈 StonkBoard</a>')
+    research_str = " │ ".join(research_items) if research_items else (f'<a href="{esc(dex_url)}">📊 DexScreener</a>' if dex_url else "None")
+
+    # Social channels (only appended if at least one exists)
+    soc_links = entry.get("socials") or {}
+    soc_items = []
+    tw_url = soc_links.get("twitter")
+    tg_url = soc_links.get("telegram")
+    web_url = soc_links.get("website")
+    if tw_url:
+        soc_items.append(f'<a href="{esc(tw_url)}">🐦 X</a>')
+    if tg_url:
+        soc_items.append(f'<a href="{esc(tg_url)}">✈️ TG</a>')
+    if web_url:
+        soc_items.append(f'<a href="{esc(web_url)}">🌐 Web</a>')
+    socials_str = " │ ".join(soc_items) if soc_items else ""
 
     text = (
-        f"🎯 <b>Opportunity: ${esc(ticker)}</b>  —  {score}/100\n"
-        f"{esc(chain)} · {esc(platform)}\n\n"
-        f"💰 MCap: ${market_cap:,.0f}\n"
-        f"📊 Vol 24h: ${volume_24h:,.0f}  ({buys_24h}↑/{sells_24h}↓)\n"
-        f"💧 Liquidity: ${liquidity_usd:,.0f}\n"
-        f"{holder_line}\n"
-        f"{dev_line}\n\n"
-        f"<b>Why:</b>\n{reasons_block}"
-        f"{link_line}"
+        f"🎯 <b>${esc(ticker)}</b>\n"
+        f"🪐 <b>Platform:</b> {esc(chain)} • {esc(platform)}\n\n"
+        f"📋 <b>CA:</b> <i>(tap to copy)</i>\n"
+        f"<pre><code>{esc(token_address)}</code></pre>\n\n"
+        f"💰 <b>MCap:</b> {mcap_str}  │  💧 <b>Liq:</b> {liq_str}\n"
+        f"📊 <b>Vol 24h:</b> {vol_str}  <i>({buys_24h}B / {sells_24h}S)</i>\n"
+        f"👥 <b>Holders:</b> {holders_str}  │  🧑‍💻 <b>Dev:</b> {dev_str}\n"
+        f"🛡️ <b>Security:</b> {esc(clean_gp)}  │  💸 <b>Tax:</b> {esc(tax_str)}\n\n"
+        f"{debot_line}"
+        f"💡 <b>Key Signals:</b>\n"
+        f"{signals_block}\n\n"
+        f"🔗 <b>Research:</b> {research_str}"
     )
-    return text
+    if soc_items:
+        text += f"\n🌐 <b>Socials:</b> {socials_str}"
+    return _fit_telegram_caption(text.strip(), max_len=1024)
 
 
 def _format_telegram_early_momentum_message(entry: dict[str, Any]) -> str:
-    """Early Momentum's own message — same field pull as the main opportunity
-    ping, but built around early_momentum_score/early_momentum_reasons (ratio
-    and signal-based, not dollar-scaled) so the "why" actually matches what
-    fired it instead of showing the (still-computed but irrelevant) main
-    score's reasons."""
+    """Ultra-clean Telegram format for early breakout momentum."""
     def esc(v: Any) -> str:
         return html.escape(str(v)) if v is not None else ""
 
     ticker = entry.get("ticker") or "UNKNOWN"
-    chain = entry.get("chain") or "?"
-    platform = entry.get("platform") or "?"
-    score = entry.get("early_momentum_score", 0)
-    market_cap = entry.get("market_cap") or 0.0
-    volume_24h = entry.get("volume_24h") or 0.0
+    token_address = entry.get("token_address") or ""
+    chain = (entry.get("chain") or "?").upper()
+    platform = infer_launchpad_platform(entry.get("platform"), token_address) or entry.get("platform") or "?"
+
+    market_cap = float(entry.get("market_cap") or 0.0)
+    volume_24h = float(entry.get("volume_24h") or entry.get("volume") or 0.0)
+    liquidity_usd = float(entry.get("liquidity_usd") or entry.get("liquidity") or 0.0)
     buys_24h = entry.get("buys_24h") or 0
     sells_24h = entry.get("sells_24h") or 0
 
+    mcap_str = f"${market_cap/1_000:.1f}K" if market_cap < 1_000_000 else f"${market_cap/1_000_000:.2f}M"
+    vol_str = f"${volume_24h/1_000:.1f}K" if volume_24h < 1_000_000 else f"${volume_24h/1_000_000:.2f}M"
+    liq_str = f"${liquidity_usd/1_000:.1f}K" if liquidity_usd < 1_000_000 else f"${liquidity_usd/1_000_000:.2f}M"
+
     holder_count = entry.get("holder_count")
     top_holder_pct = entry.get("top_holder_pct")
-    if holder_count is not None:
-        holder_line = f"👥 {holder_count} holders"
-        if top_holder_pct is not None:
-            holder_line += f" (top holder {top_holder_pct:.0f}%)"
-        if entry.get("bundle_detected"):
-            holder_line += f" · 🎭 bundle detected ({entry.get('bundle_wallet_count', 0)} wallets)"
-    else:
-        holder_line = "👥 holder data: not yet available"
+    holders_str = f"{holder_count}" if holder_count is not None else "n/a"
+    if holder_count is not None and top_holder_pct is not None:
+        holders_str += f" (top {top_holder_pct:.1f}%)"
 
-    dev_alias = entry.get("dev_alias") or f"unknown-{esc(entry.get('dev_wallet', ''))[:6]}"
-    dev_line = f"🧑‍💻 Dev: {esc(dev_alias)}"
+    dev_alias = entry.get("dev_alias") or (esc(entry.get("dev_wallet", ""))[:6] + "..." if entry.get("dev_wallet") else "Unknown")
+    dev_moons = entry.get("dev_moons") or 0
+    dev_rugs = entry.get("dev_rugs") or 0
+    dev_str = f"{esc(dev_alias)} (🚀{dev_moons}/💀{dev_rugs})"
+
+    gp = entry.get("goplus") or {}
+    gp_raw = gp.get("summary") or "Clean · Renounced"
+    clean_gp = gp_raw.replace("🛡️", "").strip() or "Clean"
+
+    buy_tax = float(gp.get("buy_tax") or entry.get("buy_tax") or 0.0)
+    sell_tax = float(gp.get("sell_tax") or entry.get("sell_tax") or 0.0)
+    if buy_tax > 0 or sell_tax > 0:
+        tax_str = f"Buy {buy_tax:g}% / Sell {sell_tax:g}%"
+    else:
+        tax_str = "0% / 0%"
+
+    # DeBot narrative origin
+    debot = entry.get("debot") or {}
+    origin_text = debot.get("origin_text")
+    debot_line = ""
+    if origin_text:
+        clean_orig = origin_text.strip()
+        if len(clean_orig) > 105:
+            clean_orig = clean_orig[:102] + "..."
+        ntype = debot.get("narrative_type")
+        type_tag = f"<i>[{esc(ntype)}]</i> " if ntype else ""
+        ref_link = f' · <a href="{esc(debot["origin_ref"])}">🔗 Source</a>' if debot.get("origin_ref") else ""
+        debot_line = f"📖 <b>Narrative:</b> {type_tag}{esc(clean_orig)}{ref_link}\n\n"
 
     reasons = entry.get("early_momentum_reasons") or []
-    reasons_block = "\n".join(f"• {esc(r)}" for r in reasons) or "• (no individual signals — baseline score)"
+    signal_bullets = []
+    for r in reasons:
+        cleaned = _clean_signal_reason(r)
+        if not cleaned or any(x in cleaned for x in ["Ticker not yet resolved", "Volume/mcap ratio", "Contract suffix", "Not from a launchpad"]):
+            continue
+        signal_bullets.append(f"• {esc(cleaned)}")
+    if not signal_bullets:
+        signal_bullets.append("• Early breakout volume surge & velocity")
+    signals_block = "\n".join(signal_bullets[:2])
 
     links = entry.get("links") or {}
-    link_url = links.get("dexscreener") or links.get("explorer")
-    link_line = f'\n🔗 <a href="{esc(link_url)}">View on DexScreener</a>' if link_url else ""
+    dex_url = links.get("dexscreener") or links.get("explorer")
+    fomo_url = links.get("fomo")
+    stonk_url = links.get("stonkboard")
+    flap_url = links.get("flap") or (f"https://flap.sh/{token_address}" if token_address.lower().endswith("7777") else None)
+    four_url = links.get("fourmeme") or (f"https://four.meme/token/{token_address}" if token_address.lower().endswith("4444") else None)
+    pump_url = links.get("pumpfun") or (f"https://pump.fun/{token_address}" if token_address.lower().endswith("pump") else None)
+
+    research_items = []
+    if flap_url:
+        research_items.append(f'<a href="{esc(flap_url)}">🥞 flap.sh</a>')
+    if four_url:
+        research_items.append(f'<a href="{esc(four_url)}">4️⃣ four.meme</a>')
+    if pump_url:
+        research_items.append(f'<a href="{esc(pump_url)}">💊 pump.fun</a>')
+    if fomo_url:
+        research_items.append(f'<a href="{esc(fomo_url)}">🦄 FOMO</a>')
+    if dex_url:
+        research_items.append(f'<a href="{esc(dex_url)}">📊 DexScreener</a>')
+    if stonk_url:
+        research_items.append(f'<a href="{esc(stonk_url)}">📈 StonkBoard</a>')
+    research_str = " │ ".join(research_items) if research_items else (f'<a href="{esc(dex_url)}">📊 DexScreener</a>' if dex_url else "None")
+
+    soc_links = entry.get("socials") or {}
+    soc_items = []
+    tw_url = soc_links.get("twitter")
+    tg_url = soc_links.get("telegram")
+    web_url = soc_links.get("website")
+    if tw_url:
+        soc_items.append(f'<a href="{esc(tw_url)}">🐦 X</a>')
+    if tg_url:
+        soc_items.append(f'<a href="{esc(tg_url)}">✈️ TG</a>')
+    if web_url:
+        soc_items.append(f'<a href="{esc(web_url)}">🌐 Web</a>')
+    socials_str = " │ ".join(soc_items) if soc_items else ""
 
     text = (
-        f"⚡ <b>Early Momentum: ${esc(ticker)}</b>  —  {score}/100\n"
-        f"{esc(chain)} · {esc(platform)}\n\n"
-        f"💰 MCap: ${market_cap:,.0f}\n"
-        f"📊 Vol 24h: ${volume_24h:,.0f}  ({buys_24h}↑/{sells_24h}↓)\n"
-        f"{holder_line}\n"
-        f"{dev_line}\n\n"
-        f"<b>Why:</b>\n{reasons_block}"
-        f"{link_line}"
+        f"⚡ <b>Early Momentum: ${esc(ticker)}</b>\n"
+        f"🪐 <b>Platform:</b> {esc(chain)} • {esc(platform)}\n\n"
+        f"📋 <b>CA:</b> <i>(tap to copy)</i>\n"
+        f"<pre><code>{esc(token_address)}</code></pre>\n\n"
+        f"💰 <b>MCap:</b> {mcap_str}  │  💧 <b>Liq:</b> {liq_str}\n"
+        f"📊 <b>Vol 24h:</b> {vol_str}  <i>({buys_24h}B / {sells_24h}S)</i>\n"
+        f"👥 <b>Holders:</b> {holders_str}  │  🧑‍💻 <b>Dev:</b> {dev_str}\n"
+        f"🛡️ <b>Security:</b> {esc(clean_gp)}  │  💸 <b>Tax:</b> {esc(tax_str)}\n\n"
+        f"{debot_line}"
+        f"💡 <b>Key Signals:</b>\n"
+        f"{signals_block}\n\n"
+        f"🔗 <b>Research:</b> {research_str}"
     )
-    return text
+    if soc_items:
+        text += f"\n🌐 <b>Socials:</b> {socials_str}"
+    return _fit_telegram_caption(text.strip(), max_len=1024)
+
 
 
 async def send_telegram_message(text: str, photo_url: Optional[str] = None) -> None:
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return
+    chat_ids = [c.strip() for c in TELEGRAM_CHAT_ID.split(",") if c.strip()]
+    if not chat_ids:
+        return
     try:
         async with aiohttp.ClientSession() as session:
-            if photo_url:
-                # Telegram fetches the URL itself server-side — no need to
-                # download the image ourselves. Caption is capped at 1024
-                # chars (much shorter than a plain message's 4096), so a
-                # long reasons list can get cut off here; fall back to a
-                # plain text message (no length cap issue at our sizes) if
-                # Telegram can't fetch this particular image URL at all.
-                resp_photo = await session.post(
-                    f"{TELEGRAM_API_BASE}/bot{TELEGRAM_BOT_TOKEN}/sendPhoto",
-                    json={"chat_id": TELEGRAM_CHAT_ID, "photo": photo_url, "caption": text[:1024], "parse_mode": "HTML"},
-                    timeout=aiohttp.ClientTimeout(total=15),
-                )
-                if resp_photo.status == 200:
-                    return
-                body = await resp_photo.text()
-                logger.debug(f"[telegram] sendPhoto failed HTTP {resp_photo.status}, falling back to text: {body[:200]}")
-
-            resp = await session.post(
-                f"{TELEGRAM_API_BASE}/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-                json={"chat_id": TELEGRAM_CHAT_ID, "text": text[:4096], "parse_mode": "HTML", "disable_web_page_preview": False},
-                timeout=aiohttp.ClientTimeout(total=15),
-            )
-            if resp.status != 200:
-                body = await resp.text()
-                logger.warning(f"[telegram] sendMessage failed HTTP {resp.status}: {body[:300]}")
+            for cid in chat_ids:
+                sent = False
+                if photo_url:
+                    caption = _fit_telegram_caption(text, max_len=1024)
+                    resp_photo = await session.post(
+                        f"{TELEGRAM_API_BASE}/bot{TELEGRAM_BOT_TOKEN}/sendPhoto",
+                        json={"chat_id": cid, "photo": photo_url, "caption": caption, "parse_mode": "HTML"},
+                        timeout=aiohttp.ClientTimeout(total=15),
+                    )
+                    if resp_photo.status == 200:
+                        sent = True
+                    else:
+                        body = await resp_photo.text()
+                        logger.debug(f"[telegram] sendPhoto to {cid} failed HTTP {resp_photo.status}, falling back to text: {body[:200]}")
+                if not sent:
+                    resp = await session.post(
+                        f"{TELEGRAM_API_BASE}/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+                        json={"chat_id": cid, "text": text[:4096], "parse_mode": "HTML", "disable_web_page_preview": True},
+                        timeout=aiohttp.ClientTimeout(total=15),
+                    )
+                    if resp.status != 200:
+                        body = await resp.text()
+                        logger.warning(f"[telegram] sendMessage to {cid} failed HTTP {resp.status}: {body[:300]}")
     except Exception as exc:
         logger.warning(f"[telegram] send failed: {exc!r}")
 
@@ -3448,10 +7195,57 @@ def _mark_opportunity_recorded(token_address: str) -> None:
             del OPPORTUNITY_RECORDED_TOKENS[oldest_key]
 
 
+def _is_safe_vetted_token(token_address: str, entry: dict[str, Any]) -> bool:
+    """Verifies that a token passes all strict anti-honeypot, single-launch dev,
+    launchpad / suffix, and under-100k market cap rules:
+    1. Market cap strictly under $100k ceiling ONLY for TheStonkBoard / StonkFun coins.
+    2. Launched from a recognized launchpad (pump.fun, stonkfun, etc.) and/or contract ends in 7777, pump, 4444.
+    3. Honeypot / sell whitelist checks (no active freeze authority, no transfer hooks, not a honeypot chart).
+    4. Dev has total launches <= 1 (discards serial launchers/ruggers).
+    5. Dev has 0 failed/rug launches and is not blacklisted."""
+    # Under 100k MC ceiling check - strictly for TheStonkBoard / StonkFun coins
+    mcap = entry.get("market_cap") or 0.0
+    is_stonk = is_stonkboard_token(token_address, entry.get("platform"), entry.get("links"))
+    if is_stonk and mcap > MAX_OPPORTUNITY_MARKET_CAP_USD:
+        return False
+    if mcap > IMPLAUSIBLE_NEW_LAUNCH_MCAP_USD:
+        return False
+
+    # Launchpad & Contract suffix check
+    qualifies_launch, _ = is_launchpad_or_target_suffix(entry.get("platform"), token_address)
+    if not qualifies_launch:
+        return False
+
+    # Anti-honeypot / sell whitelist checks
+    if entry.get("is_honeypot") or entry.get("sell_whitelist"):
+        return False
+    if entry.get("freeze_authority_active") is True:
+        return False
+    buys = entry.get("buys_24h") or 0
+    sells = entry.get("sells_24h") or 0
+    if (buys >= 4 and sells == 0) or (buys >= 15 and sells <= 1):
+        return False
+
+    dev_wallet = entry.get("dev_wallet", "")
+    is_infra = dev_wallet.lower() in KNOWN_INFRASTRUCTURE_ADDRESSES if dev_wallet else False
+    if not is_infra and dev_wallet:
+        dev_rep = DEV_REPUTATION_DATABASE.get(dev_wallet)
+        dev_total = dev_rep.get("total_launches", 0) if dev_rep else (entry.get("dev_total_launches") or 0)
+        dev_rugs = dev_rep.get("failed_spams", 0) if dev_rep else (entry.get("dev_rugs") or 0)
+        is_bl = (dev_rep.get("is_blacklisted") if dev_rep else False) or bool(entry.get("dev_blacklisted"))
+        if dev_total > 1 or is_bl or dev_rugs > 0 or len(DEV_RUG_HISTORY.get(dev_wallet, [])) > 0:
+            return False
+
+    return True
+
+
 def _open_mock_position(token_address: str, entry: dict[str, Any], score: int, ts: float) -> None:
     if token_address in MOCK_PORTFOLIO:
         return
+    if not _is_safe_vetted_token(token_address, entry):
+        return
     entry_market_cap = entry.get("market_cap") or 0.0
+    is_stonk = is_stonkboard_token(token_address, entry.get("platform"), entry.get("links"))
     MOCK_PORTFOLIO[token_address] = {
         "ticker": entry.get("ticker"),
         "chain": entry.get("chain"),
@@ -3465,13 +7259,11 @@ def _open_mock_position(token_address: str, entry: dict[str, Any], score: int, t
         "last_known_market_cap": entry_market_cap,
         "last_known_status": entry.get("status"),
         "last_known_ts": ts,
-        # Peak mcap SINCE this position opened (not the token's all-time peak,
-        # which may have happened before it was ever flagged) — this is what
-        # answers "did it actually move up from where we'd have bought," not
-        # just "where is it right now" (current price can be well off the
-        # peak on the way back down and still look fine on pnl_pct alone).
+        # Peak mcap SINCE this opportunity was called
         "peak_market_cap": entry_market_cap,
         "peak_ts": ts,
+        "goplus": entry.get("goplus"),
+        "is_stonkboard": is_stonk,
     }
     if len(MOCK_PORTFOLIO) > MOCK_PORTFOLIO_MAX:
         oldest_key = next(iter(MOCK_PORTFOLIO))
@@ -3479,36 +7271,74 @@ def _open_mock_position(token_address: str, entry: dict[str, Any], score: int, t
             del MOCK_PORTFOLIO[oldest_key]
 
 
+
+
+async def _update_mock_portfolio_market_caps() -> None:
+    """Polls latest market cap and updates peak multiples for all tracked calls."""
+    now = time.time()
+    for addr, pos in list(MOCK_PORTFOLIO.items()):
+        last_ts = float(pos.get("last_known_ts") or 0.0)
+        feed_entry = TOKEN_FEED.get(addr)
+        if feed_entry and feed_entry.get("market_cap"):
+            mcap = float(feed_entry["market_cap"])
+            pos["last_known_market_cap"] = mcap
+            pos["last_known_status"] = feed_entry.get("status")
+            pos["last_known_ts"] = now
+            if mcap > pos.get("peak_market_cap", 0.0):
+                pos["peak_market_cap"] = mcap
+                pos["peak_ts"] = now
+        elif now - last_ts > 45:
+            try:
+                dex = await fetch_dexscreener_info(addr)
+                if dex.get("market_cap"):
+                    mcap = float(dex["market_cap"])
+                    pos["last_known_market_cap"] = mcap
+                    pos["last_known_ts"] = now
+                    if mcap > pos.get("peak_market_cap", 0.0):
+                        pos["peak_market_cap"] = mcap
+                        pos["peak_ts"] = now
+                await asyncio.sleep(0.2)
+            except Exception:
+                pass
+
+
 def _mock_position_with_pnl(token_address: str, position: dict[str, Any]) -> dict[str, Any]:
-    # Refresh from TOKEN_FEED whenever it's still tracked there — mcap keeps
-    # updating for GRADUATED/RUGGED tokens too, not just WATCHING ones. Once a
-    # token ages out of TOKEN_FEED entirely (bounded at TOKEN_FEED_MAX), the
-    # position just freezes at its last known value instead of erroring.
+    entry_market_cap = float(position.get("entry_market_cap") or 0.0)
+
     feed_entry = TOKEN_FEED.get(token_address)
     if feed_entry is not None and feed_entry.get("market_cap"):
         now = time.time()
-        position["last_known_market_cap"] = feed_entry["market_cap"]
+        feed_mcap = float(feed_entry["market_cap"])
+        if feed_mcap > 0:
+            position["last_known_market_cap"] = feed_mcap
         position["last_known_status"] = feed_entry.get("status")
         position["last_known_ts"] = now
-        if feed_entry["market_cap"] > position.get("peak_market_cap", 0.0):
-            position["peak_market_cap"] = feed_entry["market_cap"]
+        if feed_mcap > position.get("peak_market_cap", 0.0):
+            position["peak_market_cap"] = feed_mcap
             position["peak_ts"] = now
+        if feed_entry.get("goplus"):
+            position["goplus"] = feed_entry.get("goplus")
+        if feed_entry.get("links"):
+            position["links"] = feed_entry.get("links")
 
-    entry_market_cap = position.get("entry_market_cap") or 0.0
-    current_market_cap = position.get("last_known_market_cap") or entry_market_cap
-    peak_market_cap = position.get("peak_market_cap") or current_market_cap
-    pnl_pct = ((current_market_cap - entry_market_cap) / entry_market_cap * 100) if entry_market_cap > 0 else 0.0
-    pnl_usd = MOCK_BUY_SIZE_USD * (pnl_pct / 100)
-    peak_multiple = (peak_market_cap / entry_market_cap) if entry_market_cap > 0 else 0.0
+    current_market_cap = float(position.get("last_known_market_cap") or entry_market_cap)
+    peak_market_cap = float(position.get("peak_market_cap") or current_market_cap)
+    peak_multiple = (peak_market_cap / entry_market_cap) if entry_market_cap > 0 else 1.0
+    current_multiple = (current_market_cap / entry_market_cap) if entry_market_cap > 0 else 1.0
+    pnl_pct = ((current_market_cap - entry_market_cap) / entry_market_cap * 100.0) if entry_market_cap > 0 else 0.0
+    pnl_usd = (MOCK_BUY_SIZE_USD * current_multiple) - MOCK_BUY_SIZE_USD
+
     return {
         **position,
         "token_address": token_address,
+        "entry_market_cap": entry_market_cap,
         "current_market_cap": current_market_cap,
-        "pnl_pct": pnl_pct,
-        "pnl_usd": pnl_usd,
-        "buy_size_usd": MOCK_BUY_SIZE_USD,
         "peak_market_cap": peak_market_cap,
         "peak_multiple": peak_multiple,
+        "current_multiple": current_multiple,
+        "pnl_usd": pnl_usd,
+        "pnl_pct": pnl_pct,
+        "buy_size_usd": MOCK_BUY_SIZE_USD,
     }
 
 
@@ -3545,9 +7375,12 @@ async def mock_portfolio_broadcaster() -> None:
     while True:
         await asyncio.sleep(MOCK_PORTFOLIO_BROADCAST_INTERVAL_SECONDS)
         if MOCK_PORTFOLIO:
+            await _update_mock_portfolio_market_caps()
             await broadcast_json({"kind": "mock_portfolio", "payload": _build_mock_portfolio_snapshot()})
         if RECENT_OPPORTUNITIES:
             await broadcast_json({"kind": "opportunity_history", "payload": _refresh_opportunity_history_statuses()})
+        if JEV_ENABLED:
+            await broadcast_json({"kind": "jev_stats", "payload": build_jev_stats()})
 
 
 async def _rescore_token_and_maybe_ping(token_address: str) -> None:
@@ -3561,6 +7394,15 @@ async def _rescore_token_and_maybe_ping(token_address: str) -> None:
     entry = TOKEN_FEED.get(token_address)
     if not entry:
         return
+    # Jev semantic evaluation — gated + once-per-candidate + budget-capped (see
+    # maybe_evaluate_token_with_jev). Runs after the deterministic rescore so
+    # the cost gate sees a fresh opportunity_score; on a successful judgment it
+    # re-rescores internally so the ping/opportunity logic below sees the
+    # Jev-adjusted score. No-ops instantly when disabled/over budget/not gated.
+    if JEV_ENABLED and entry.get("status") == "WATCHING":
+        await maybe_screen_early_momentum_with_jev(token_address, entry)
+        await maybe_evaluate_token_with_jev(token_address, entry)
+        await maybe_run_pvp_choice(token_address, entry)
     # Only act while it's still an actionable, live opportunity — not a
     # token that's already graduated/rugged/skipped by the time it crossed
     # the bar (rescoring can happen well after the fact, e.g. via narrative
@@ -3576,7 +7418,26 @@ async def _rescore_token_and_maybe_ping(token_address: str) -> None:
     # rugged, or dipped back under the hard $ floor just vanishes with no
     # record it was ever flagged.
     if score > 0 and token_address not in OPPORTUNITY_RECORDED_TOKENS:
+        # Pre-opportunity security verification (GoPlus & honeypot check)
+        sec = await check_token_honeypot_and_whitelist(entry.get("chain", "solana"), token_address, entry)
+        if sec.get("is_honeypot") or sec.get("sell_whitelist"):
+            hp_reason = sec.get("reason") or "Sell whitelist / honeypot detected"
+            entry["is_honeypot"] = True
+            entry["sell_whitelist"] = True
+            entry["honeypot_reason"] = hp_reason
+            await _kick_out_watchlist_token(token_address, entry, time.time(), "HONEYPOT_SELL_WHITELIST", f"SKIPPED - {hp_reason.upper()}")
+            return
+
         _mark_opportunity_recorded(token_address)
+        if token_address.lower().endswith("7777"):
+            if not entry.get("platform") or entry.get("platform") in ("?", "unknown"):
+                entry["platform"] = "flap.sh"
+
+        if entry.get("debot") is None:
+            entry["debot"] = await fetch_debot_story(token_address)
+
+        entry["links"] = build_token_links(entry.get("chain", "solana"), token_address, entry.get("platform"))
+        is_stonk = is_stonkboard_token(token_address, entry.get("platform"), entry.get("links"))
         opp_alert = {
             "type": "OPPORTUNITY_FLAGGED",
             "severity": "info",
@@ -3592,6 +7453,9 @@ async def _rescore_token_and_maybe_ping(token_address: str) -> None:
             "volume_24h_usd": entry.get("volume_24h") or 0.0,
             "image_url": entry.get("image_url"),
             "links": entry.get("links") or {},
+            "goplus": entry.get("goplus"),
+            "debot": entry.get("debot"),
+            "is_stonkboard": is_stonk,
             "timestamp": time.time(),
         }
         RECENT_OPPORTUNITIES.append(opp_alert)
@@ -3600,25 +7464,31 @@ async def _rescore_token_and_maybe_ping(token_address: str) -> None:
         _open_mock_position(token_address, entry, score, opp_alert["timestamp"])
         await persist_state()
 
-    if token_address not in TELEGRAM_PINGED_TOKENS and score >= TELEGRAM_OPPORTUNITY_SCORE_THRESHOLD:
+
+    # Telegram opportunity ping — fires only for vetted calls that opened in MOCK_PORTFOLIO
+    # (cleared single-launch, anti-rug, and honeypot filters)
+    if token_address not in TELEGRAM_PINGED_TOKENS and token_address in MOCK_PORTFOLIO:
         _mark_telegram_pinged(token_address)
+        if entry.get("debot") is None:
+            entry["debot"] = await fetch_debot_story(token_address)
         text = _format_telegram_opportunity_message(entry)
         TELEGRAM_SEND_QUEUE.put_nowait((text, entry.get("image_url")))
 
-    # Early Momentum's own independent ping — different score field, lower
-    # threshold, but gated to the same mcap band the dashboard's Early
-    # Momentum panel filters to, so Telegram never fires on a ratio spike on
-    # a token too small/new to actually act on.
-    early_score = entry.get("early_momentum_score", 0)
-    market_cap = entry.get("market_cap") or 0.0
-    if (
-        token_address not in TELEGRAM_EARLY_PINGED_TOKENS
-        and early_score >= TELEGRAM_EARLY_MOMENTUM_SCORE_THRESHOLD
-        and EARLY_MOMENTUM_PING_MIN_MCAP_USD <= market_cap <= EARLY_MOMENTUM_PING_MAX_MCAP_USD
-    ):
-        _mark_telegram_early_pinged(token_address)
-        early_text = _format_telegram_early_momentum_message(entry)
-        TELEGRAM_SEND_QUEUE.put_nowait((early_text, entry.get("image_url")))
+    # Early Momentum ping — disabled by default, only opportunity calls are sent
+    if TELEGRAM_SEND_EARLY_MOMENTUM:
+        early_score = entry.get("early_momentum_score", 0)
+        market_cap = entry.get("market_cap") or 0.0
+        if (
+            token_address not in TELEGRAM_EARLY_PINGED_TOKENS
+            and _is_safe_vetted_token(token_address, entry)
+            and early_score >= TELEGRAM_EARLY_MOMENTUM_SCORE_THRESHOLD
+            and EARLY_MOMENTUM_PING_MIN_MCAP_USD <= market_cap <= EARLY_MOMENTUM_PING_MAX_MCAP_USD
+        ):
+            _mark_telegram_early_pinged(token_address)
+            if entry.get("debot") is None:
+                entry["debot"] = await fetch_debot_story(token_address)
+            early_text = _format_telegram_early_momentum_message(entry)
+            TELEGRAM_SEND_QUEUE.put_nowait((early_text, entry.get("image_url")))
 
 
 TOP_HOLDER_SELL_DROP_RATIO = 0.9  # same top holder's balance falling below 90% of its last-seen value counts as "selling down"
@@ -3634,7 +7504,13 @@ async def _kick_out_watchlist_token(token_address: str, info: dict[str, Any], no
     disqualifying fact becomes known (mid-tracking, not at creation)."""
     info["status"] = "SKIPPED"
     info["dev_decision"] = "SKIPPED"
-    token_feed_upsert(token_address, status="SKIPPED", dev_decision="SKIPPED")
+    token_feed_upsert(token_address, status="SKIPPED", dev_decision="SKIPPED", opportunity_score=0, early_momentum_score=0)
+    if token_address in MOCK_PORTFOLIO:
+        MOCK_PORTFOLIO[token_address]["last_known_status"] = "SKIPPED"
+        MOCK_PORTFOLIO[token_address]["last_known_market_cap"] = 0.0
+        MOCK_PORTFOLIO[token_address]["exit_reason"] = reason
+        MOCK_PORTFOLIO[token_address]["last_known_ts"] = now
+
     await broadcast_token_card(TOKEN_FEED[token_address])
     await bump_daily_stat(now, "skipped")
     await broadcast_alert(
@@ -3663,6 +7539,16 @@ async def _maybe_refresh_holder_stats(token_address: str, info: dict[str, Any], 
     chain = info["chain"]
     if chain == "solana":
         holder_stats = await fetch_solana_holder_stats(token_address)
+        # Fallback: only when the RPC scan returned no holders AND this is a real
+        # candidate worth a Birdeye call (mcap at/above the Jev floor) — cached so
+        # it doesn't re-fetch every 60s. Protects the free quota.
+        if (BIRDEYE_ENABLED and not holder_stats.get("holder_count")
+                and (info.get("market_cap") or (TOKEN_FEED.get(token_address, {}).get("market_cap")) or 0) >= JEV_PVP_MIN_MCAP
+                and (now - info.get("birdeye_holder_checked_at", 0.0)) > BIRDEYE_RECHECK_SECONDS):
+            info["birdeye_holder_checked_at"] = now
+            be = await fetch_birdeye_holders(token_address)
+            if be:
+                holder_stats.update(be)
     elif chain in ("bnb", "robinhood"):
         holder_stats = _evm_holder_stats_from_ledger(token_address)
     else:
@@ -3670,6 +7556,27 @@ async def _maybe_refresh_holder_stats(token_address: str, info: dict[str, Any], 
 
     if holder_stats.get("mint_authority_active") and info["status"] == "WATCHING":
         await _kick_out_watchlist_token(token_address, info, now, "MINTABLE", "SKIPPED - MINT AUTHORITY NOT RENOUNCED")
+        return
+
+    if holder_stats.get("freeze_authority_active") and info["status"] == "WATCHING":
+        await _kick_out_watchlist_token(token_address, info, now, "FREEZE_HONEYPOT", "SKIPPED - FREEZE AUTHORITY ACTIVE (Honeypot risk)")
+        return
+
+    if (holder_stats.get("sell_whitelist") or holder_stats.get("is_honeypot")) and info["status"] == "WATCHING":
+        hp_reason = holder_stats.get("honeypot_reason") or "Sell whitelist / honeypot detected"
+        info["is_honeypot"] = True
+        info["sell_whitelist"] = True
+        info["honeypot_reason"] = hp_reason
+        await _kick_out_watchlist_token(token_address, info, now, "HONEYPOT_SELL_WHITELIST", f"SKIPPED - {hp_reason.upper()}")
+        return
+
+    sec = await check_token_honeypot_and_whitelist(chain, token_address, info)
+    if (sec.get("is_honeypot") or sec.get("sell_whitelist")) and info["status"] == "WATCHING":
+        hp_reason = sec.get("reason") or "Sell whitelist / honeypot detected"
+        info["is_honeypot"] = True
+        info["sell_whitelist"] = True
+        info["honeypot_reason"] = hp_reason
+        await _kick_out_watchlist_token(token_address, info, now, "HONEYPOT_SELL_WHITELIST", f"SKIPPED - {hp_reason.upper()}")
         return
 
     if holder_stats:
@@ -3689,7 +7596,38 @@ async def _maybe_refresh_holder_stats(token_address: str, info: dict[str, Any], 
             and new_balance < prev_balance * TOP_HOLDER_SELL_DROP_RATIO
         )
         holder_stats["top_holder_selling"] = top_holder_selling
+        # "Substantial holders" — how many wallets hold a >= $1k POSITION in
+        # this coin (their token balance x current price). Your intuition:
+        # buyers taking a real position signal more legitimacy than a swarm of
+        # dust/sybil wallets. Computed FREE from the per-wallet balances the
+        # holder scan already produced (SOLANA_LAST_HOLDER_BALANCES) x the
+        # DexScreener price — no extra RPC. NOTE: this is position value in
+        # THIS coin, not the wallet's total net worth (which would need a
+        # per-wallet balance sweep, too expensive on the current RPC plan).
+        substantial = _compute_substantial_holders(token_address, prev_entry)
+        if substantial is not None:
+            holder_stats.update(substantial)
         token_feed_upsert(token_address, **holder_stats)
+
+
+def _compute_substantial_holders(token_address: str, entry: dict[str, Any]) -> Optional[dict[str, Any]]:
+    """Count holders whose position (balance x price) is >= $1k / $10k, from the
+    per-wallet balances the last holder scan already produced. Solana only for
+    now (that's where SOLANA_LAST_HOLDER_BALANCES is populated)."""
+    balances = SOLANA_LAST_HOLDER_BALANCES.get(token_address)
+    if not balances:
+        return None
+    price = entry.get("price_usd") or 0.0
+    if price <= 0:
+        return None
+    over_1k = sum(1 for bal in balances.values() if bal * price >= 1000)
+    over_10k = sum(1 for bal in balances.values() if bal * price >= 10000)
+    total = len(balances) or 1
+    return {
+        "substantial_holders_1k": over_1k,
+        "substantial_holders_10k": over_10k,
+        "substantial_holders_pct": round(over_1k / total * 100, 1),
+    }
 
 
 BUNDLE_CHECK_INTERVAL_SECONDS = 300  # bundle detection is RPC-heavier (Solana) / needs enough tx history (EVM) than a plain stats refresh
@@ -3874,15 +7812,75 @@ async def _process_watchlist_token(token_address: str, info: dict[str, Any], now
 
     dex_info = await fetch_dexscreener_info(token_address)
     market_cap = dex_info.get("market_cap", 0.0)
+    # Birdeye enrichment for real Solana candidates: fill price/mcap/liquidity/vol
+    # that DexScreener is MISSING (not just when mcap is 0 — DexScreener often has
+    # mcap but $0 liquidity, and Birdeye has it). Gated to non-dust candidates
+    # (>= the Jev mcap floor OR mcap unknown) so the free tier isn't spent on the
+    # flood of $2 dead coins. Globally throttled + fail-safe.
+    _be_ticker_ok = info.get("ticker") and info["ticker"] != "UNKNOWN" and not ticker_is_invalid(info.get("ticker"))[0]
+    # QUOTA-CONSERVING: Birdeye free tier is small. Only call it as a genuine
+    # last resort — when DexScreener returned NOTHING at all (mcap 0) for a
+    # real, resolved-ticker Solana coin — and cache the result so the same coin
+    # is never re-fetched within the cache window. Coins DexScreener already
+    # covers (even partially) never touch Birdeye.
+    _dex_empty = (market_cap <= 0)
+    _be_cached_at = info.get("birdeye_checked_at", 0.0)
+    _be_due = (now - _be_cached_at) > BIRDEYE_RECHECK_SECONDS
+    if (BIRDEYE_ENABLED and info.get("chain") == "solana"
+            and _be_ticker_ok and _dex_empty and _be_due):
+        info["birdeye_checked_at"] = now
+        be = await fetch_birdeye_overview(token_address)
+        if be:
+            for k in ("market_cap", "price_usd", "liquidity_usd", "volume_24h"):
+                if be.get(k) and not dex_info.get(k):
+                    dex_info[k] = be[k]
+            market_cap = dex_info.get("market_cap", 0.0)
+    # NEVER blank a previously-known mcap: if this poll returned 0 but we had a
+    # real value before, keep the last good one (free — no API call). This alone
+    # fixes most "data went missing" cases (DexScreener returns 0 transiently).
+    _prev = TOKEN_FEED.get(token_address) or {}
+    if market_cap <= 0 and (_prev.get("market_cap") or 0) > 0:
+        market_cap = _prev["market_cap"]
+        dex_info["market_cap"] = market_cap
+        if not dex_info.get("liquidity_usd") and _prev.get("liquidity_usd"):
+            dex_info["liquidity_usd"] = _prev["liquidity_usd"]
     volume_24h = dex_info.get("volume_24h", 0.0)
     liquidity_usd = dex_info.get("liquidity_usd", 0.0)
     txns_24h = dex_info.get("txns_24h", 0)
     buys_24h = dex_info.get("buys_24h", 0)
     sells_24h = dex_info.get("sells_24h", 0)
     image_url = dex_info.get("image_url")
+    price_usd = dex_info.get("price_usd", 0.0)
     if market_cap > info["peak_market_cap"]:
         info["peak_market_cap"] = market_cap
+    record_big_runner_if_qualified(token_address, TOKEN_FEED.get(token_address) or info, info["peak_market_cap"])
 
+    if token_address in MOCK_PORTFOLIO:
+        mock_pos = MOCK_PORTFOLIO[token_address]
+        if market_cap > 0:
+            mock_pos["last_known_market_cap"] = market_cap
+            if market_cap > mock_pos.get("peak_market_cap", 0.0):
+                mock_pos["peak_market_cap"] = market_cap
+                mock_pos["peak_ts"] = now
+        mock_pos["last_known_status"] = info.get("status")
+        mock_pos["last_known_ts"] = now
+
+    # Store price on the entry BEFORE the holder-stats refresh so the
+    # substantial-holders ($1k position) calc there can read it.
+    token_feed_upsert(token_address, price_usd=price_usd)
+
+    dex_socials = dex_info.get("socials")
+    if dex_socials and dex_socials.get("social_count", 0) > 0:
+        existing_soc = dict(info.get("socials") or {})
+        for k in ("twitter", "telegram", "website"):
+            if dex_socials.get(k):
+                existing_soc[k] = dex_socials[k]
+                existing_soc[f"has_{k}"] = True
+        if dex_socials.get("active_boosts"):
+            existing_soc["active_boosts"] = max(existing_soc.get("active_boosts", 0), dex_socials["active_boosts"])
+        existing_soc["social_count"] = sum(1 for x in [existing_soc.get("twitter"), existing_soc.get("telegram"), existing_soc.get("website")] if x)
+        info["socials"] = existing_soc
+        token_feed_upsert(token_address, socials=existing_soc)
     sparkline = _update_feed_sparkline(token_address, market_cap, now)
     await _maybe_refresh_holder_stats(token_address, info, now)
     await _maybe_check_bundle(token_address, info, now)
@@ -3926,6 +7924,9 @@ async def _process_watchlist_token(token_address: str, info: dict[str, Any], now
             peak = info["peak_market_cap"]
             if token_age >= RUG_WINDOW_SECONDS and peak > 0 and market_cap <= peak * (1 - RUG_DRAWDOWN_PCT):
                 info["status"] = "RUGGED"
+                jev_record_outcome(token_address, "rugged")
+                jev_record_pvp_outcome(token_address, "rugged")
+                jev_record_proposed_outcome(token_address, "rugged")
                 _blacklist_bundle_operator_if_any(token_address)
                 _credit_early_buyers(token_address, info["chain"], "rugs")
                 dev = DEV_REPUTATION_DATABASE.get(info["dev_wallet"])
@@ -3948,6 +7949,12 @@ async def _process_watchlist_token(token_address: str, info: dict[str, Any], now
                 if len(history) > DEV_RUG_HISTORY_MAX_PER_DEV:
                     del history[0]
                 token_feed_upsert(token_address, status="RUGGED", **_identity_fields(token_address, info))
+                if token_address in MOCK_PORTFOLIO:
+                    mock_pos = MOCK_PORTFOLIO[token_address]
+                    mock_pos["last_known_status"] = "RUGGED"
+                    if market_cap > 0:
+                        mock_pos["last_known_market_cap"] = market_cap
+                    mock_pos["last_known_ts"] = now
                 # This branch never rescored either — without it, a
                 # rugged-after-graduation token's displayed
                 # opportunity_score would stay frozen at its last
@@ -3986,6 +7993,56 @@ async def _process_watchlist_token(token_address: str, info: dict[str, Any], now
         )
         return
 
+    # Cross-platform established coin / tokenized stock / implausible new-launch
+    # mcap (any platform). Catches HYPE/MSTRx/ZEC leaks whose symbol only
+    # resolved after DexScreener backfill.
+    est, est_reason = is_probably_established_or_stock(info.get("ticker"), market_cap)
+    if est:
+        await _kick_out_watchlist_token(
+            token_address, info, now, "NOT_A_NEW_LAUNCH",
+            f"SKIPPED - NOT A NEW LAUNCH ({est_reason})",
+        )
+        return
+
+    # Dev multi-launch & serial rugger check:
+    dev_wallet = info.get("dev_wallet", "")
+    is_infra = dev_wallet.lower() in KNOWN_INFRASTRUCTURE_ADDRESSES
+    if not is_infra and dev_wallet:
+        dev = DEV_REPUTATION_DATABASE.get(dev_wallet)
+        if dev:
+            if dev.get("total_launches", 0) > 1 and info["status"] == "WATCHING":
+                await _kick_out_watchlist_token(
+                    token_address, info, now, "DEV_MULTI_LAUNCH_DISCARDED",
+                    f"SKIPPED - DEV LAUNCHED MULTIPLE TOKENS ({dev.get('total_launches')} launches)",
+                )
+                return
+            if (dev.get("is_blacklisted") or dev.get("failed_spams", 0) > 0 or len(DEV_RUG_HISTORY.get(dev_wallet, [])) > 0) and info["status"] == "WATCHING":
+                await _kick_out_watchlist_token(
+                    token_address, info, now, "SERIAL_RUGGER_DISCARDED",
+                    "SKIPPED - SERIAL RUGGER / PRIOR RUGS ON RECORD",
+                )
+                return
+
+    # Honeypot chart detection (0 sells or extreme buy-to-sell ratio):
+    token_age = now - info["created_at"]
+    is_honeypot_chart = False
+    if token_age >= 45:
+        if (buys_24h >= 4 and sells_24h == 0) or (buys_24h >= 12 and sells_24h <= 1):
+            is_honeypot_chart = True
+
+    if is_honeypot_chart and info["status"] == "WATCHING":
+        if not is_infra and dev_wallet:
+            dev = DEV_REPUTATION_DATABASE.get(dev_wallet)
+            if dev:
+                dev["is_blacklisted"] = True
+                dev["failed_spams"] = dev.get("failed_spams", 0) + 1
+            DEV_SPAM_LOG[dev_wallet].append(now)
+        await _kick_out_watchlist_token(
+            token_address, info, now, "HONEYPOT_CHART",
+            f"SKIPPED - HONEYPOT CHART DETECTED ({buys_24h} buys / {sells_24h} sells - no sells possible)",
+        )
+        return
+
     # Free alternative to PumpPortal's paid per-trade subscription: poll
     # the token's own on-chain bonding curve account directly (decoder
     # verified empirically — see fetch_pumpfun_bonding_curve_state).
@@ -3993,11 +8050,15 @@ async def _process_watchlist_token(token_address: str, info: dict[str, Any], now
     if info["platform"] == "pump.fun" and bonding_curve_key:
         bonding_state = await fetch_pumpfun_bonding_curve_state(bonding_curve_key)
         if bonding_state:
+            sol_raised = bonding_state.get("bonding_sol_raised") or 0.0
+            if liquidity_usd <= 0.0 and sol_raised > 0:
+                liquidity_usd = round(sol_raised * 150.0, 2)
             token_feed_upsert(
                 token_address,
-                bonding_sol_raised=bonding_state.get("bonding_sol_raised"),
+                bonding_sol_raised=sol_raised,
                 bonding_progress_pct=bonding_state.get("bonding_progress_pct"),
                 bonding_complete=bonding_state.get("bonding_complete"),
+                liquidity_usd=liquidity_usd,
             )
 
     # Backfill a ticker that showed up as UNKNOWN at creation (StonkFun
@@ -4007,6 +8068,12 @@ async def _process_watchlist_token(token_address: str, info: dict[str, Any], now
     if resolved_symbol and (not info["ticker"] or info["ticker"] == "UNKNOWN"):
         info["ticker"] = resolved_symbol
         token_feed_upsert(token_address, ticker=resolved_symbol)
+    # Store the token NAME (DexScreener provides it) — Jev needs to know what the
+    # coin actually IS to judge narrative/quality/legitimacy. Without this, name
+    # was always blank and Jev flagged 'insufficient info' on every judgment.
+    resolved_name = dex_info.get("name")
+    if resolved_name and not (TOKEN_FEED.get(token_address, {}).get("name")):
+        token_feed_upsert(token_address, name=resolved_name)
 
     token_age = now - info["created_at"]
     hit_mcap_target = market_cap >= TARGET_MARKET_CAP_USD
@@ -4129,6 +8196,12 @@ async def _process_watchlist_token(token_address: str, info: dict[str, Any], now
             buys_24h=buys_24h, sells_24h=sells_24h, image_url=image_url,
                 **_identity_fields(token_address, info),
             )
+            if token_address in MOCK_PORTFOLIO:
+                mock_pos = MOCK_PORTFOLIO[token_address]
+                mock_pos["last_known_status"] = "RUGGED"
+                if market_cap > 0:
+                    mock_pos["last_known_market_cap"] = market_cap
+                mock_pos["last_known_ts"] = now
             await _rescore_token_and_maybe_ping(token_address)
             await broadcast_token_card(TOKEN_FEED[token_address])
             await bump_daily_stat(now, "rugged")
@@ -4154,6 +8227,13 @@ async def _process_watchlist_token(token_address: str, info: dict[str, Any], now
             await persist_state()
         else:
             info["status"] = "EXPIRED_WATCH"
+            # Terminal for learning purposes: an evaluated coin that faded out
+            # without graduating or rugging is a 'flat' outcome (not a winner) —
+            # record it so the correlation/proposal stats aren't blind to the
+            # many coins that simply never went anywhere.
+            jev_record_outcome(token_address, "flat")
+            jev_record_pvp_outcome(token_address, "flat")
+            jev_record_proposed_outcome(token_address, "flat")
             token_feed_upsert(
                 token_address, status="EXPIRED_WATCH", market_cap=market_cap,
                 peak_market_cap=peak, sparkline=sparkline,
@@ -4204,11 +8284,20 @@ def _restore_tracking_from_mock_portfolio() -> int:
         status = position.get("last_known_status")
         if status not in ("WATCHING", "GRADUATED", "RUGGED"):
             continue
+        entry_mc = position.get("entry_market_cap") or 0.0
         chain = position.get("chain")
         platform = position.get("platform")
         dev_wallet = position.get("dev_wallet")
         ticker = position.get("ticker")
         if not chain or not platform or not dev_wallet:
+            continue
+        is_stonk = is_stonkboard_token(token_address, platform, position.get("links"))
+        if is_stonk and entry_mc > MAX_OPPORTUNITY_MARKET_CAP_USD:
+            continue
+        if entry_mc > IMPLAUSIBLE_NEW_LAUNCH_MCAP_USD:
+            continue
+        qualifies, _ = is_launchpad_or_target_suffix(platform, token_address)
+        if not qualifies:
             continue
         created_at = position.get("entry_ts") or time.time()
         peak_market_cap = position.get("peak_market_cap") or 0.0
@@ -4230,6 +8319,7 @@ def _restore_tracking_from_mock_portfolio() -> int:
             created_at=created_at, status=status, market_cap=market_cap,
             peak_market_cap=peak_market_cap, image_url=position.get("image_url"),
             links=position.get("links") or {},
+            goplus=position.get("goplus"),
             **dev_rep_badge_fields(dev_wallet),
         )
         restored += 1
@@ -4239,6 +8329,12 @@ def _restore_tracking_from_mock_portfolio() -> int:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     _load_state_sync()
+    _seed_big_runners()
+    purge_established_from_jev()
+    try:
+        await sync_stonkboard_coins()
+    except Exception as exc:
+        logger.debug(f"Initial stonkboard sync error: {exc!r}")
     restored_count = _restore_tracking_from_mock_portfolio()
     if restored_count:
         logger.info(f"Restored {restored_count} token(s) from mock_portfolio into the active hot loop after restart")
@@ -4261,10 +8357,17 @@ async def lifespan(app: FastAPI):
         (telegram_sender_worker, "telegram-sender"),
         (mock_portfolio_broadcaster, "mock-portfolio-broadcaster"),
         (periodic_state_snapshot, "state-snapshot"),
+        (jev_auto_proposer_worker, "jev-auto-proposer"),
+        (jev_trajectory_worker, "jev-trajectory"),
+        (jev_autotune_worker, "jev-autotune"),
+        (discovery_worker, "discovery"),
+        (token_profiles_worker, "token-profiles"),
+        (stonkboard_sync_worker, "stonkboard-sync"),
     ]
     for factory, name in tasks_spec:
         BACKGROUND_TASKS.append(asyncio.create_task(run_forever(factory, name), name=name))
     logger.info(f"Started {len(BACKGROUND_TASKS)} background tasks")
+
 
     try:
         yield
@@ -4336,7 +8439,56 @@ async def api_debug_token(token_address: str) -> dict:
         "feed_entry": {k: v for k, v in (feed_entry or {}).items() if k != "sparkline"},
         "in_long_tail": token_address in LONG_TAIL_WATCHLIST,
         "mock_position": mock_position,
+        "jev": (feed_entry or {}).get("jev"),
+        "jev_judgment_log": JEV_JUDGMENT_LOG.get(token_address),
     }
+
+
+@app.get("/api/jev")
+async def api_jev() -> dict:
+    """Aggregate Jev decision + budget + learning-loop stats."""
+    return build_jev_stats()
+
+
+@app.post("/api/jev/propose")
+async def api_jev_propose(request: Request) -> dict:
+    """Add a candidate question to be tested live (manual proposal). Body:
+    {instructions, type?('noul'|'score'), criteria?, name?}."""
+    body = await request.json()
+    ok, res = jev_add_proposed_question(
+        instructions=body.get("instructions", ""),
+        qtype=body.get("type", "noul"),
+        criteria=body.get("criteria"),
+        proposed_by=body.get("proposed_by", "manual"),
+        name=body.get("name"),
+    )
+    return {"ok": ok, "id" if ok else "error": res}
+
+
+@app.post("/api/jev/retire")
+async def api_jev_retire(request: Request) -> dict:
+    """Deactivate a proposed question by id. Body: {id}."""
+    body = await request.json()
+    qid = body.get("id")
+    q = JEV_PROPOSED_QUESTIONS.get(qid)
+    if not q:
+        return {"ok": False, "error": "unknown id"}
+    q["active"] = False
+    q["status"] = "retired"
+    return {"ok": True, "id": qid}
+
+
+@app.post("/api/jev/promote")
+async def api_jev_promote(request: Request) -> dict:
+    """Mark a proposed question 'promoted' (kept as a winner). Body: {id}.
+    Stays in the proposed set (still merged into calls) but flagged as trusted."""
+    body = await request.json()
+    qid = body.get("id")
+    q = JEV_PROPOSED_QUESTIONS.get(qid)
+    if not q:
+        return {"ok": False, "error": "unknown id"}
+    q["status"] = "promoted"
+    return {"ok": True, "id": qid}
 
 
 @app.websocket("/ws/dashboard")
@@ -4344,12 +8496,17 @@ async def dashboard_ws(websocket: WebSocket) -> None:
     await websocket.accept()
     CONNECTED_CLIENTS.add(websocket)
     try:
+        elite_count = sum(1 for d in DEV_REPUTATION_DATABASE.values() if d.get("successful_launches", 0) >= 1 and not d.get("is_blacklisted"))
+        blacklist_count = sum(1 for d in DEV_REPUTATION_DATABASE.values() if d.get("is_blacklisted"))
+        filtered_dev_rep = {k: v for k, v in DEV_REPUTATION_DATABASE.items() if v.get("successful_launches", 0) >= 1 or v.get("is_blacklisted")}
         snapshot = {
             "kind": "snapshot",
             "payload": {
-                "alerts": list(ALERT_HISTORY),
+                "alerts": list(ALERT_HISTORY)[-40:],
                 "smart_wallets": SMART_WALLETS,
-                "dev_reputation": DEV_REPUTATION_DATABASE,
+                "dev_reputation": {},
+                "elite_count": elite_count,
+                "blacklist_count": blacklist_count,
                 "narratives": {k: v for k, v in NARRATIVE_STATUS.items() if v.get("qualifies")},
                 # Full TOKEN_FEED (up to TOKEN_FEED_MAX) stays server-side for live
                 # tracking, but the reconnect snapshot only sends the most recent
@@ -4363,10 +8520,12 @@ async def dashboard_ws(websocket: WebSocket) -> None:
                 # week-over-week trends.
                 "daily_stats_history": {day: dict(counters) for day, counters in DAILY_STATS.items()},
                 "hourly_launch_stats": dict(HOURLY_LAUNCH_STATS),
-                "recent_graduations": list(RECENT_GRADUATIONS),
-                "recent_rugs": list(RECENT_RUGS),
+                "recent_graduations": list(RECENT_GRADUATIONS)[-25:],
+                "recent_rugs": list(RECENT_RUGS)[-25:],
                 "mock_portfolio": _build_mock_portfolio_snapshot(),
-                "recent_opportunities": _refresh_opportunity_history_statuses(),
+                "recent_opportunities": _refresh_opportunity_history_statuses()[-30:],
+                "jev_stats": build_jev_stats(),
+                "description_feed": build_description_feed(),
             },
         }
         await websocket.send_text(json.dumps(snapshot, default=str))

@@ -4,3 +4,11 @@ __pycache__/
 data/
 *.log
 .DS_Store
+
+# Agent caches and skills
+.*
+!.gitignore
+!.env.example
+agent/
+skills/
+skills-lock.json

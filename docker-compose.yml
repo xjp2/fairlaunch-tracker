@@ -14,6 +14,8 @@ services:
       - DATA_DIR=/app/data
     volumes:
       - tracker_data:/app/data
+      - ./static:/app/static:ro
+      - ./tracker.py:/app/tracker.py:ro
     networks:
       - proxy
     labels:
