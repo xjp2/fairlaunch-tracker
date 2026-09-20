@@ -207,64 +207,6 @@ MAX_OPPORTUNITY_MARKET_CAP_USD = float(os.getenv("MAX_OPPORTUNITY_MARKET_CAP_USD
 
 # Only evaluate tokens launched from recognized launchpads and/or contracts ending in 7777, pump, 4444
 QUALIFYING_CONTRACT_SUFFIXES = ("7777", "pump", "4444")
-KNOWN_LAUNCHPAD_PLATFORMS = {
-    "pump.fun",
-    "stonkfun",
-    "four.meme",
-    "flap.sh",
-    "pons",
-    "ember",
-    "long.xyz",
-}
-
-def infer_launchpad_platform(platform: Optional[str], token_address: str) -> Optional[str]:
-    """Infers or normalizes the launchpad platform name based on contract suffix and platform string:
-    - ends in 'pump' -> 'pump.fun'
-    - ends in '4444' -> 'four.meme'
-    - ends in '7777' -> 'flap.sh'
-    """
-    addr = (token_address or "").lower()
-    if addr.endswith("pump"):
-        return "pump.fun"
-    if addr.endswith("4444"):
-        return "four.meme"
-    if addr.endswith("7777"):
-        return "flap.sh"
-    plat = (platform or "").lower().strip()
-    if "pump" in plat:
-        return "pump.fun"
-    if "four" in plat or "4meme" in plat:
-        return "four.meme"
-    if "flap" in plat:
-        return "flap.sh"
-    if "stonk" in plat:
-        return "stonkfun"
-    return platform if platform and platform not in ("?", "unknown") else None
-
-
-def is_launchpad_or_target_suffix(platform: Optional[str], token_address: str) -> tuple[bool, str]:
-    """Checks if a token was launched from a recognized launchpad (pump.fun, four.meme, flap.sh,
-    stonkfun, pons, ember) and/or its contract address ends in 7777, pump, or 4444:
-    - ends with pump: pump.fun launchpad
-    - ends with 4444: four.meme launchpad
-    - ends with 7777: flap.sh launchpad"""
-    addr = (token_address or "").lower()
-    inferred = infer_launchpad_platform(platform, token_address)
-
-    if addr.endswith("pump"):
-        return True, "pump.fun launchpad (contract suffix 'pump')"
-    if addr.endswith("4444"):
-        return True, "four.meme launchpad (contract suffix '4444')"
-    if addr.endswith("7777"):
-        return True, "flap.sh launchpad (contract suffix '7777')"
-
-    plat = (platform or inferred or "").lower().strip()
-    is_launchpad = any(lp in plat for lp in KNOWN_LAUNCHPAD_PLATFORMS)
-    if is_launchpad:
-        return True, f"Launchpad ({inferred or platform})"
-
-    return False, f"Not from a launchpad ({platform or 'unknown'}) & contract does not end in 7777/pump/4444"
-
 # --- TheStonkBoard token detection & sync -------------------------------------
 # The user specified that the <$100k market cap ceiling applies strictly to
 # coins associated with thestonkboard.com (StonkFun native launches and coins
@@ -427,6 +369,70 @@ def is_stonkboard_token(token_address: str, platform: Optional[str] = None, link
         return True
     return False
 
+KNOWN_LAUNCHPAD_PLATFORMS = {
+    "pump.fun",
+    "stonkfun",
+    "four.meme",
+    "flap.sh",
+    "pons",
+    "ember",
+    "long.xyz",
+}
+
+def infer_launchpad_platform(platform: Optional[str], token_address: str) -> Optional[str]:
+    """Infers or normalizes the launchpad platform name based on contract suffix and platform string:
+    - ends in 'pump' -> 'pump.fun'
+    - ends in '4444' -> 'four.meme'
+    - ends in '7777' -> 'flap.sh'
+    - stonkboard / stonkfun -> 'stonkfun'
+    """
+    if is_stonkboard_token(token_address, platform):
+        return "stonkfun"
+    addr = (token_address or "").lower()
+    if addr.endswith("pump"):
+        return "pump.fun"
+    if addr.endswith("4444"):
+        return "four.meme"
+    if addr.endswith("7777"):
+        return "flap.sh"
+    plat = (platform or "").lower().strip()
+    if "pump" in plat:
+        return "pump.fun"
+    if "four" in plat or "4meme" in plat:
+        return "four.meme"
+    if "flap" in plat:
+        return "flap.sh"
+    if "stonk" in plat:
+        return "stonkfun"
+    return platform if platform and platform not in ("?", "unknown") else None
+
+
+def is_launchpad_or_target_suffix(platform: Optional[str], token_address: str) -> tuple[bool, str]:
+    """Checks if a token was launched from a recognized launchpad (pump.fun, four.meme, flap.sh,
+    stonkfun, pons, ember) and/or its contract address ends in 7777, pump, or 4444:
+    - ends with pump: pump.fun launchpad
+    - ends with 4444: four.meme launchpad
+    - ends with 7777: flap.sh launchpad
+    - stonkfun / thestonkboard.com: stonkfun launchpad"""
+    addr = (token_address or "").lower()
+    inferred = infer_launchpad_platform(platform, token_address)
+
+    if addr.endswith("pump"):
+        return True, "pump.fun launchpad (contract suffix 'pump')"
+    if addr.endswith("4444"):
+        return True, "four.meme launchpad (contract suffix '4444')"
+    if addr.endswith("7777"):
+        return True, "flap.sh launchpad (contract suffix '7777')"
+    if inferred == "stonkfun" or is_stonkboard_token(token_address, platform):
+        return True, "StonkFun launchpad"
+
+    plat = (platform or inferred or "").lower().strip()
+    is_launchpad = any(lp in plat for lp in KNOWN_LAUNCHPAD_PLATFORMS)
+    if is_launchpad:
+        return True, f"Launchpad ({inferred or platform})"
+
+    return False, f"Not from a launchpad ({platform or 'unknown'}) & contract does not end in 7777/pump/4444"
+
 async def sync_stonkboard_coins() -> None:
     """Scrapes token roster from https://thestonkboard.com so we know exactly
     which tokens are visible on TheStonkBoard and ingests any newly discovered StonkFun coins.
@@ -477,6 +483,25 @@ async def sync_stonkboard_coins() -> None:
                                 continue
 
                             STONKBOARD_COIN_ADDRESSES.add(mint)
+                            logo_path = c.get("logo")
+                            logo_url = f"https://thestonkboard.com{logo_path}" if logo_path else f"https://thestonkboard.com/api/logos/{mint}"
+                            coin_name = c.get("name")
+
+                            # Ensure any active tracked instances in memory are stamped with stonkfun and logo
+                            if mint in TOKEN_WATCHLIST:
+                                TOKEN_WATCHLIST[mint]["platform"] = "stonkfun"
+                                if not TOKEN_WATCHLIST[mint].get("image_url"):
+                                    TOKEN_WATCHLIST[mint]["image_url"] = logo_url
+                                if coin_name and not TOKEN_WATCHLIST[mint].get("name"):
+                                    TOKEN_WATCHLIST[mint]["name"] = coin_name
+                            if mint in TOKEN_FEED:
+                                TOKEN_FEED[mint]["platform"] = "stonkfun"
+                                TOKEN_FEED[mint]["is_stonkboard"] = True
+                                if not TOKEN_FEED[mint].get("image_url"):
+                                    TOKEN_FEED[mint]["image_url"] = logo_url
+                                if coin_name and not TOKEN_FEED[mint].get("name"):
+                                    TOKEN_FEED[mint]["name"] = coin_name
+
                             existing_wl = TOKEN_WATCHLIST.get(mint)
                             if existing_wl and existing_wl.get("status") == "SKIPPED":
                                 dev_w = existing_wl.get("dev_wallet", "")
@@ -498,7 +523,11 @@ async def sync_stonkboard_coins() -> None:
                                     ticker_raw=sym,
                                     dev_wallet=f"stonkboard_{mint[:8]}",
                                     ts=now,
-                                    extra={"source": "thestonkboard.com", "name": c.get("name")},
+                                    extra={
+                                        "source": "thestonkboard.com",
+                                        "name": coin_name,
+                                        "image_url": logo_url,
+                                    },
                                 )
                                 newly_ingested += 1
                     else:
@@ -513,6 +542,7 @@ async def sync_stonkboard_coins() -> None:
                                 continue
                             if sym and ticker_is_invalid(sym)[0]:
                                 continue
+                            logo_url = f"https://thestonkboard.com/api/logos/{mint}"
                             if mint not in TOKEN_FEED and mint not in TOKEN_WATCHLIST:
                                 await process_new_token_event(
                                     chain="solana",
@@ -521,7 +551,10 @@ async def sync_stonkboard_coins() -> None:
                                     ticker_raw=sym,
                                     dev_wallet=f"stonkboard_{mint[:8]}",
                                     ts=now,
-                                    extra={"source": "thestonkboard.com"},
+                                    extra={
+                                        "source": "thestonkboard.com",
+                                        "image_url": logo_url,
+                                    },
                                 )
                                 newly_ingested += 1
 
@@ -1065,10 +1098,21 @@ def token_feed_upsert(token_address: str, **fields: Any) -> dict[str, Any]:
             oldest_key = next(iter(TOKEN_FEED))
             if oldest_key != token_address:
                 del TOKEN_FEED[oldest_key]
+
+    # Never overwrite an existing valid image_url/name/description with None or empty
+    for k in ("image_url", "name", "description"):
+        if k in fields and not fields[k] and entry.get(k):
+            fields[k] = entry[k]
+
     entry.update(fields)
     inferred_plat = infer_launchpad_platform(entry.get("platform"), token_address)
     if inferred_plat:
         entry["platform"] = inferred_plat
+    if is_stonkboard_token(token_address, entry.get("platform")):
+        entry["platform"] = "stonkfun"
+        entry["is_stonkboard"] = True
+        if not entry.get("image_url"):
+            entry["image_url"] = f"https://thestonkboard.com/api/logos/{token_address}"
     return entry
 
 
@@ -1779,10 +1823,11 @@ def build_token_links(chain: str, token_address: str, platform: Optional[str] = 
     if chain == "solana":
         if is_stonkboard_token(token_address, platform):
             links["stonkboard"] = f"https://thestonkboard.com/coin/{token_address}"
-        links["pumpfun"] = f"https://pump.fun/{token_address}"
+        else:
+            links["pumpfun"] = f"https://pump.fun/{token_address}"
         links["birdeye"] = f"https://birdeye.so/token/{token_address}?chain=solana"
         links["rugcheck"] = f"https://rugcheck.xyz/tokens/{token_address}"
-    if addr_lower.endswith("pump") or (platform and "pump" in platform.lower()):
+    if not is_stonkboard_token(token_address, platform) and (addr_lower.endswith("pump") or (platform and "pump" in platform.lower())):
         links["pumpfun"] = f"https://pump.fun/{token_address}"
     if addr_lower.endswith("4444") or (platform and ("four" in platform.lower() or "4meme" in platform.lower())):
         links["fourmeme"] = f"https://four.meme/token/{token_address}"
@@ -1941,11 +1986,14 @@ async def _maybe_fetch_pumpfun_image(token_address: str, info: dict[str, Any]) -
         upd = {}
         if meta.get("image_uri"):
             upd["image_url"] = meta["image_uri"]
+            info["image_url"] = meta["image_uri"]
         if meta.get("name") and not fe.get("name"):
             upd["name"] = meta["name"]
+            info["name"] = meta["name"]
         if meta.get("description") and not fe.get("description"):
             # the coin's own pitch — the narrative context Jev was missing
             upd["description"] = meta["description"][:1000]
+            info["description"] = meta["description"][:1000]
         if meta.get("twitter") or meta.get("telegram") or meta.get("website"):
             soc = dict(info.get("socials") or {})
             if meta.get("twitter"):
@@ -4025,6 +4073,8 @@ async def maybe_screen_early_momentum_with_jev(token_address: str, entry: dict[s
             meta = await fetch_pumpfun_image(token_address)
             if meta:
                 upd = {}
+                if meta.get("image_uri") and not entry.get("image_url"):
+                    upd["image_url"] = meta["image_uri"]
                 if meta.get("name") and not entry.get("name"):
                     upd["name"] = meta["name"]
                 if meta.get("description"):
@@ -4032,6 +4082,8 @@ async def maybe_screen_early_momentum_with_jev(token_address: str, entry: dict[s
                 if upd:
                     token_feed_upsert(token_address, **upd)
                     entry.update(upd)
+                    if token_address in TOKEN_WATCHLIST:
+                        TOKEN_WATCHLIST[token_address].update(upd)
         except Exception:
             pass
 
@@ -4138,6 +4190,8 @@ async def maybe_evaluate_token_with_jev(token_address: str, entry: dict[str, Any
             meta = await fetch_pumpfun_image(token_address)
             if meta:
                 upd = {}
+                if meta.get("image_uri") and not entry.get("image_url"):
+                    upd["image_url"] = meta["image_uri"]
                 if meta.get("name") and not entry.get("name"):
                     upd["name"] = meta["name"]
                 if meta.get("description"):
@@ -4145,6 +4199,8 @@ async def maybe_evaluate_token_with_jev(token_address: str, entry: dict[str, Any
                 if upd:
                     token_feed_upsert(token_address, **upd)
                     entry.update(upd)
+                    if token_address in TOKEN_WATCHLIST:
+                        TOKEN_WATCHLIST[token_address].update(upd)
         except Exception:
             pass
 
@@ -6233,6 +6289,11 @@ async def process_new_token_event(
     extra = extra or {}
 
     bonding_curve_key = (extra or {}).get("bonding_curve_key")
+    coin_name = (extra or {}).get("name")
+    coin_desc = (extra or {}).get("description")
+    img_url = (extra or {}).get("image_url")
+    if not img_url and is_stonkboard_token(token_address, platform):
+        img_url = f"https://thestonkboard.com/api/logos/{token_address}"
 
     TOKEN_CREATION_TIME[token_address] = ts
     TOKEN_WATCHLIST[token_address] = {
@@ -6240,6 +6301,9 @@ async def process_new_token_event(
         "platform": platform,
         "dev_wallet": dev_wallet,
         "ticker": ticker_raw,
+        "name": coin_name,
+        "description": coin_desc,
+        "image_url": img_url,
         "created_at": ts,
         "peak_market_cap": 0.0,
         "status": "WATCHING",
@@ -6252,6 +6316,8 @@ async def process_new_token_event(
         platform=platform,
         dev_wallet=dev_wallet,
         ticker=ticker_raw,
+        name=coin_name,
+        description=coin_desc,
         created_at=ts,
         dev_decision="PENDING",
         market_cap=0.0,
@@ -6266,7 +6332,7 @@ async def process_new_token_event(
         sells_24h=0,
         opportunity_score=0,
         score_reasons=[],
-        links=build_token_links(chain, token_address),
+        links=build_token_links(chain, token_address, platform=platform),
         bonding_sol_raised=None,
         bonding_progress_pct=None,
         holder_count=None,
@@ -6280,7 +6346,7 @@ async def process_new_token_event(
         bundle_known_bad_operator=False,
         early_momentum_score=0,
         early_momentum_reasons=[],
-        image_url=None,
+        image_url=img_url,
         **dev_rep_badge_fields(dev_wallet),
     )
     await bump_daily_stat(ts, "total_tokens")
@@ -7024,7 +7090,7 @@ async def _handle_token_revival(token_address: str, cold_info: dict[str, Any], d
         token_address, status="WATCHING", market_cap=market_cap, peak_market_cap=peak_market_cap,
         volume_24h=dex_info.get("volume_24h", 0.0), liquidity_usd=dex_info.get("liquidity_usd", 0.0),
         txns_24h=dex_info.get("txns_24h", 0), buys_24h=dex_info.get("buys_24h", 0), sells_24h=dex_info.get("sells_24h", 0),
-        image_url=dex_info.get("image_url"),
+        image_url=dex_info.get("image_url") or TOKEN_WATCHLIST[token_address].get("image_url") or (TOKEN_FEED.get(token_address) or {}).get("image_url"),
         **_identity_fields(token_address, TOKEN_WATCHLIST[token_address]),
     )
     await _rescore_token_and_maybe_ping(token_address)
@@ -7088,24 +7154,27 @@ def _update_feed_sparkline(token_address: str, market_cap: float, ts: float) -> 
 
 
 def _identity_fields(token_address: str, info: dict[str, Any]) -> dict[str, Any]:
-    """TOKEN_FEED is capped (TOKEN_FEED_MAX) and evicts its oldest entry when full;
-    TOKEN_WATCHLIST is not, and keeps polling every still-WATCHING token regardless.
-    If a token's TOKEN_FEED entry gets evicted while TOKEN_WATCHLIST is still actively
-    tracking it, the next token_feed_upsert() call would otherwise silently recreate a
-    bare stub missing chain/platform/ticker/dev_wallet — showing up on the dashboard as
-    a blank row with an empty chain badge and a "PENDING"/"unresolved" ticker. Passing
-    these identity fields on every watch-loop update makes that self-healing instead."""
-    return {
+    plat = infer_launchpad_platform(info.get("platform"), token_address) or info.get("platform")
+    is_stonk = is_stonkboard_token(token_address, plat)
+    if is_stonk:
+        plat = "stonkfun"
+    fields = {
         "chain": info["chain"],
-        "platform": info["platform"],
+        "platform": plat,
+        "is_stonkboard": is_stonk,
         "dev_wallet": info["dev_wallet"],
         "ticker": info["ticker"],
         "created_at": info["created_at"],
         "dev_decision": info.get("dev_decision", "PASS"),
-        "links": build_token_links(info["chain"], token_address),
+        "links": build_token_links(info["chain"], token_address, platform=plat),
         "socials": info.get("socials"),
         **dev_rep_badge_fields(info["dev_wallet"]),
     }
+    if info.get("name"):
+        fields["name"] = info["name"]
+    if info.get("description"):
+        fields["description"] = info["description"]
+    return fields
 
 
 async def mark_token_graduated(token_address: str, source: str) -> None:
@@ -7164,7 +7233,8 @@ async def mark_token_graduated(token_address: str, source: str) -> None:
         peak_market_cap=info["peak_market_cap"], sparkline=sparkline,
         volume_24h=dex_info.get("volume_24h", 0.0), liquidity_usd=dex_info.get("liquidity_usd", 0.0),
         txns_24h=dex_info.get("txns_24h", 0), buys_24h=dex_info.get("buys_24h", 0),
-        sells_24h=dex_info.get("sells_24h", 0), image_url=dex_info.get("image_url"),
+        sells_24h=dex_info.get("sells_24h", 0),
+        image_url=dex_info.get("image_url") or info.get("image_url") or (TOKEN_FEED.get(token_address) or {}).get("image_url"),
         **_identity_fields(token_address, info),
     )
     # Resolved: whatever thin-volume concern an earlier WATCHING poll may
@@ -7355,9 +7425,13 @@ def _format_telegram_opportunity_message(entry: dict[str, Any]) -> str:
     else:
         tax_str = "0% / 0%"
 
+    is_stonk = (platform.lower() == "stonkfun") or is_stonkboard_token(token_address)
+    plat_display = "📈 StonkFun" if is_stonk else esc(platform)
+    title_badge = " <i>[📈 StonkFun]</i>" if is_stonk else ""
+
     header_block = (
-        f"🎯 <b>${esc(ticker)}</b>\n"
-        f"🪐 <b>Platform:</b> {esc(chain)} • {esc(platform)}\n\n"
+        f"🎯 <b>${esc(ticker)}</b>{title_badge}\n"
+        f"🪐 <b>Platform:</b> {esc(chain)} • {plat_display}\n\n"
         f"📋 <b>CA:</b> <i>(tap to copy)</i>\n"
         f"<pre><code>{esc(token_address)}</code></pre>\n\n"
         f"💰 <b>MCap:</b> {mcap_str}  │  💧 <b>Liq:</b> {liq_str}\n"
@@ -7430,11 +7504,30 @@ def _format_telegram_opportunity_message(entry: dict[str, Any]) -> str:
 
     debot = entry.get("debot") or {}
     origin_text = (debot.get("origin_text") or "").strip()
+    narrative_type = debot.get("narrative_type")
+    ref_link = f' · <a href="{esc(debot["origin_ref"])}">🔗 Source</a>' if debot.get("origin_ref") else ""
+
+    if not origin_text:
+        # Fallback 1: Project's own description / lore (from pump.fun or StonkBoard metadata)
+        desc_raw = (entry.get("description") or (TOKEN_WATCHLIST.get(token_address) or {}).get("description") or "").strip()
+        if desc_raw:
+            origin_text = desc_raw
+            narrative_type = "Creator Lore"
+            ref_link = ""
+        elif entry.get("score_reasons"):
+            # Fallback 2: Check for AI narrative / lore observations in reasons
+            for r in entry.get("score_reasons", []):
+                if any(k in r.lower() for k in ["narrative", "lore", "concept", "theme"]):
+                    cleaned_r = _clean_signal_reason(r)
+                    if cleaned_r:
+                        origin_text = cleaned_r
+                        narrative_type = "AI Intel"
+                        ref_link = ""
+                        break
+
     debot_line = ""
     if origin_text and narrative_budget > 60:
-        ntype = debot.get("narrative_type")
-        type_tag = f"<i>[{esc(ntype)}]</i> " if ntype else ""
-        ref_link = f' · <a href="{esc(debot["origin_ref"])}">🔗 Source</a>' if debot.get("origin_ref") else ""
+        type_tag = f"<i>[{esc(narrative_type)}]</i> " if narrative_type else ""
         prefix = f"📖 <b>Narrative:</b> {type_tag}"
         suffix = f"{ref_link}\n\n"
         max_orig_len = narrative_budget - len(prefix) - len(suffix)
@@ -7494,9 +7587,13 @@ def _format_telegram_early_momentum_message(entry: dict[str, Any]) -> str:
     else:
         tax_str = "0% / 0%"
 
+    is_stonk = (platform.lower() == "stonkfun") or is_stonkboard_token(token_address)
+    plat_display = "📈 StonkFun" if is_stonk else esc(platform)
+    title_badge = " <i>[📈 StonkFun]</i>" if is_stonk else ""
+
     header_block = (
-        f"⚡ <b>Early Momentum: ${esc(ticker)}</b>\n"
-        f"🪐 <b>Platform:</b> {esc(chain)} • {esc(platform)}\n\n"
+        f"⚡ <b>Early Momentum: ${esc(ticker)}</b>{title_badge}\n"
+        f"🪐 <b>Platform:</b> {esc(chain)} • {plat_display}\n\n"
         f"📋 <b>CA:</b> <i>(tap to copy)</i>\n"
         f"<pre><code>{esc(token_address)}</code></pre>\n\n"
         f"💰 <b>MCap:</b> {mcap_str}  │  💧 <b>Liq:</b> {liq_str}\n"
@@ -7566,11 +7663,30 @@ def _format_telegram_early_momentum_message(entry: dict[str, Any]) -> str:
 
     debot = entry.get("debot") or {}
     origin_text = (debot.get("origin_text") or "").strip()
+    narrative_type = debot.get("narrative_type")
+    ref_link = f' · <a href="{esc(debot["origin_ref"])}">🔗 Source</a>' if debot.get("origin_ref") else ""
+
+    if not origin_text:
+        # Fallback 1: Project's own description / lore (from pump.fun or StonkBoard metadata)
+        desc_raw = (entry.get("description") or (TOKEN_WATCHLIST.get(token_address) or {}).get("description") or "").strip()
+        if desc_raw:
+            origin_text = desc_raw
+            narrative_type = "Creator Lore"
+            ref_link = ""
+        elif entry.get("early_momentum_reasons"):
+            # Fallback 2: Check for AI narrative / lore observations in reasons
+            for r in entry.get("early_momentum_reasons", []):
+                if any(k in r.lower() for k in ["narrative", "lore", "concept", "theme"]):
+                    cleaned_r = _clean_signal_reason(r)
+                    if cleaned_r:
+                        origin_text = cleaned_r
+                        narrative_type = "AI Intel"
+                        ref_link = ""
+                        break
+
     debot_line = ""
     if origin_text and narrative_budget > 60:
-        ntype = debot.get("narrative_type")
-        type_tag = f"<i>[{esc(ntype)}]</i> " if ntype else ""
-        ref_link = f' · <a href="{esc(debot["origin_ref"])}">🔗 Source</a>' if debot.get("origin_ref") else ""
+        type_tag = f"<i>[{esc(narrative_type)}]</i> " if narrative_type else ""
         prefix = f"📖 <b>Narrative:</b> {type_tag}"
         suffix = f"{ref_link}\n\n"
         max_orig_len = narrative_budget - len(prefix) - len(suffix)
@@ -8403,7 +8519,11 @@ async def _process_watchlist_token(token_address: str, info: dict[str, Any], now
     txns_24h = dex_info.get("txns_24h", 0)
     buys_24h = dex_info.get("buys_24h", 0)
     sells_24h = dex_info.get("sells_24h", 0)
-    image_url = dex_info.get("image_url")
+    image_url = dex_info.get("image_url") or info.get("image_url") or (_prev.get("image_url") if _prev else None)
+    if not image_url and is_stonkboard_token(token_address, info.get("platform")):
+        image_url = f"https://thestonkboard.com/api/logos/{token_address}"
+    if image_url:
+        info["image_url"] = image_url
     price_usd = dex_info.get("price_usd", 0.0)
     if market_cap > info["peak_market_cap"]:
         info["peak_market_cap"] = market_cap

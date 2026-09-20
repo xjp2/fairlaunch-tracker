@@ -2025,8 +2025,10 @@
     const caRow = ca ? `<div class="meta" style="font-family:monospace;font-size:10px;display:flex;align-items:center;gap:6px;margin:2px 0;"><span>CA:</span> <code style="background:rgba(255,255,255,0.06);padding:1px 5px;border-radius:3px;cursor:pointer;color:var(--text-bright);" onclick="navigator.clipboard.writeText('${ca}');this.textContent='Copied!';setTimeout(()=>this.textContent='${caShort}',1000);event.preventDefault();" title="Click to copy full CA: ${ca}">${caShort} 📋</code></div>` : "";
     const fomoUrl = (alert.links && alert.links.fomo) || (ca ? `https://fomo.family/tokens/${alert.chain || 'solana'}/${ca}` : "");
     const stonkUrl = (alert.links && alert.links.stonkboard) || (alert.is_stonkboard && ca ? `https://thestonkboard.com/coin/${ca}` : "");
+    const isStonk = (alert.platform || "").toLowerCase() === "stonkfun" || Boolean(alert.is_stonkboard) || Boolean(alert.links && alert.links.stonkboard);
+    const stonkBadge = isStonk ? `<span class="badge" style="background:#0284c7;color:#fff;font-weight:700;font-size:9px;padding:1px 5px;border-radius:3px;">📈 StonkFun</span>` : "";
     return `<a href="${href}" target="_blank" rel="noopener" style="text-decoration:none;color:inherit;">
-        <div class="title">${chainTag(alert.chain)} ${label} <span class="opp-score ${scoreClass(alert.opportunity_score)}">${alert.opportunity_score}</span>${badge} ${secBadge}</div>
+        <div class="title">${chainTag(alert.chain)} ${label} ${stonkBadge} <span class="opp-score ${scoreClass(alert.opportunity_score)}">${alert.opportunity_score}</span>${badge} ${secBadge}</div>
         ${caRow}
         <div class="meta">${fmtUsd(alert.market_cap_usd)} mcap &middot; vol ${fmtUsd(alert.volume_24h_usd)} &middot; ${fmtTime(alert.timestamp)}</div>
         <div class="meta" style="margin-top:4px;display:flex;gap:8px;font-size:11px;flex-wrap:wrap;align-items:center;">
@@ -2308,7 +2310,9 @@
         <span class="token-img-wrap">${tokenImageHtml(payload, 22)}</span>
         <div class="token-name-col">
           <span class="token-ticker" title="${payload.token_address}">$${ticker}</span>
-          <span class="token-platform">${payload.platform || "-"}</span>
+          ${((payload.platform || "").toLowerCase() === "stonkfun" || Boolean(payload.is_stonkboard) || Boolean(payload.links && payload.links.stonkboard))
+            ? '<span class="badge" style="background:#0284c7;color:#fff;font-weight:700;font-size:9px;padding:1px 5px;border-radius:3px;">📈 StonkFun</span>'
+            : `<span class="token-platform">${payload.platform || "-"}</span>`}
         </div>
       </div>
       <div class="dev-cell">
@@ -2804,7 +2808,7 @@
         <div class="jev-j-head">
           <span class="jev-j-tick">${link ? `<a href="${link}" target="_blank" rel="noopener">$${(j.ticker||"?")}</a>` : `$${(j.ticker||"?")}`}</span>
           ${ocBadge}
-          <span class="jev-j-meta">${(j.chain||"")}/${(j.platform||"")} · mcap $${Math.round(j.mcap_at_eval||0).toLocaleString()}</span>
+          <span class="jev-j-meta">${(j.chain||"")}/${((j.platform||"").toLowerCase() === "stonkfun" || Boolean(j.is_stonkboard)) ? "📈 StonkFun" : (j.platform||"")} · mcap $${Math.round(j.mcap_at_eval||0).toLocaleString()}</span>
           <span class="jev-j-verdict ${contribCls}" title="How much Jev's judgment moved this coin's 0-100 opportunity score.">${contribTxt}</span>
           <span class="jev-j-when">${when} · ${tokensUsed} tok</span>
         </div>
@@ -2857,9 +2861,11 @@
       const pct = (prob !== undefined && prob !== null) ? (prob * 100).toFixed(0) + "%" : "–";
       const link = c.links && (c.links.dexscreener || c.links.explorer);
       const addr = c.token_address ? c.token_address.slice(0, 4) + "…" + c.token_address.slice(-4) : "";
+      const isStonkPvp = (c.platform || "").toLowerCase() === "stonkfun" || Boolean(c.is_stonkboard);
+      const platStr = isStonkPvp ? "📈 StonkFun" : (c.platform || "");
       const coinCell = link
-        ? `<a href="${link}" target="_blank" rel="noopener">${c.platform}/${c.chain} <span class="jev-addr">${addr}</span></a>`
-        : `${c.platform}/${c.chain} <span class="jev-addr">${addr}</span>`;
+        ? `<a href="${link}" target="_blank" rel="noopener">${platStr}/${c.chain} <span class="jev-addr">${addr}</span></a>`
+        : `${platStr}/${c.chain} <span class="jev-addr">${addr}</span>`;
       return `<tr class="${isPick ? 'jev-pvp-row-pick' : ''}"><td>${isPick ? '🏆 ' : ''}${coinCell}</td><td>${ageMin}m old</td><td>$${Math.round(c.market_cap||0).toLocaleString()}</td><td>$${Math.round(c.volume_24h||0).toLocaleString()}</td><td>${pct}</td></tr>`;
     }).join("");
     const pickedCoin = cohort.find(c => c.token_address === p.picked_address);
@@ -2869,7 +2875,7 @@
       <div class="jev-judgment jev-pvp-card">
         <div class="jev-j-head">
           <span class="jev-j-tick">⚔️ PvP: ${tickHtml}</span>
-          <span class="jev-j-meta">${cohort.length} same-name coins · picked <b>${p.picked_platform||"none"}</b> · conf ${((p.confidence||0)*100).toFixed(0)}% · ${p.history_count||0} past &gt;$500k runner(s) as context</span>
+          <span class="jev-j-meta">${cohort.length} same-name coins · picked <b>${(p.picked_platform||"").toLowerCase() === "stonkfun" ? "📈 StonkFun" : (p.picked_platform||"none")}</b> · conf ${((p.confidence||0)*100).toFixed(0)}% · ${p.history_count||0} past &gt;$500k runner(s) as context</span>
           <span class="jev-j-when">${when} · ${p.model||""}</span>
         </div>
         ${p.reasoning ? `<div class="jev-pvp-reason">🧠 ${p.reasoning.replace(/</g,"&lt;")}</div>` : ""}
@@ -2954,6 +2960,7 @@
       return `<tr>
         <td style="text-align:left; white-space:nowrap;">
           <a href="${href}" target="_blank" rel="noopener" style="color:inherit; font-weight:600;">${chainTag(p.chain)} ${label}</a>
+          ${isStonk ? '<span class="badge" style="background:#0284c7;color:#fff;font-weight:700;font-size:9px;padding:1px 5px;border-radius:3px;margin-left:4px;">📈 StonkFun</span>' : ''}
           ${fomoUrl ? `<a href="${fomoUrl}" target="_blank" rel="noopener" style="font-size:10px;color:#c084fc;text-decoration:none;font-weight:700;margin-left:6px;" title="Research on FOMO.family">🦄 FOMO</a>` : ""}
           ${stonkUrl ? `<a href="${stonkUrl}" target="_blank" rel="noopener" style="font-size:10px;color:#38bdf8;text-decoration:none;font-weight:700;margin-left:4px;" title="Research on The Stonk Board">📈 Stonk</a>` : ""}
           ${caHtml}
@@ -3074,7 +3081,9 @@ Dev: ${p.dev_wallet}">
             ${tokenImageHtml(p, 24)}
             ${chainTag(p.chain)}
             <span style="font-size:12px;font-weight:800;">${label}</span>
-            <span style="color:var(--text-dim);font-size:10px;">${p.platform || "-"}</span>
+            ${isStonk 
+              ? '<span class="badge" style="background:#0284c7;color:#fff;font-weight:700;font-size:9px;padding:1px 5px;border-radius:3px;">📈 StonkFun</span>' 
+              : `<span style="color:var(--text-dim);font-size:10px;">${p.platform || "-"}</span>`}
           </div>
           <span class="opp-score ${scoreClass(p.opportunity_score)}">${p.opportunity_score} pts</span>
         </div>
@@ -3178,7 +3187,9 @@ Dev: ${p.dev_wallet}">
             ${tokenImageHtml(p, 24)}
             ${chainTag(p.chain)}
             <span style="font-size:12px;font-weight:800;">${label}</span>
-            <span style="color:var(--text-dim);font-size:10px;">${p.platform || "-"}</span>
+            ${isStonk 
+              ? '<span class="badge" style="background:#0284c7;color:#fff;font-weight:700;font-size:9px;padding:1px 5px;border-radius:3px;">📈 StonkFun</span>' 
+              : `<span style="color:var(--text-dim);font-size:10px;">${p.platform || "-"}</span>`}
           </div>
           <span class="opp-score ${scoreClass(p.early_momentum_score)}">${p.early_momentum_score} pts</span>
         </div>
