@@ -6964,20 +6964,47 @@ def _clean_signal_reason(r: Any) -> str:
 
 def _fit_telegram_caption(text: str, max_len: int = 1024) -> str:
     """Guarantees a Telegram HTML message or photo caption stays within max_len (1024).
-    Progressively trims non-essential trailing sections without breaking open HTML tags."""
+    Trims narrative text or secondary signals if needed, NEVER drops Research links or CA."""
     text = text.strip()
     if len(text) <= max_len:
         return text
-    paras = text.split("\n\n")
-    while len("\n\n".join(paras)) > max_len and len(paras) > 3:
-        paras.pop()
-    res = "\n\n".join(paras).strip()
-    if len(res) <= max_len:
-        return res
-    clean = re.sub(r"<[^>]+>", "", text)
-    if len(clean) > max_len:
-        clean = clean[:max_len - 3] + "..."
-    return clean
+
+    # If over length, locate Narrative block and shorten it
+    if "📖 <b>Narrative:</b>" in text:
+        paras = text.split("\n\n")
+        for idx, p in enumerate(paras):
+            if "📖 <b>Narrative:</b>" in p:
+                over = len(text) - max_len
+                if len(p) > over + 35:
+                    if "· <a" in p:
+                        prefix, link = p.split("· <a", 1)
+                        link = "· <a" + link
+                        trim_amount = over + 5
+                        new_prefix = prefix[:max(20, len(prefix) - trim_amount)].rsplit(' ', 1)[0] + "..."
+                        paras[idx] = f"{new_prefix} {link}"
+                    else:
+                        paras[idx] = p[:len(p) - over - 5].rsplit(' ', 1)[0] + "..."
+                else:
+                    paras.pop(idx)
+                break
+        res = "\n\n".join(paras).strip()
+        if len(res) <= max_len:
+            return res
+
+    # If still over, drop 1 signal bullet if more than 1 bullet exists
+    if "💡 <b>Key Signals:</b>" in text:
+        paras = text.split("\n\n")
+        for idx, p in enumerate(paras):
+            if "💡 <b>Key Signals:</b>" in p:
+                lines = p.split("\n")
+                if len(lines) > 2:
+                    paras[idx] = "\n".join(lines[:2])
+                break
+        res = "\n\n".join(paras).strip()
+        if len(res) <= max_len:
+            return res
+
+    return text[:max_len]
 
 
 def _format_telegram_opportunity_message(entry: dict[str, Any]) -> str:
@@ -7033,18 +7060,16 @@ def _format_telegram_opportunity_message(entry: dict[str, Any]) -> str:
     else:
         tax_str = "0% / 0%"
 
-    # DeBot narrative origin
-    debot = entry.get("debot") or {}
-    origin_text = debot.get("origin_text")
-    debot_line = ""
-    if origin_text:
-        clean_orig = origin_text.strip()
-        if len(clean_orig) > 105:
-            clean_orig = clean_orig[:102] + "..."
-        ntype = debot.get("narrative_type")
-        type_tag = f"<i>[{esc(ntype)}]</i> " if ntype else ""
-        ref_link = f' · <a href="{esc(debot["origin_ref"])}">🔗 Source</a>' if debot.get("origin_ref") else ""
-        debot_line = f"📖 <b>Narrative:</b> {type_tag}{esc(clean_orig)}{ref_link}\n\n"
+    header_block = (
+        f"🎯 <b>${esc(ticker)}</b>\n"
+        f"🪐 <b>Platform:</b> {esc(chain)} • {esc(platform)}\n\n"
+        f"📋 <b>CA:</b> <i>(tap to copy)</i>\n"
+        f"<pre><code>{esc(token_address)}</code></pre>\n\n"
+        f"💰 <b>MCap:</b> {mcap_str}  │  💧 <b>Liq:</b> {liq_str}\n"
+        f"📊 <b>Vol 24h:</b> {vol_str}  <i>({buys_24h}B / {sells_24h}S)</i>\n"
+        f"👥 <b>Holders:</b> {holders_str}  │  🧑‍💻 <b>Dev:</b> {dev_str}\n"
+        f"🛡️ <b>Security:</b> {esc(clean_gp)}  │  💸 <b>Tax:</b> {esc(tax_str)}\n\n"
+    )
 
     # Key driving signals as neat bullet points (top 2 for high signal & guaranteed fit)
     reasons = entry.get("score_reasons") or []
@@ -7056,9 +7081,9 @@ def _format_telegram_opportunity_message(entry: dict[str, Any]) -> str:
         signal_bullets.append(f"• {esc(cleaned)}")
     if not signal_bullets:
         signal_bullets.append("• Strong launch momentum & volume activity")
-    signals_block = "\n".join(signal_bullets[:2])
+    signals_block = "💡 <b>Key Signals:</b>\n" + "\n".join(signal_bullets[:2]) + "\n\n"
 
-    # Research links
+    # Research links (MUST ALWAYS BE INCLUDED)
     links = entry.get("links") or {}
     dex_url = links.get("dexscreener") or links.get("explorer")
     fomo_url = links.get("fomo")
@@ -7081,6 +7106,7 @@ def _format_telegram_opportunity_message(entry: dict[str, Any]) -> str:
     if stonk_url:
         research_items.append(f'<a href="{esc(stonk_url)}">📈 StonkBoard</a>')
     research_str = " │ ".join(research_items) if research_items else (f'<a href="{esc(dex_url)}">📊 DexScreener</a>' if dex_url else "None")
+    research_block = f"🔗 <b>Research:</b> {research_str}"
 
     # Social channels (only appended if at least one exists)
     soc_links = entry.get("socials") or {}
@@ -7097,23 +7123,31 @@ def _format_telegram_opportunity_message(entry: dict[str, Any]) -> str:
     if web_url:
         soc_items.append(f'<a href="{esc(web_url)}">🌐 Web</a>')
     socials_str = " │ ".join(soc_items) if soc_items else ""
+    socials_block = f"\n🌐 <b>Socials:</b> {socials_str}" if socials_str else ""
 
-    text = (
-        f"🎯 <b>${esc(ticker)}</b>\n"
-        f"🪐 <b>Platform:</b> {esc(chain)} • {esc(platform)}\n\n"
-        f"📋 <b>CA:</b> <i>(tap to copy)</i>\n"
-        f"<pre><code>{esc(token_address)}</code></pre>\n\n"
-        f"💰 <b>MCap:</b> {mcap_str}  │  💧 <b>Liq:</b> {liq_str}\n"
-        f"📊 <b>Vol 24h:</b> {vol_str}  <i>({buys_24h}B / {sells_24h}S)</i>\n"
-        f"👥 <b>Holders:</b> {holders_str}  │  🧑‍💻 <b>Dev:</b> {dev_str}\n"
-        f"🛡️ <b>Security:</b> {esc(clean_gp)}  │  💸 <b>Tax:</b> {esc(tax_str)}\n\n"
-        f"{debot_line}"
-        f"💡 <b>Key Signals:</b>\n"
-        f"{signals_block}\n\n"
-        f"🔗 <b>Research:</b> {research_str}"
-    )
-    if soc_items:
-        text += f"\n🌐 <b>Socials:</b> {socials_str}"
+    # Dynamically budget space for DeBot Narrative so Research and Socials NEVER get squeezed out
+    fixed_len = len(header_block) + len(signals_block) + len(research_block) + len(socials_block)
+    max_total = 1010
+    narrative_budget = max_total - fixed_len
+
+    debot = entry.get("debot") or {}
+    origin_text = (debot.get("origin_text") or "").strip()
+    debot_line = ""
+    if origin_text and narrative_budget > 60:
+        ntype = debot.get("narrative_type")
+        type_tag = f"<i>[{esc(ntype)}]</i> " if ntype else ""
+        ref_link = f' · <a href="{esc(debot["origin_ref"])}">🔗 Source</a>' if debot.get("origin_ref") else ""
+        prefix = f"📖 <b>Narrative:</b> {type_tag}"
+        suffix = f"{ref_link}\n\n"
+        max_orig_len = narrative_budget - len(prefix) - len(suffix)
+        if max_orig_len > 15:
+            if len(origin_text) > max_orig_len:
+                clean_orig = origin_text[:max_orig_len - 3].rsplit(' ', 1)[0] + "..."
+            else:
+                clean_orig = origin_text
+            debot_line = f"{prefix}{esc(clean_orig)}{suffix}"
+
+    text = header_block + debot_line + signals_block + research_block + socials_block
     return _fit_telegram_caption(text.strip(), max_len=1024)
 
 
@@ -7159,18 +7193,16 @@ def _format_telegram_early_momentum_message(entry: dict[str, Any]) -> str:
     else:
         tax_str = "0% / 0%"
 
-    # DeBot narrative origin
-    debot = entry.get("debot") or {}
-    origin_text = debot.get("origin_text")
-    debot_line = ""
-    if origin_text:
-        clean_orig = origin_text.strip()
-        if len(clean_orig) > 105:
-            clean_orig = clean_orig[:102] + "..."
-        ntype = debot.get("narrative_type")
-        type_tag = f"<i>[{esc(ntype)}]</i> " if ntype else ""
-        ref_link = f' · <a href="{esc(debot["origin_ref"])}">🔗 Source</a>' if debot.get("origin_ref") else ""
-        debot_line = f"📖 <b>Narrative:</b> {type_tag}{esc(clean_orig)}{ref_link}\n\n"
+    header_block = (
+        f"⚡ <b>Early Momentum: ${esc(ticker)}</b>\n"
+        f"🪐 <b>Platform:</b> {esc(chain)} • {esc(platform)}\n\n"
+        f"📋 <b>CA:</b> <i>(tap to copy)</i>\n"
+        f"<pre><code>{esc(token_address)}</code></pre>\n\n"
+        f"💰 <b>MCap:</b> {mcap_str}  │  💧 <b>Liq:</b> {liq_str}\n"
+        f"📊 <b>Vol 24h:</b> {vol_str}  <i>({buys_24h}B / {sells_24h}S)</i>\n"
+        f"👥 <b>Holders:</b> {holders_str}  │  🧑‍💻 <b>Dev:</b> {dev_str}\n"
+        f"🛡️ <b>Security:</b> {esc(clean_gp)}  │  💸 <b>Tax:</b> {esc(tax_str)}\n\n"
+    )
 
     reasons = entry.get("early_momentum_reasons") or []
     signal_bullets = []
@@ -7181,7 +7213,7 @@ def _format_telegram_early_momentum_message(entry: dict[str, Any]) -> str:
         signal_bullets.append(f"• {esc(cleaned)}")
     if not signal_bullets:
         signal_bullets.append("• Early breakout volume surge & velocity")
-    signals_block = "\n".join(signal_bullets[:2])
+    signals_block = "💡 <b>Key Signals:</b>\n" + "\n".join(signal_bullets[:2]) + "\n\n"
 
     links = entry.get("links") or {}
     dex_url = links.get("dexscreener") or links.get("explorer")
@@ -7205,6 +7237,7 @@ def _format_telegram_early_momentum_message(entry: dict[str, Any]) -> str:
     if stonk_url:
         research_items.append(f'<a href="{esc(stonk_url)}">📈 StonkBoard</a>')
     research_str = " │ ".join(research_items) if research_items else (f'<a href="{esc(dex_url)}">📊 DexScreener</a>' if dex_url else "None")
+    research_block = f"🔗 <b>Research:</b> {research_str}"
 
     soc_links = entry.get("socials") or {}
     soc_items = []
@@ -7220,23 +7253,31 @@ def _format_telegram_early_momentum_message(entry: dict[str, Any]) -> str:
     if web_url:
         soc_items.append(f'<a href="{esc(web_url)}">🌐 Web</a>')
     socials_str = " │ ".join(soc_items) if soc_items else ""
+    socials_block = f"\n🌐 <b>Socials:</b> {socials_str}" if socials_str else ""
 
-    text = (
-        f"⚡ <b>Early Momentum: ${esc(ticker)}</b>\n"
-        f"🪐 <b>Platform:</b> {esc(chain)} • {esc(platform)}\n\n"
-        f"📋 <b>CA:</b> <i>(tap to copy)</i>\n"
-        f"<pre><code>{esc(token_address)}</code></pre>\n\n"
-        f"💰 <b>MCap:</b> {mcap_str}  │  💧 <b>Liq:</b> {liq_str}\n"
-        f"📊 <b>Vol 24h:</b> {vol_str}  <i>({buys_24h}B / {sells_24h}S)</i>\n"
-        f"👥 <b>Holders:</b> {holders_str}  │  🧑‍💻 <b>Dev:</b> {dev_str}\n"
-        f"🛡️ <b>Security:</b> {esc(clean_gp)}  │  💸 <b>Tax:</b> {esc(tax_str)}\n\n"
-        f"{debot_line}"
-        f"💡 <b>Key Signals:</b>\n"
-        f"{signals_block}\n\n"
-        f"🔗 <b>Research:</b> {research_str}"
-    )
-    if soc_items:
-        text += f"\n🌐 <b>Socials:</b> {socials_str}"
+    # Dynamically budget space for DeBot Narrative so Research and Socials NEVER get squeezed out
+    fixed_len = len(header_block) + len(signals_block) + len(research_block) + len(socials_block)
+    max_total = 1010
+    narrative_budget = max_total - fixed_len
+
+    debot = entry.get("debot") or {}
+    origin_text = (debot.get("origin_text") or "").strip()
+    debot_line = ""
+    if origin_text and narrative_budget > 60:
+        ntype = debot.get("narrative_type")
+        type_tag = f"<i>[{esc(ntype)}]</i> " if ntype else ""
+        ref_link = f' · <a href="{esc(debot["origin_ref"])}">🔗 Source</a>' if debot.get("origin_ref") else ""
+        prefix = f"📖 <b>Narrative:</b> {type_tag}"
+        suffix = f"{ref_link}\n\n"
+        max_orig_len = narrative_budget - len(prefix) - len(suffix)
+        if max_orig_len > 15:
+            if len(origin_text) > max_orig_len:
+                clean_orig = origin_text[:max_orig_len - 3].rsplit(' ', 1)[0] + "..."
+            else:
+                clean_orig = origin_text
+            debot_line = f"{prefix}{esc(clean_orig)}{suffix}"
+
+    text = header_block + debot_line + signals_block + research_block + socials_block
     return _fit_telegram_caption(text.strip(), max_len=1024)
 
 
