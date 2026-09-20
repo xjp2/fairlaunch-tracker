@@ -1294,6 +1294,7 @@ RECENT_RUGS: deque = deque(maxlen=100)
 # vanish with no record it was ever flagged — this is the permanent log of
 # "every token that was ever flagged," independent of what happens to it after.
 RECENT_OPPORTUNITIES: deque = deque(maxlen=100)
+RECENT_SMART_MONEY: deque = deque(maxlen=100)
 
 
 # ============================================================================
@@ -3768,15 +3769,27 @@ async def evm_holder_ledger_listener(chain: str, ws_url: str) -> None:
         await client.close()
 
 
-async def estimate_solana_trade(client: JsonRpcWsClient, signature: str, wallet: str) -> tuple[Optional[str], float]:
-    """Fetch a confirmed Solana tx and estimate USD size of the wallet's largest token balance increase."""
+async def estimate_solana_trade(*args, **kwargs) -> tuple[Optional[str], float]:
+    """Fetch a confirmed Solana tx via HTTPS RPC and estimate USD size of the wallet's largest token balance increase."""
+    if len(args) == 3:
+        _, signature, wallet = args
+    elif len(args) == 2:
+        signature, wallet = args
+    else:
+        signature = kwargs.get("signature", "")
+        wallet = kwargs.get("wallet", "")
+
+    if not signature or not wallet:
+        return None, 0.0
+
     try:
-        resp = await client.call(
-            "getTransaction",
-            [signature, {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}],
-            timeout=20,
-        )
-        result = resp.get("result")
+        async with aiohttp.ClientSession() as session:
+            result = await _solana_rpc_post(
+                session,
+                "getTransaction",
+                [signature, {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0, "commitment": "confirmed"}],
+                timeout=12.0,
+            )
         if not result:
             return None, 0.0
         meta = result.get("meta", {}) or {}
@@ -3795,11 +3808,35 @@ async def estimate_solana_trade(client: JsonRpcWsClient, signature: str, wallet:
                 best_token = post_bal.get("mint")
         if not best_token or best_delta <= 0:
             return None, 0.0
+
+        trade_size_usd = 0.0
         price = await fetch_token_price_usd(best_token)
-        return best_token, best_delta * price
+        if price > 0:
+            trade_size_usd = best_delta * price
+        else:
+            # Fallback: estimate trade size from wallet's net SOL spent
+            try:
+                keys = result.get("transaction", {}).get("message", {}).get("accountKeys", [])
+                wallet_idx = None
+                for i, k in enumerate(keys):
+                    pk = k.get("pubkey") if isinstance(k, dict) else str(k)
+                    if pk == wallet:
+                        wallet_idx = i
+                        break
+                if wallet_idx is not None:
+                    pre_lamports = meta.get("preBalances", [])[wallet_idx] if wallet_idx < len(meta.get("preBalances", [])) else 0
+                    post_lamports = meta.get("postBalances", [])[wallet_idx] if wallet_idx < len(meta.get("postBalances", [])) else 0
+                    sol_spent = max(0.0, (pre_lamports - post_lamports) / 1e9)
+                    if sol_spent > 0.005:  # more than a network fee
+                        trade_size_usd = sol_spent * 150.0  # approximate SOL USD price
+            except Exception:
+                pass
+
+        return best_token, trade_size_usd
     except Exception as exc:
         logger.warning(f"[wallet/solana] failed to estimate trade for {signature}: {exc!r}")
         return None, 0.0
+
 
 
 # ============================================================================
@@ -5913,6 +5950,7 @@ async def persist_state() -> None:
         "recent_graduations": list(RECENT_GRADUATIONS),
         "recent_rugs": list(RECENT_RUGS),
         "recent_opportunities": list(RECENT_OPPORTUNITIES),
+        "recent_smart_money": list(RECENT_SMART_MONEY),
         "bundle_operator_history": dict(BUNDLE_OPERATOR_HISTORY),
         "bundle_operator_blacklist": list(BUNDLE_OPERATOR_BLACKLIST),
         "long_tail_watchlist": dict(LONG_TAIL_WATCHLIST),
@@ -5968,6 +6006,8 @@ def _load_state_sync() -> None:
         RECENT_GRADUATIONS.extend(loaded_graduations)
         loaded_rugs = saved.get("recent_rugs", [])
         RECENT_RUGS.extend(loaded_rugs)
+        loaded_smart_money = saved.get("recent_smart_money", [])
+        RECENT_SMART_MONEY.extend(loaded_smart_money)
         loaded_opportunities = saved.get("recent_opportunities", [])
         for opp in loaded_opportunities:
             addr = opp.get("token_address") or ""
@@ -6676,16 +6716,16 @@ async def process_wallet_buy_event(
 
     c_result = await stage_c_smart_money(wallet_address, token_address, chain, trade_size_usd, ts)
 
-    await broadcast_smart_money_activity(
-        {
-            "wallet": wallet_address,
-            "alias": wallet_info["alias"],
-            "chain": chain,
-            "token_address": token_address,
-            "trade_size_usd": trade_size_usd,
-            "timestamp": ts,
-        }
-    )
+    event_payload = {
+        "wallet": wallet_address,
+        "alias": wallet_info["alias"],
+        "chain": chain,
+        "token_address": token_address,
+        "trade_size_usd": trade_size_usd,
+        "timestamp": ts,
+    }
+    RECENT_SMART_MONEY.append(event_payload)
+    await broadcast_smart_money_activity(event_payload)
 
     if c_result["conviction_alert"]:
         add_token_signal(token_address, "CONVICTION_BUY")
@@ -7081,7 +7121,7 @@ async def handle_solana_wallet_log(client: JsonRpcWsClient, value: dict, tracked
     if not signature:
         return
     log_text = " ".join(logs)
-    is_swap_like = any(kw in log_text for kw in ("Buy", "buy", "Swap", "swap", "Trade", "trade"))
+    is_swap_like = any(kw in log_text for kw in ("Buy", "buy", "Swap", "swap", "Trade", "trade", "Route", "route", "Order", "order", "Fill", "fill"))
     if not is_swap_like:
         return
     # The wallet is resolved from the per-wallet subscription (the mentions
@@ -9374,6 +9414,7 @@ async def api_state() -> dict:
         "narratives": NARRATIVE_STATUS,
         "watchlist_size": len(TOKEN_WATCHLIST),
         "alert_count": len(ALERT_HISTORY),
+        "recent_smart_money": list(RECENT_SMART_MONEY)[-50:],
     }
 
 
@@ -9487,6 +9528,7 @@ async def dashboard_ws(websocket: WebSocket) -> None:
                 "recent_rugs": list(RECENT_RUGS)[-25:],
                 "mock_portfolio": _build_mock_portfolio_snapshot(),
                 "recent_opportunities": _refresh_opportunity_history_statuses()[-30:],
+                "recent_smart_money": list(RECENT_SMART_MONEY)[-50:],
                 "jev_stats": build_jev_stats(),
                 "description_feed": build_description_feed(),
             },

@@ -2213,16 +2213,29 @@
     sortNarrativeFeed();
   }
 
+  const seenSmartMoney = new Set();
   function renderSmartMoney(payload) {
+    if (!payload || !payload.wallet) return;
+    const key = `${payload.wallet}:${payload.token_address}:${payload.timestamp}`;
+    if (seenSmartMoney.has(key)) return;
+    seenSmartMoney.add(key);
+
     clearEmpty(smartMoneyFeed);
     smartMoneyCount += 1;
     document.getElementById("smartmoney-count").textContent = smartMoneyCount;
 
     const card = document.createElement("div");
     card.className = "card severity-info";
+    const walletLink = payload.chain === "solana"
+      ? `https://solscan.io/account/${payload.wallet}`
+      : `https://basescan.org/address/${payload.wallet}`;
+    const tokenLink = payload.chain === "solana"
+      ? `https://solscan.io/token/${payload.token_address}`
+      : `https://basescan.org/token/${payload.token_address}`;
+
     card.innerHTML = `
-      <div class="title">${payload.alias || shortAddr(payload.wallet)}</div>
-      <div class="meta">${chainTag(payload.chain)} bought ${shortAddr(payload.token_address)}</div>
+      <div class="title"><a href="${walletLink}" target="_blank" rel="noopener noreferrer" style="color:inherit;text-decoration:none;font-weight:600;">${payload.alias || shortAddr(payload.wallet)}</a></div>
+      <div class="meta">${chainTag(payload.chain)} bought <a href="${tokenLink}" target="_blank" rel="noopener noreferrer" style="color:var(--text-muted);text-decoration:underline;">${shortAddr(payload.token_address)}</a></div>
       <div class="meta">${fmtUsd(payload.trade_size_usd)} &middot; ${fmtTime(payload.timestamp)}</div>
     `;
     smartMoneyFeed.prepend(card);
@@ -2230,6 +2243,7 @@
       smartMoneyFeed.removeChild(smartMoneyFeed.lastChild);
     }
   }
+
 
   const tokenStatusCounts = { ALL: 0, WATCHING: 0, GRADUATED: 0, RUGGED: 0, SKIPPED: 0, EXPIRED_WATCH: 0 };
   const tokenStatusOf = new Map(); // token_address -> current status, for tab counts + filtering
@@ -3363,6 +3377,7 @@ Dev: ${p.dev_wallet}">
     (payload.recent_rugs || []).forEach(renderOutcome);
     renderOpportunityHistoryList(payload.recent_opportunities || []);
     (payload.tokens || []).forEach(renderToken);
+    (payload.recent_smart_money || []).forEach(renderSmartMoney);
 
     Object.values(payload.narratives || {}).forEach(renderNarrative);
 
