@@ -117,6 +117,10 @@ SOLANA_WS_RPC_URL = os.getenv("SOLANA_WS_RPC_URL", "")  # e.g. a Helius/QuickNod
 # only ever softens an outage for cheap calls (getAccountInfo), not a fix for
 # a Helius plan that stays exhausted long-term.
 SOLANA_FALLBACK_RPC_URL = os.getenv("SOLANA_FALLBACK_RPC_URL", "https://api.mainnet-beta.solana.com")
+SOLANA_FALLBACK_WS_RPC_URL = os.getenv(
+    "SOLANA_FALLBACK_WS_RPC_URL",
+    SOLANA_FALLBACK_RPC_URL.replace("https://", "wss://").replace("http://", "ws://"),
+)
 
 # --- BNB Chain -----------------------------------------------------------
 BNB_WS_RPC_URL = os.getenv("BNB_WS_RPC_URL", "")  # e.g. a QuickNode/Ankr/Chainstack BSC WS endpoint
@@ -1037,8 +1041,10 @@ class JsonRpcWsClient:
     `next_notification()` for streamed events on the same socket.
     """
 
-    def __init__(self, url: str):
+    def __init__(self, url: str, fallback_url: Optional[str] = None):
         self.url = url
+        self.fallback_url = fallback_url
+        self.active_url = url
         self.ws: Optional[websockets.WebSocketClientProtocol] = None
         self._next_id = 0
         self._pending: dict[int, asyncio.Future] = {}
@@ -1046,10 +1052,29 @@ class JsonRpcWsClient:
         self._reader_task: Optional[asyncio.Task] = None
 
     async def connect(self) -> None:
-        self.ws = await websockets.connect(
-            self.url, ping_interval=20, ping_timeout=20, max_size=2 ** 23
-        )
-        self._reader_task = asyncio.create_task(self._reader())
+        urls_to_try = [self.url] if self.url else []
+        if self.fallback_url and self.fallback_url not in urls_to_try:
+            urls_to_try.append(self.fallback_url)
+        if not urls_to_try:
+            raise ValueError("No WS RPC URL provided")
+
+        last_exc: Optional[Exception] = None
+        for i, target_url in enumerate(urls_to_try):
+            try:
+                self.ws = await websockets.connect(
+                    target_url, ping_interval=20, ping_timeout=20, max_size=2 ** 23
+                )
+                self.active_url = target_url
+                self._reader_task = asyncio.create_task(self._reader())
+                if i > 0:
+                    logger.info(f"[JsonRpcWsClient] Connected to fallback WS RPC: {target_url}")
+                return
+            except Exception as exc:
+                last_exc = exc
+                if i == 0 and len(urls_to_try) > 1:
+                    logger.warning(f"[JsonRpcWsClient] Primary WS RPC failed: {exc!r}. Retrying on fallback: {urls_to_try[1]}")
+        if last_exc:
+            raise last_exc
 
     async def _reader(self) -> None:
         assert self.ws is not None
@@ -2138,6 +2163,7 @@ async def check_token_honeypot_and_whitelist(chain: str, token_address: str, ent
             entry["sell_whitelist"] = True
             entry["honeypot_reason"] = reason
         token_feed_upsert(token_address, goplus=res, is_honeypot=is_honeypot, sell_whitelist=sell_whitelist)
+    return res
 
 
 DEBOT_API_BASES = ["https://app.debot.ai", "https://debot.ai"]
@@ -6308,7 +6334,7 @@ async def solana_stonkfun_listener() -> None:
         logger.warning("[solana/stonkfun] SOLANA_WS_RPC_URL not configured; listener idle.")
         await asyncio.sleep(300)
         return
-    client = JsonRpcWsClient(SOLANA_WS_RPC_URL)
+    client = JsonRpcWsClient(SOLANA_WS_RPC_URL, fallback_url=SOLANA_FALLBACK_WS_RPC_URL)
     await client.connect()
     try:
         for account in STONKFUN_PLATFORM_CONFIGS:
@@ -6560,7 +6586,7 @@ async def solana_wallet_monitor() -> None:
         await asyncio.sleep(300)
         return
 
-    client = JsonRpcWsClient(SOLANA_WS_RPC_URL)
+    client = JsonRpcWsClient(SOLANA_WS_RPC_URL, fallback_url=SOLANA_FALLBACK_WS_RPC_URL)
     await client.connect()
     subscribed: set[str] = set()
     sub_to_wallet: dict[Any, str] = {}  # logsSubscribe subscription id -> wallet
@@ -7034,7 +7060,10 @@ def _format_telegram_opportunity_message(entry: dict[str, Any]) -> str:
     if holder_count is not None:
         holders_str = f"{holder_count}"
         if top_holder_pct is not None:
-            holders_str += f" (top {top_holder_pct:.1f}%)"
+            if top_holder_pct > 5.0:
+                holders_str += f" (⚠️ top {top_holder_pct:.1f}%)"
+            else:
+                holders_str += f" (top {top_holder_pct:.1f}%)"
     else:
         holders_str = "n/a"
 
@@ -7074,6 +7103,9 @@ def _format_telegram_opportunity_message(entry: dict[str, Any]) -> str:
     # Key driving signals as neat bullet points (top 2 for high signal & guaranteed fit)
     reasons = entry.get("score_reasons") or []
     signal_bullets = []
+    active_boosts = int((entry.get("socials") or {}).get("active_boosts") or 0)
+    if active_boosts > 0:
+        signal_bullets.append(f"• ⚡ Paid DexScreener Boosts ({active_boosts}x)")
     for r in reasons:
         cleaned = _clean_signal_reason(r)
         if not cleaned or any(x in cleaned for x in ["Ticker not yet resolved", "Volume/mcap ratio", "Contract suffix", "Not from a launchpad"]):
@@ -7175,7 +7207,10 @@ def _format_telegram_early_momentum_message(entry: dict[str, Any]) -> str:
     top_holder_pct = entry.get("top_holder_pct")
     holders_str = f"{holder_count}" if holder_count is not None else "n/a"
     if holder_count is not None and top_holder_pct is not None:
-        holders_str += f" (top {top_holder_pct:.1f}%)"
+        if top_holder_pct > 5.0:
+            holders_str += f" (⚠️ top {top_holder_pct:.1f}%)"
+        else:
+            holders_str += f" (top {top_holder_pct:.1f}%)"
 
     dev_alias = entry.get("dev_alias") or (esc(entry.get("dev_wallet", ""))[:6] + "..." if entry.get("dev_wallet") else "Unknown")
     dev_moons = entry.get("dev_moons") or 0
@@ -7206,6 +7241,9 @@ def _format_telegram_early_momentum_message(entry: dict[str, Any]) -> str:
 
     reasons = entry.get("early_momentum_reasons") or []
     signal_bullets = []
+    active_boosts = int((entry.get("socials") or {}).get("active_boosts") or 0)
+    if active_boosts > 0:
+        signal_bullets.append(f"• ⚡ Paid DexScreener Boosts ({active_boosts}x)")
     for r in reasons:
         cleaned = _clean_signal_reason(r)
         if not cleaned or any(x in cleaned for x in ["Ticker not yet resolved", "Volume/mcap ratio", "Contract suffix", "Not from a launchpad"]):
@@ -7282,7 +7320,48 @@ def _format_telegram_early_momentum_message(entry: dict[str, Any]) -> str:
 
 
 
-async def send_telegram_message(text: str, photo_url: Optional[str] = None) -> None:
+def _build_telegram_reply_markup(chain: str, token_address: str, platform: Optional[str] = None) -> Optional[dict[str, Any]]:
+    chain_norm = (chain or "solana").lower()
+    inline_keyboard: list[list[dict[str, str]]] = []
+    if chain_norm == "solana":
+        row1 = [
+            {"text": "⚡ Photon", "url": f"https://photon-sol.tinyastro.io/en/lp/{token_address}"},
+            {"text": "🎯 Trojan", "url": f"https://t.me/solana_trojanbot?start=r-snipe_{token_address}"},
+            {"text": "🐂 BullX", "url": f"https://neo.bullx.io/terminal?chainId=1399811149&address={token_address}"},
+        ]
+        row2 = [
+            {"text": "📊 DexScreener", "url": f"https://dexscreener.com/solana/{token_address}"},
+        ]
+        if (platform or "").lower() == "pump.fun" or token_address.lower().endswith("pump"):
+            row2.insert(0, {"text": "💊 Pump.fun", "url": f"https://pump.fun/coin/{token_address}"})
+        else:
+            row2.insert(0, {"text": "🦄 Raydium", "url": f"https://raydium.io/swap/?inputMint=sol&outputMint={token_address}"})
+        inline_keyboard = [row1, row2]
+    elif chain_norm in ("bnb", "bsc"):
+        row1 = [
+            {"text": "🥞 PancakeSwap", "url": f"https://pancakeswap.finance/swap?outputCurrency={token_address}"},
+            {"text": "📊 DexScreener", "url": f"https://dexscreener.com/bsc/{token_address}"},
+        ]
+        row2 = []
+        if (platform or "").lower() == "four.meme" or token_address.lower().endswith("4444"):
+            row2.append({"text": "4️⃣ four.meme", "url": f"https://four.meme/token/{token_address}"})
+        elif (platform or "").lower() == "flap.sh" or token_address.lower().endswith("7777"):
+            row2.append({"text": "🥞 flap.sh", "url": f"https://flap.sh/{token_address}"})
+        row2.append({"text": "🔍 BscScan", "url": f"https://bscscan.com/token/{token_address}"})
+        inline_keyboard = [row1, row2]
+    elif chain_norm == "robinhood":
+        inline_keyboard = [
+            [
+                {"text": "📊 DexScreener", "url": f"https://dexscreener.com/robinhood/{token_address}"},
+                {"text": "🔍 Explorer", "url": f"https://robinhoodchain.blockscout.com/token/{token_address}"},
+            ]
+        ]
+    return {"inline_keyboard": inline_keyboard} if inline_keyboard else None
+
+
+async def send_telegram_message(
+    text: str, photo_url: Optional[str] = None, reply_markup: Optional[dict[str, Any]] = None
+) -> None:
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return
     chat_ids = [c.strip() for c in TELEGRAM_CHAT_ID.split(",") if c.strip()]
@@ -7294,9 +7373,17 @@ async def send_telegram_message(text: str, photo_url: Optional[str] = None) -> N
                 sent = False
                 if photo_url:
                     caption = _fit_telegram_caption(text, max_len=1024)
+                    payload: dict[str, Any] = {
+                        "chat_id": cid,
+                        "photo": photo_url,
+                        "caption": caption,
+                        "parse_mode": "HTML",
+                    }
+                    if reply_markup:
+                        payload["reply_markup"] = reply_markup
                     resp_photo = await session.post(
                         f"{TELEGRAM_API_BASE}/bot{TELEGRAM_BOT_TOKEN}/sendPhoto",
-                        json={"chat_id": cid, "photo": photo_url, "caption": caption, "parse_mode": "HTML"},
+                        json=payload,
                         timeout=aiohttp.ClientTimeout(total=15),
                     )
                     if resp_photo.status == 200:
@@ -7305,9 +7392,17 @@ async def send_telegram_message(text: str, photo_url: Optional[str] = None) -> N
                         body = await resp_photo.text()
                         logger.debug(f"[telegram] sendPhoto to {cid} failed HTTP {resp_photo.status}, falling back to text: {body[:200]}")
                 if not sent:
+                    payload = {
+                        "chat_id": cid,
+                        "text": text[:4096],
+                        "parse_mode": "HTML",
+                        "disable_web_page_preview": True,
+                    }
+                    if reply_markup:
+                        payload["reply_markup"] = reply_markup
                     resp = await session.post(
                         f"{TELEGRAM_API_BASE}/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-                        json={"chat_id": cid, "text": text[:4096], "parse_mode": "HTML", "disable_web_page_preview": True},
+                        json=payload,
                         timeout=aiohttp.ClientTimeout(total=15),
                     )
                     if resp.status != 200:
@@ -7324,8 +7419,11 @@ async def telegram_sender_worker() -> None:
     Telegram's per-chat rate limit. Producers (see _rescore_token_and_maybe_ping)
     only ever enqueue, never call send_telegram_message directly."""
     while True:
-        text, photo_url = await TELEGRAM_SEND_QUEUE.get()
-        await send_telegram_message(text, photo_url)
+        item = await TELEGRAM_SEND_QUEUE.get()
+        text = item[0]
+        photo_url = item[1] if len(item) > 1 else None
+        reply_markup = item[2] if len(item) > 2 else None
+        await send_telegram_message(text, photo_url, reply_markup=reply_markup)
         await asyncio.sleep(TELEGRAM_MIN_SEND_INTERVAL_SECONDS)
 
 
@@ -7561,7 +7659,7 @@ async def _rescore_token_and_maybe_ping(token_address: str) -> None:
     # record it was ever flagged.
     if score > 0 and token_address not in OPPORTUNITY_RECORDED_TOKENS:
         # Pre-opportunity security verification (GoPlus & honeypot check)
-        sec = await check_token_honeypot_and_whitelist(entry.get("chain", "solana"), token_address, entry)
+        sec = (await check_token_honeypot_and_whitelist(entry.get("chain", "solana"), token_address, entry)) or {}
         if sec.get("is_honeypot") or sec.get("sell_whitelist"):
             hp_reason = sec.get("reason") or "Sell whitelist / honeypot detected"
             entry["is_honeypot"] = True
@@ -7625,7 +7723,8 @@ async def _rescore_token_and_maybe_ping(token_address: str) -> None:
         if entry.get("debot") is None:
             entry["debot"] = await fetch_debot_story(token_address)
         text = _format_telegram_opportunity_message(entry)
-        TELEGRAM_SEND_QUEUE.put_nowait((text, entry.get("image_url")))
+        markup = _build_telegram_reply_markup(entry.get("chain", "solana"), token_address, entry.get("platform"))
+        TELEGRAM_SEND_QUEUE.put_nowait((text, entry.get("image_url"), markup))
 
     # Early Momentum ping — disabled by default, only opportunity calls are sent
     if TELEGRAM_SEND_EARLY_MOMENTUM:
@@ -7649,7 +7748,8 @@ async def _rescore_token_and_maybe_ping(token_address: str) -> None:
             if entry.get("debot") is None:
                 entry["debot"] = await fetch_debot_story(token_address)
             early_text = _format_telegram_early_momentum_message(entry)
-            TELEGRAM_SEND_QUEUE.put_nowait((early_text, entry.get("image_url")))
+            markup = _build_telegram_reply_markup(entry.get("chain", "solana"), token_address, entry.get("platform"))
+            TELEGRAM_SEND_QUEUE.put_nowait((early_text, entry.get("image_url"), markup))
 
 
 TOP_HOLDER_SELL_DROP_RATIO = 0.9  # same top holder's balance falling below 90% of its last-seen value counts as "selling down"
@@ -7699,7 +7799,7 @@ async def _maybe_refresh_holder_stats(token_address: str, info: dict[str, Any], 
 
     chain = info["chain"]
     if chain == "solana":
-        holder_stats = await fetch_solana_holder_stats(token_address)
+        holder_stats = (await fetch_solana_holder_stats(token_address)) or {}
         # Fallback: only when the RPC scan returned no holders AND this is a real
         # candidate worth a Birdeye call (mcap at/above the Jev floor) — cached so
         # it doesn't re-fetch every 60s. Protects the free quota.
@@ -7711,7 +7811,7 @@ async def _maybe_refresh_holder_stats(token_address: str, info: dict[str, Any], 
             if be:
                 holder_stats.update(be)
     elif chain in ("bnb", "robinhood"):
-        holder_stats = _evm_holder_stats_from_ledger(token_address)
+        holder_stats = _evm_holder_stats_from_ledger(token_address) or {}
     else:
         return
 
@@ -7731,7 +7831,7 @@ async def _maybe_refresh_holder_stats(token_address: str, info: dict[str, Any], 
         await _kick_out_watchlist_token(token_address, info, now, "HONEYPOT_SELL_WHITELIST", f"SKIPPED - {hp_reason.upper()}")
         return
 
-    sec = await check_token_honeypot_and_whitelist(chain, token_address, info)
+    sec = (await check_token_honeypot_and_whitelist(chain, token_address, info)) or {}
     if (sec.get("is_honeypot") or sec.get("sell_whitelist")) and info["status"] == "WATCHING":
         hp_reason = sec.get("reason") or "Sell whitelist / honeypot detected"
         info["is_honeypot"] = True
@@ -7971,7 +8071,7 @@ async def _process_watchlist_token(token_address: str, info: dict[str, Any], now
             return
         info["terminal_last_polled_at"] = now
 
-    dex_info = await fetch_dexscreener_info(token_address)
+    dex_info = (await fetch_dexscreener_info(token_address)) or {}
     market_cap = dex_info.get("market_cap", 0.0)
     # Birdeye enrichment for real Solana candidates: fill price/mcap/liquidity/vol
     # that DexScreener is MISSING (not just when mcap is 0 — DexScreener often has
