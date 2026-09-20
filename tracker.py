@@ -70,6 +70,7 @@ import struct
 import time
 from collections import defaultdict, deque
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from typing import Any, Optional
 
 import aiohttp
@@ -2207,6 +2208,102 @@ async def fetch_debot_story(token_address: str) -> Optional[dict[str, Any]]:
     if len(DEBOT_STORY_CACHE) > 500:
         DEBOT_STORY_CACHE.pop(next(iter(DEBOT_STORY_CACHE)), None)
     return result
+
+
+TWITTER_VERIFY_CACHE: dict[str, dict[str, Any]] = {}
+TWITTER_VERIFY_CACHE_MAX = 1000
+TWITTER_VERIFY_CACHE_TTL = 21600.0  # 6 hours
+
+
+def extract_twitter_handle(url_or_handle: Optional[str]) -> Optional[str]:
+    """Extracts clean Twitter/X handle from a URL or raw string."""
+    if not url_or_handle:
+        return None
+    s = str(url_or_handle).strip()
+    m = re.search(r"(?:twitter\.com|x\.com)/([A-Za-z0-9_]{1,15})(?:/|\?|$)", s, re.IGNORECASE)
+    if m:
+        h = m.group(1)
+        if h.lower() not in ("i", "intent", "home", "explore", "search", "hashtag"):
+            return h
+    if s.startswith("@") and len(s) <= 16:
+        return s[1:]
+    if re.match(r"^[A-Za-z0-9_]{1,15}$", s):
+        return s
+    return None
+
+
+async def verify_twitter_quality(twitter_input: Optional[str]) -> tuple[bool, str, dict[str, Any]]:
+    """Verifies Twitter account criteria required for opportunity admission:
+    1. If no Twitter link is provided, passes (tokens without Twitter can still qualify).
+    2. If a Twitter link is provided, the account must be:
+       - Created within the last year (<= 365 days old)
+       - Have 0 historical username changes (verified via memory.lol)
+    Returns (is_valid, reason, metadata_dict)."""
+    if not twitter_input:
+        return True, "NO_TWITTER", {}
+
+    handle = extract_twitter_handle(twitter_input)
+    if not handle:
+        return False, "INVALID_TWITTER_LINK", {}
+
+    cache_key = handle.lower()
+    now = time.time()
+    cached = TWITTER_VERIFY_CACHE.get(cache_key)
+    if cached and (now - cached.get("cached_at", 0) < TWITTER_VERIFY_CACHE_TTL):
+        return cached["ok"], cached["reason"], cached.get("meta", {})
+
+    meta: dict[str, Any] = {"handle": handle}
+    timeout = aiohttp.ClientTimeout(total=6)
+    headers = {"User-Agent": "curl/8.5.0"}
+
+    async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
+        # 1. Check account creation age via vxTwitter
+        try:
+            async with session.get(f"https://api.vxtwitter.com/{handle}") as resp:
+                if resp.status == 404:
+                    res = (False, "TWITTER_ACCOUNT_NOT_FOUND_OR_SUSPENDED", meta)
+                    TWITTER_VERIFY_CACHE[cache_key] = {"ok": res[0], "reason": res[1], "meta": meta, "cached_at": now}
+                    return res
+                if resp.status == 200:
+                    data = await resp.json()
+                    created_str = data.get("created_at")
+                    if created_str:
+                        dt = datetime.strptime(created_str, "%a %b %d %H:%M:%S %z %Y")
+                        days_old = (datetime.now(timezone.utc) - dt).days
+                        meta["days_old"] = days_old
+                        meta["created_at"] = dt.strftime("%b %Y")
+                        meta["followers"] = data.get("followers_count", 0)
+
+                        if days_old > 365:
+                            reason = f"TWITTER_ACCOUNT_TOO_OLD ({days_old}d > 365d, created {meta['created_at']})"
+                            res = (False, reason, meta)
+                            TWITTER_VERIFY_CACHE[cache_key] = {"ok": res[0], "reason": res[1], "meta": meta, "cached_at": now}
+                            return res
+        except Exception as exc:
+            logger.debug(f"[twitter] age check for {handle} failed: {exc!r}")
+
+        # 2. Check username change history via memory.lol
+        try:
+            async with session.get(f"https://api.memory.lol/v1/tw/{handle}") as resp_mem:
+                if resp_mem.status == 200:
+                    data_mem = await resp_mem.json()
+                    accounts = data_mem.get("accounts") or []
+                    for acc in accounts:
+                        snames = acc.get("screen_names") or {}
+                        if len(snames) > 1:
+                            prior = ", ".join(snames.keys())
+                            reason = f"TWITTER_USERNAME_CHANGED ({len(snames)-1} changes: {prior})"
+                            res = (False, reason, meta)
+                            TWITTER_VERIFY_CACHE[cache_key] = {"ok": res[0], "reason": res[1], "meta": meta, "cached_at": now}
+                            return res
+        except Exception as exc:
+            logger.debug(f"[twitter] memory.lol check for {handle} failed: {exc!r}")
+
+    res = (True, "TWITTER_CLEAN", meta)
+    TWITTER_VERIFY_CACHE[cache_key] = {"ok": res[0], "reason": res[1], "meta": meta, "cached_at": now}
+    if len(TWITTER_VERIFY_CACHE) > TWITTER_VERIFY_CACHE_MAX:
+        TWITTER_VERIFY_CACHE.pop(next(iter(TWITTER_VERIFY_CACHE)), None)
+    return res
 
 
 
@@ -6992,7 +7089,9 @@ def _format_telegram_opportunity_message(entry: dict[str, Any]) -> str:
     tg_url = soc_links.get("telegram")
     web_url = soc_links.get("website")
     if tw_url:
-        soc_items.append(f'<a href="{esc(tw_url)}">🐦 X</a>')
+        tw_meta = entry.get("twitter_meta") or {}
+        tw_tag = f" ({tw_meta['created_at']})" if tw_meta.get("created_at") else ""
+        soc_items.append(f'<a href="{esc(tw_url)}">🐦 X{tw_tag}</a>')
     if tg_url:
         soc_items.append(f'<a href="{esc(tg_url)}">✈️ TG</a>')
     if web_url:
@@ -7113,7 +7212,9 @@ def _format_telegram_early_momentum_message(entry: dict[str, Any]) -> str:
     tg_url = soc_links.get("telegram")
     web_url = soc_links.get("website")
     if tw_url:
-        soc_items.append(f'<a href="{esc(tw_url)}">🐦 X</a>')
+        tw_meta = entry.get("twitter_meta") or {}
+        tw_tag = f" ({tw_meta['created_at']})" if tw_meta.get("created_at") else ""
+        soc_items.append(f'<a href="{esc(tw_url)}">🐦 X{tw_tag}</a>')
     if tg_url:
         soc_items.append(f'<a href="{esc(tg_url)}">✈️ TG</a>')
     if web_url:
@@ -7428,6 +7529,17 @@ async def _rescore_token_and_maybe_ping(token_address: str) -> None:
             await _kick_out_watchlist_token(token_address, entry, time.time(), "HONEYPOT_SELL_WHITELIST", f"SKIPPED - {hp_reason.upper()}")
             return
 
+        # Twitter quality verification:
+        # User rule: if token has Twitter, it MUST be < 1 year old (<= 365d) and have 0 username changes.
+        # Tokens without Twitter are allowed through. Anything else is blocked from opportunities & pings.
+        tw_url = (entry.get("socials") or {}).get("twitter") or (entry.get("links") or {}).get("twitter")
+        tw_ok, tw_reason, tw_meta = await verify_twitter_quality(tw_url)
+        if not tw_ok:
+            logger.info(f"ALERT SKIPPED: SKIPPED - {tw_reason} for {entry.get('ticker')} ({token_address})")
+            return
+        if tw_meta:
+            entry["twitter_meta"] = tw_meta
+
         _mark_opportunity_recorded(token_address)
         if token_address.lower().endswith("7777"):
             if not entry.get("platform") or entry.get("platform") in ("?", "unknown"):
@@ -7484,6 +7596,14 @@ async def _rescore_token_and_maybe_ping(token_address: str) -> None:
             and early_score >= TELEGRAM_EARLY_MOMENTUM_SCORE_THRESHOLD
             and EARLY_MOMENTUM_PING_MIN_MCAP_USD <= market_cap <= EARLY_MOMENTUM_PING_MAX_MCAP_USD
         ):
+            # Twitter quality verification for early momentum
+            tw_url = (entry.get("socials") or {}).get("twitter") or (entry.get("links") or {}).get("twitter")
+            tw_ok, tw_reason, tw_meta = await verify_twitter_quality(tw_url)
+            if not tw_ok:
+                logger.info(f"EARLY MOMENTUM SKIPPED: SKIPPED - {tw_reason} for {entry.get('ticker')} ({token_address})")
+                return
+            if tw_meta:
+                entry["twitter_meta"] = tw_meta
             _mark_telegram_early_pinged(token_address)
             if entry.get("debot") is None:
                 entry["debot"] = await fetch_debot_story(token_address)
