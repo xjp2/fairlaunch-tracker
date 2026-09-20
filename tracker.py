@@ -272,10 +272,151 @@ def is_launchpad_or_target_suffix(platform: Optional[str], token_address: str) -
 STONKBOARD_COIN_ADDRESSES: set[str] = set()
 STONKBOARD_LAST_SYNC_TS: float = 0.0
 
+# StonkFun pairs a new fair-launch memecoin (base token, e.g. NIU) against an
+# established stock token or crypto asset (quote token, e.g. ZEC, STONK, WBTC, USDC).
+# The user strictly wants the FIRST one (base token) — quote tokens must NEVER be
+# tracked, scored, recorded as big runners, or alerted on.
+STONKFUN_KNOWN_QUOTE_MINTS: set[str] = {
+    "XsbEhLAtcf6HdfpFZ5xEMdqW8nfAvcsP5bdudRLJzJp",  # AAPLx
+    "9cRCn9rGT8V2imeM2BaKs13yhMEais3ruM3rPvTGpump",  # ANSEM
+    "Pren1FvFX6J3E4kXhJuCiAD5aDmGEb7qJRncwA8Lkhw",  # ANTHROPIC
+    "bioJ9JTqW62MLz7UKHU69gtKhPpGi1BQhccj2kmSvUJ",  # BIO
+    "BPxxfRCXkUVhig4HS1Lh7kZqV6SPJhzfEk4x6fVBjPCy",  # BP
+    "CARDSccUMFKoPRZxt5vt3ksUbxEFEcnZ3H2pd3dKxYjp",  # CARDS
+    "Xs2yquAgsHByNzx68WJC55WHjHBvG9JsMB7CWjTLyPy",  # DFDV
+    "DKNGQFNGQmoBdXSRGKJ8tTu7uPDasw5JDcfMmWniNfow",  # DKNG
+    "DoGEV7LASBkQbibMc5k5vKnTZoMg423GpJ5QtJEGfm7R",  # DOGE
+    "FLWSojG1gB5VStYR3Sb4nQFRt43UBYkqih1j2CpVLqgd",  # FLWS
+    "Xsv9hRk1z5ystj9MhnA7Lq4vjSsLwzL2nxrwmwtD3re",  # GLDX
+    "GPRR2u6NS5yBQHWGauoJ9HXgjrTH8dDsrBfTV5zAYvDH",  # GPRO
+    "GRNDYDpqwpCm6jVxpbh4xT5AM4r3p391qYsKTHqgaET2",  # GRND
+    "98sMhvDwXj1RQi5c5Mndm3vPe9cBqPrbLaufMXFNMh5g",  # HYPE
+    "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN",  # JUP
+    "TKLSidmLVt3cqGaaodG8tyRzoANfQwoh67AccjmubeZ",  # KALSHI
+    "XsaBXg8dU5cPM6ehmVctMkVqoiRG2ZjMo1cyBJ3AykQ",  # KOX
+    "EicWvteVi2fWepEzS3FYWsnuPoP6caZfjnKqNvydLjCH",  # LIT
+    "XsqE9cRRpzxcGKDXj1BJ7Xmg4GRhZoyY1KpmGSxAWT2",  # MCDX
+    "XspzcW1PRtgf6Wj92HCiZdjzKCyFekVD8P5Ueh3dRMX",  # MSFTX
+    "XsP7xzNPvEHS1m6qfanPUGjNmdnmsLKEoNAnHjdxxyZ",  # MSTRX
+    "MUxEsUKSMACyw5fZf68wxf5FLnZVhtU9CwH8uNNGay1",  # MU
+    "ATBR4i19gcQ31Rfr7ymA2XvkCQEAkNFGBtVKTmdqpump",  # Machi
+    "3ZLekZYq2qkZiSpnSvabjit34tUkjSwD1JFuW9as9wBG",  # NEAR
+    "oPAiAikWTaFj9RYoRFD35ccfwhnMcB3ThgBZRHSkjTZ",  # OPENAI
+    "oreoU2P8bN6jkk3jbaiVxYnG1dCXcYxwhwyK9jSybcp",  # ORE
+    "2zMMhcVQEXDtdE6vsFS7S7D5oUodfJHE8vd1gnBouauv",  # PENGU
+    "Pre8AREmFPtoJFT8mQSXQLh56cwJmM7CFDRuoGBZiUP",  # POLYMARKET
+    "pumpCmXqMfrsAkQ5r49WcJnRayYRqmXz6ae8H7H9Dfn",  # PUMP
+    "4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R",  # RAY
+    "RDDTGbhHwVXfyCvQMXzzowKjf5qrYBZAnehoXW83ooh",  # RDDT
+    "BoTx8y9ynfdxf5ZjWtCoBVkff52qKA82ysaLU8ZM6d8T",  # ROBOSTRATEGY
+    "SiLVFMgD3eD2rgK628NbTBq9MnuJF5FW2CRaVyTB35L",  # SILVER
+    "SNDKbwMUQvZhnLnxLduradgLHG5KrPuKwpnrkkGRhfH",  # SNDK
+    "So11111111111111111111111111111111111111112",  # SOL
+    "Xs3oZwbHvqis4NYcf4YKWmEia2eC84wSiVrcYcTqpH8",  # SPCXX
+    "J3NKxxXZcnNiMjKw9hYb2K4LUxgwB6t1FtPtQVsv3KFr",  # SPX
+    "6GmAFSYs4gk3FDao5FzzySQpPZaWsa4rUJHacpMpUNgx",  # STONK
+    "Xs78JED6PFZxWc2wCEPspZW9kL3Se5J7L5TChKgsidH",  # STRCX
+    "SV151D5pjygAKA8aJJcKzm4wFnRX5G92Fye94jQJk7g",  # SV151
+    "taoC6xyv2v8tDLcev4uaGUgV4vdQsWJrGft2kcBRrBY",  # TAO
+    "TTWofwAge91oFhZs7kpQdyrVRkmevgM88xijGvQFbKo",  # TTWO
+    "uniHfuPhEQSrtpzXpJZDCSq53yaejKKpNhFUiKoHKHV",  # UNI
+    "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",  # USDC
+    "Dz9mQ9NzkBcCsuGPFJ3r1bS4wgqKMHBPiVuniW8Mbonk",  # USELESS
+    "XsfCC9VL4DamVGNgdJpfLXB3sBVa158Gbx8sh7NzmTk",  # VIDAX
+    "3NZ9JMVBmGAqocybic2c7LQCJScmgsAZ6vQqTDzcqmJh",  # WBTC
+    "7vfCXTUXx5WJV5JADk17DUJ4ksgau7utNKj4b963voxs",  # WETH
+    "2zCo6bUowJMvr89ajxuWsPadAqJ2F9akCkxumNsSdgsL",  # XBTC
+    "WXMRyRZhsa19ety5erZhHg4N3xj3EVN92u94422teJp",  # XMR
+    "A7bdiYdS5GjqGFtxf17ppRHtDKPkkRqbKtR27dxvQXaS",  # ZEC
+    "Ce2gx9KGXJ6C9Mp5b5x1sn9Mg87JwEbrQby4Zqo3pump",  # neet
+    "6UpQcMAb5xMzxc7ZfPaVMgx3KqsvKZdT5U718BzD5We2",  # wXRP
+    "4sWNB8zGWHkh6UnmwiEtzNxL4XrN7uK9tosbESbJFfVs",  # xSOL
+}
+STONKFUN_QUOTE_MINTS: set[str] = set(STONKFUN_KNOWN_QUOTE_MINTS)
+
+def purge_stonkfun_quote_tokens() -> int:
+    """Purges all StonkFun quote assets (collateral stock/crypto tokens like ZEC, STONK,
+    WBTC, USDC, SOL, etc.) from all active tracking structures.
+    StonkFun pairs fair-launch coins against these quote assets (e.g. NIU/ZEC) — we only ever want
+    the base token (first one), never the quote token (second one)."""
+    purged = 0
+    wl = globals().get("TOKEN_WATCHLIST")
+    feed = globals().get("TOKEN_FEED")
+    mock = globals().get("MOCK_PORTFOLIO")
+    stonk_addrs = globals().get("STONKBOARD_COIN_ADDRESSES")
+    long_tail = globals().get("LONG_TAIL_WATCHLIST")
+    seen = globals().get("BIG_RUNNERS_SEEN")
+    jev_log = globals().get("JEV_JUDGMENT_LOG")
+    jev_eval = globals().get("JEV_EVALUATED_TOKENS")
+    jev_screen = globals().get("JEV_SCREENED_TOKENS")
+    tg_pinged = globals().get("TELEGRAM_PINGED_TOKENS")
+    opp_rec = globals().get("OPPORTUNITY_RECORDED_TOKENS")
+
+    for qm in list(STONKFUN_QUOTE_MINTS):
+        if wl is not None and qm in wl:
+            del wl[qm]
+            purged += 1
+        if feed is not None and qm in feed:
+            del feed[qm]
+            purged += 1
+        if mock is not None and qm in mock:
+            del mock[qm]
+            purged += 1
+        if stonk_addrs is not None and qm in stonk_addrs:
+            stonk_addrs.discard(qm)
+            purged += 1
+        if long_tail is not None and qm in long_tail:
+            del long_tail[qm]
+            purged += 1
+        if seen is not None and qm in seen:
+            seen.discard(qm)
+            purged += 1
+        if jev_log is not None and qm in jev_log:
+            del jev_log[qm]
+            purged += 1
+        if jev_eval is not None and qm in jev_eval:
+            del jev_eval[qm]
+            purged += 1
+        if jev_screen is not None and qm in jev_screen:
+            del jev_screen[qm]
+            purged += 1
+        if tg_pinged is not None and qm in tg_pinged:
+            del tg_pinged[qm]
+            purged += 1
+        if opp_rec is not None and qm in opp_rec:
+            del opp_rec[qm]
+            purged += 1
+
+    # Clean from BIG_RUNNERS across all chains
+    big_runners = globals().get("BIG_RUNNERS")
+    if big_runners is not None:
+        for ch in ("solana", "bnb", "robinhood"):
+            runners = big_runners.get(ch, [])
+            new_runners = [r for r in runners if r.get("token_address") not in STONKFUN_QUOTE_MINTS]
+            if len(new_runners) != len(runners):
+                purged += (len(runners) - len(new_runners))
+                big_runners[ch] = new_runners
+
+    # Clean from RECENT_OPPORTUNITIES
+    recent_opps = globals().get("RECENT_OPPORTUNITIES")
+    if recent_opps is not None:
+        new_opps = deque([o for o in recent_opps if o.get("token_address") not in STONKFUN_QUOTE_MINTS], maxlen=recent_opps.maxlen)
+        if len(new_opps) != len(recent_opps):
+            purged += (len(recent_opps) - len(new_opps))
+            recent_opps.clear()
+            recent_opps.extend(new_opps)
+
+    if purged > 0:
+        logger.info(f"[stonkboard] Purged {purged} quote token leak(s) ($ZEC, $STONK, etc.) from active memory")
+    return purged
+
 def is_stonkboard_token(token_address: str, platform: Optional[str] = None, links: Optional[dict[str, Any]] = None) -> bool:
     """Checks if a coin is associated with TheStonkBoard (thestonkboard.com) —
-    either native to StonkFun, listed in TheStonkBoard cache, or has a verified StonkBoard link."""
+    either native to StonkFun, listed in TheStonkBoard cache, or has a verified StonkBoard link.
+    CRITICAL: Quote/collateral assets (e.g. ZEC, STONK, WBTC, USDC) are NEVER StonkBoard fair-launch coins."""
     if not token_address:
+        return False
+    if token_address in STONKFUN_QUOTE_MINTS:
         return False
     plat = (platform or "").lower().strip()
     if "stonkfun" in plat or "stonk" in plat:
@@ -288,7 +429,10 @@ def is_stonkboard_token(token_address: str, platform: Optional[str] = None, link
 
 async def sync_stonkboard_coins() -> None:
     """Scrapes token roster from https://thestonkboard.com so we know exactly
-    which tokens are visible on TheStonkBoard and ingests any newly discovered StonkFun coins."""
+    which tokens are visible on TheStonkBoard and ingests any newly discovered StonkFun coins.
+    CRITICAL: StonkFun pools are pairs of (baseToken, quoteToken). The baseToken is the
+    fair-launch meme coin (e.g. NIU), while quoteToken is the established stock/crypto collateral (e.g. ZEC).
+    We strictly ingest the baseToken (the first one) and record quote tokens to block them."""
     global STONKBOARD_LAST_SYNC_TS
     try:
         headers = {
@@ -298,43 +442,95 @@ async def sync_stonkboard_coins() -> None:
             async with session.get("https://thestonkboard.com", timeout=aiohttp.ClientTimeout(total=10)) as resp:
                 if resp.status == 200:
                     text = await resp.text()
-                    token_objs = re.findall(r'\{[^{}]*\"mint\":\"([1-9A-HJ-NP-Za-km-z]{32,44})\"[^{}]*\"symbol\":\"([^\"]+)\"[^{}]*\}', text)
-                    mints = set(re.findall(r'/coin/([1-9A-HJ-NP-Za-km-z]{32,44})', text))
-                    json_mints = set(re.findall(r'"mint":"([1-9A-HJ-NP-Za-km-z]{32,44})"', text))
-                    all_mints = mints | json_mints | {m for m, _ in token_objs}
-                    symbol_by_mint = {m: s for m, s in token_objs}
-                    
+                    coins: list[dict[str, Any]] = []
+                    scripts = re.findall(r"<script[^>]*>(.*?)</script>", text, re.DOTALL)
+                    for s in scripts:
+                        if "initialSnapshot" in s:
+                            try:
+                                data = json.loads(s)
+                                snapshot = data.get("initialSnapshot", {})
+                                coins = snapshot.get("coins", [])
+                                if coins:
+                                    break
+                            except Exception:
+                                pass
+
                     now = time.time()
                     newly_ingested = 0
-                    for mint in all_mints:
-                        STONKBOARD_COIN_ADDRESSES.add(mint)
-                        existing_wl = TOKEN_WATCHLIST.get(mint)
-                        if existing_wl and existing_wl.get("status") == "SKIPPED":
-                            dev_w = existing_wl.get("dev_wallet", "")
-                            if dev_w.startswith("stonkboard_"):
-                                existing_wl["status"] = "WATCHING"
-                                existing_wl["dev_decision"] = "PASS"
-                                if mint in TOKEN_FEED:
-                                    TOKEN_FEED[mint]["status"] = "WATCHING"
-                        elif mint not in TOKEN_FEED and mint not in TOKEN_WATCHLIST:
-                            sym = symbol_by_mint.get(mint, "UNKNOWN").strip().upper()
+
+                    if coins:
+                        base_mints = {c.get("mint") for c in coins if c.get("mint")}
+                        # 1. Update STONKFUN_QUOTE_MINTS with pure quote collateral tokens (tokens that are NOT base launches)
+                        for c in coins:
+                            q = c.get("quote", {})
+                            qm = q.get("mint")
+                            if qm and qm not in base_mints:
+                                STONKFUN_QUOTE_MINTS.add(qm)
+
+                        # 2. Ingest strictly the base tokens (c['mint'] — the FIRST token)
+                        for c in coins:
+                            mint = c.get("mint")
+                            if not mint:
+                                continue
+                            # Never ingest a pure quote asset (like ZEC, STONK, WBTC)
+                            if mint in STONKFUN_QUOTE_MINTS:
+                                continue
+
+                            STONKBOARD_COIN_ADDRESSES.add(mint)
+                            existing_wl = TOKEN_WATCHLIST.get(mint)
+                            if existing_wl and existing_wl.get("status") == "SKIPPED":
+                                dev_w = existing_wl.get("dev_wallet", "")
+                                if dev_w.startswith("stonkboard_"):
+                                    existing_wl["status"] = "WATCHING"
+                                    existing_wl["dev_decision"] = "PASS"
+                                    if mint in TOKEN_FEED:
+                                        TOKEN_FEED[mint]["status"] = "WATCHING"
+                            elif mint not in TOKEN_FEED and mint not in TOKEN_WATCHLIST:
+                                sym = (c.get("symbol") or "UNKNOWN").strip().upper()
+                                if sym and is_stock_style_ticker(sym):
+                                    continue
+                                if sym and ticker_is_invalid(sym)[0]:
+                                    continue
+                                await process_new_token_event(
+                                    chain="solana",
+                                    platform="stonkfun",
+                                    token_address=mint,
+                                    ticker_raw=sym,
+                                    dev_wallet=f"stonkboard_{mint[:8]}",
+                                    ts=now,
+                                    extra={"source": "thestonkboard.com", "name": c.get("name")},
+                                )
+                                newly_ingested += 1
+                    else:
+                        # Fallback regex if SSR JSON shape changed
+                        token_objs = re.findall(r'\{[^{}]*\"mint\":\"([1-9A-HJ-NP-Za-km-z]{32,44})\"[^{}]*\"symbol\":\"([^\"]+)\"[^{}]*\}', text)
+                        for mint, sym_raw in token_objs:
+                            if mint in STONKFUN_QUOTE_MINTS:
+                                continue
+                            STONKBOARD_COIN_ADDRESSES.add(mint)
+                            sym = sym_raw.strip().upper()
                             if sym and is_stock_style_ticker(sym):
                                 continue
                             if sym and ticker_is_invalid(sym)[0]:
                                 continue
-                            await process_new_token_event(
-                                chain="solana",
-                                platform="stonkfun",
-                                token_address=mint,
-                                ticker_raw=sym,
-                                dev_wallet=f"stonkboard_{mint[:8]}",
-                                ts=now,
-                                extra={"source": "thestonkboard.com"},
-                            )
-                            newly_ingested += 1
+                            if mint not in TOKEN_FEED and mint not in TOKEN_WATCHLIST:
+                                await process_new_token_event(
+                                    chain="solana",
+                                    platform="stonkfun",
+                                    token_address=mint,
+                                    ticker_raw=sym,
+                                    dev_wallet=f"stonkboard_{mint[:8]}",
+                                    ts=now,
+                                    extra={"source": "thestonkboard.com"},
+                                )
+                                newly_ingested += 1
+
+                    # Purge any quote tokens that may have leaked in
+                    purge_stonkfun_quote_tokens()
+
                     STONKBOARD_LAST_SYNC_TS = now
                     if newly_ingested > 0:
-                        logger.info(f"[stonkboard] Synced {len(all_mints)} tokens; ingested {newly_ingested} new StonkFun coins into live tracker & PvP pipeline")
+                        logger.info(f"[stonkboard] Synced {len(STONKBOARD_COIN_ADDRESSES)} base tokens; ingested {newly_ingested} new StonkFun base coins into live tracker & PvP pipeline")
     except Exception as exc:
         logger.debug(f"[stonkboard] Sync failed: {exc!r}")
 
@@ -1459,6 +1655,8 @@ async def fetch_dexscreener_info(token_address: str) -> dict[str, Any]:
     have) nor Blockscout (its API sits behind a Cloudflare bot-challenge that
     blocks non-browser requests, confirmed by testing it directly) are usable
     for that from a server-side process — holder count is not implemented."""
+    if token_address in STONKFUN_QUOTE_MINTS:
+        return {}
     url = f"{DEXSCREENER_API_BASE}/latest/dex/tokens/{token_address}"
     # DexScreener rate-limits high-frequency polling and intermittently returns
     # 429 or an empty pairs list even when the token HAS data — which used to get
@@ -1489,8 +1687,14 @@ async def fetch_dexscreener_info(token_address: str) -> dict[str, Any]:
     else:
         return {}
     try:
-        pairs.sort(key=lambda p: float((p.get("liquidity") or {}).get("usd") or 0), reverse=True)
-        best = pairs[0]
+        # Prefer pairs where token_address is the baseToken (we strictly want the first token of the pair!)
+        matching_base_pairs = [p for p in pairs if ((p.get("baseToken") or {}).get("address") or "").lower() == token_address.lower()]
+        if matching_base_pairs:
+            matching_base_pairs.sort(key=lambda p: float((p.get("liquidity") or {}).get("usd") or 0), reverse=True)
+            best = matching_base_pairs[0]
+        else:
+            pairs.sort(key=lambda p: float((p.get("liquidity") or {}).get("usd") or 0), reverse=True)
+            best = pairs[0]
         base = best.get("baseToken") or {}
         volume = best.get("volume") or {}
         txns_24h = (best.get("txns") or {}).get("h24") or {}
@@ -2509,16 +2713,22 @@ def is_stock_style_ticker(ticker: Optional[str]) -> bool:
 
 
 def is_probably_established_or_stock(
-    ticker: Optional[str], market_cap: float = 0.0, platform: Optional[str] = None
+    ticker: Optional[str],
+    market_cap: float = 0.0,
+    platform: Optional[str] = None,
+    token_address: Optional[str] = None,
 ) -> tuple[bool, str]:
-    """True + reason if this looks like an ALREADY-ESTABLISHED coin or a
-    tokenized stock rather than a genuine new fair-launch. Three signals:
-      - a known established symbol (HYPE, ZEC, BTC, ...) — case-insensitive
+    """True + reason if this looks like an ALREADY-ESTABLISHED coin, a StonkFun quote collateral token,
+    or a tokenized stock rather than a genuine new fair-launch. Four signals:
+      - token address is a known StonkFun quote/collateral asset (ZEC, STONK, WBTC, USDC, etc.)
+      - a known established symbol (HYPE, ZEC, BTC, ...) — case-insensitive (blocked unless fresh StonkFun base token)
       - the xStocks tokenized-equity pattern (MSTRx, AAPLx, ...)
       - an implausibly high mcap for something we're seeing as 'new'
-    NOTE: StonkFun tokens intentionally share meme tickers with real stocks;
-    they are allowed as long as they are fresh (mcap < $1M) and not xStocks.
+    NOTE: StonkFun pairs fair-launch coins against quote stock tokens (e.g. NIU/ZEC). The user ONLY
+    wants the first one (base token). Quote collateral tokens are 100% blocked regardless of platform.
     """
+    if token_address and token_address in STONKFUN_QUOTE_MINTS:
+        return True, f"'{ticker or 'token'}' ({token_address}) is a StonkFun quote collateral token (paired stock coin), not the fair-launch base token"
     if ticker:
         sym = ticker.strip().upper()
         if is_stock_style_ticker(ticker):
@@ -2543,7 +2753,12 @@ def purge_established_from_jev() -> int:
         pm = rec_or_a.get("peak_multiple")
         return pm is not None and pm > 1.2
     def _is_stock(rec_or_a):
-        est, _ = is_probably_established_or_stock(rec_or_a.get("ticker"), rec_or_a.get("mcap_at_eval") or 0.0)
+        est, _ = is_probably_established_or_stock(
+            rec_or_a.get("ticker"),
+            rec_or_a.get("mcap_at_eval") or 0.0,
+            platform=rec_or_a.get("platform"),
+            token_address=rec_or_a.get("token_address"),
+        )
         if est:
             return True
         # only the STRONG signal (xStocks pattern / blocklist via est above);
@@ -3514,6 +3729,8 @@ def jev_emit_event(event_type: str, *, ticker: Optional[str] = None,
 def record_big_runner_if_qualified(token_address: str, entry: dict[str, Any], peak_mcap: float) -> None:
     """Called on peak updates. Once a coin's peak crosses BIG_RUNNER_MCAP_USD,
     record it (once) into the per-chain history Jev compares new cohorts to."""
+    if token_address in STONKFUN_QUOTE_MINTS:
+        return
     if peak_mcap < BIG_RUNNER_MCAP_USD or token_address in BIG_RUNNERS_SEEN:
         return
     chain = entry.get("chain") or "?"
@@ -3888,7 +4105,12 @@ async def maybe_evaluate_token_with_jev(token_address: str, entry: dict[str, Any
         return
     # Safety net: never evaluate established coins / tokenized stocks even if one
     # leaked into the feed — these aren't new fair-launches (user doesn't want them).
-    est, est_reason = is_probably_established_or_stock(ticker, entry.get("market_cap") or 0.0, platform=entry.get("platform"))
+    est, est_reason = is_probably_established_or_stock(
+        ticker,
+        entry.get("market_cap") or 0.0,
+        platform=entry.get("platform"),
+        token_address=token_address,
+    )
     if est:
         jev_emit_event("skipped", ticker=ticker, token_address=token_address,
                        reason=f"not a new launch: {est_reason}")
@@ -5203,6 +5425,8 @@ async def run_discovery_scan() -> int:
         mcap = info.get("market_cap") or 0
         vol = info.get("volume_24h") or 0
         symbol = (info.get("symbol") or "").strip()
+        if addr in STONKFUN_QUOTE_MINTS:
+            continue
         if mcap < DISCOVERY_MIN_MCAP or vol < DISCOVERY_MIN_VOLUME_24H:
             continue
         if is_stonkboard_token(addr) and mcap > MAX_OPPORTUNITY_MARKET_CAP_USD:
@@ -5217,7 +5441,7 @@ async def run_discovery_scan() -> int:
             continue
         if ticker_is_invalid(symbol)[0]:
             continue
-        est, _ = is_probably_established_or_stock(symbol, mcap)
+        est, _ = is_probably_established_or_stock(symbol, mcap, token_address=addr)
         if est:
             continue
         # inject into the normal pipeline. dev_wallet unknown for discovered
@@ -5515,9 +5739,11 @@ def _load_state_sync() -> None:
         RECENT_RUGS.extend(loaded_rugs)
         loaded_opportunities = saved.get("recent_opportunities", [])
         for opp in loaded_opportunities:
+            addr = opp.get("token_address") or ""
+            if addr in STONKFUN_QUOTE_MINTS:
+                continue
             mc = opp.get("market_cap_usd") or 0.0
             plat = opp.get("platform")
-            addr = opp.get("token_address") or ""
             qualifies, _ = is_launchpad_or_target_suffix(plat, addr)
             is_stonk = is_stonkboard_token(addr, plat, opp.get("links"))
             mc_ok = (mc <= MAX_OPPORTUNITY_MARKET_CAP_USD) if is_stonk else (mc <= IMPLAUSIBLE_NEW_LAUNCH_MCAP_USD)
@@ -5529,18 +5755,24 @@ def _load_state_sync() -> None:
         BUNDLE_OPERATOR_BLACKLIST.update(saved.get("bundle_operator_blacklist", []))
         loaded_long_tail = saved.get("long_tail_watchlist", {})
         for k, v in loaded_long_tail.items():
-            LONG_TAIL_WATCHLIST[k] = v
+            if k not in STONKFUN_QUOTE_MINTS:
+                LONG_TAIL_WATCHLIST[k] = v
         loaded_telegram_pinged = saved.get("telegram_pinged_tokens", {})
         for k, v in loaded_telegram_pinged.items():
-            TELEGRAM_PINGED_TOKENS[k] = v
+            if k not in STONKFUN_QUOTE_MINTS:
+                TELEGRAM_PINGED_TOKENS[k] = v
         loaded_telegram_early_pinged = saved.get("telegram_early_pinged_tokens", {})
         for k, v in loaded_telegram_early_pinged.items():
-            TELEGRAM_EARLY_PINGED_TOKENS[k] = v
+            if k not in STONKFUN_QUOTE_MINTS:
+                TELEGRAM_EARLY_PINGED_TOKENS[k] = v
         loaded_opportunity_recorded = saved.get("opportunity_recorded_tokens", {})
         for k, v in loaded_opportunity_recorded.items():
-            OPPORTUNITY_RECORDED_TOKENS[k] = v
+            if k not in STONKFUN_QUOTE_MINTS:
+                OPPORTUNITY_RECORDED_TOKENS[k] = v
         loaded_mock_portfolio = saved.get("mock_portfolio", {})
         for k, v in loaded_mock_portfolio.items():
+            if k in STONKFUN_QUOTE_MINTS:
+                continue
             entry_mc = v.get("entry_market_cap") or 0.0
             plat = v.get("platform")
             qualifies, _ = is_launchpad_or_target_suffix(plat, k)
@@ -5559,20 +5791,26 @@ def _load_state_sync() -> None:
                 JEV_USAGE[k] = v
         loaded_jev_log = saved.get("jev_judgment_log", {})
         for k, v in loaded_jev_log.items():
-            JEV_JUDGMENT_LOG[k] = v
+            if k not in STONKFUN_QUOTE_MINTS:
+                JEV_JUDGMENT_LOG[k] = v
         loaded_jev_evaluated = saved.get("jev_evaluated_tokens", {})
         for k, v in loaded_jev_evaluated.items():
-            JEV_EVALUATED_TOKENS[k] = v
+            if k not in STONKFUN_QUOTE_MINTS:
+                JEV_EVALUATED_TOKENS[k] = v
         loaded_jev_screened = saved.get("jev_screened_tokens", {})
         for k, v in loaded_jev_screened.items():
-            JEV_SCREENED_TOKENS[k] = v
+            if k not in STONKFUN_QUOTE_MINTS:
+                JEV_SCREENED_TOKENS[k] = v
         loaded_jev_semantic = saved.get("jev_semantic_cache", {})
         for k, v in loaded_jev_semantic.items():
-            JEV_SEMANTIC_CACHE[k] = v
+            if k not in STONKFUN_QUOTE_MINTS:
+                JEV_SEMANTIC_CACHE[k] = v
         for rec in saved.get("jev_recent_judgments", []):
-            RECENT_JEV_JUDGMENTS.append(rec)
+            if rec.get("token_address") not in STONKFUN_QUOTE_MINTS:
+                RECENT_JEV_JUDGMENTS.append(rec)
         for evt in saved.get("jev_recent_events", []):
-            RECENT_JEV_EVENTS.append(evt)
+            if evt.get("token_address") not in STONKFUN_QUOTE_MINTS:
+                RECENT_JEV_EVENTS.append(evt)
         for k, v in saved.get("jev_pvp_log", {}).items():
             JEV_PVP_LOG[k] = v
         for k, v in saved.get("jev_pvp_token_index", {}).items():
@@ -5586,8 +5824,8 @@ def _load_state_sync() -> None:
         for k, v in saved.get("jev_learned_weights", {}).items():
             JEV_LEARNED_WEIGHTS[k] = v
         for chain, rs in saved.get("big_runners", {}).items():
-            BIG_RUNNERS[chain] = rs
-        BIG_RUNNERS_SEEN.update(saved.get("big_runners_seen", []))
+            BIG_RUNNERS[chain] = [r for r in rs if r.get("token_address") not in STONKFUN_QUOTE_MINTS]
+        BIG_RUNNERS_SEEN.update([x for x in saved.get("big_runners_seen", []) if x not in STONKFUN_QUOTE_MINTS])
         logger.info(
             f"Loaded persisted dev reputation state for {len(loaded_devs)} dev wallet(s), "
             f"rug history for {len(loaded_rug_history)} dev wallet(s), "
@@ -5988,6 +6226,9 @@ async def process_new_token_event(
     ts: Optional[float] = None,
     extra: Optional[dict] = None,
 ) -> None:
+    if token_address in STONKFUN_QUOTE_MINTS:
+        logger.debug(f"[token-event] Skipping StonkFun quote/collateral token {token_address} ({ticker_raw})")
+        return
     ts = ts or time.time()
     extra = extra or {}
 
@@ -6051,7 +6292,7 @@ async def process_new_token_event(
     # new fair-launches (HYPE, ZEC, MSTRx, AAPLx...). Blocking here keeps them
     # out of narrative clustering, scoring, and Jev entirely. The mcap arm of
     # the detector fires later in the poll loop once DexScreener fills mcap in.
-    est, est_reason = is_probably_established_or_stock(ticker_raw, 0.0, platform=platform)
+    est, est_reason = is_probably_established_or_stock(ticker_raw, 0.0, platform=platform, token_address=token_address)
     _tinv, _treason = ticker_is_invalid(ticker_raw)
     if est or _tinv:
         _reason = est_reason if est else _treason
@@ -6333,10 +6574,12 @@ async def handle_stonkfun_log(client: JsonRpcWsClient, value: dict) -> None:
         meta = result.get("meta", {}) or {}
         pre_mints = {b.get("mint") for b in meta.get("preTokenBalances", [])}
         post_mints = {b.get("mint") for b in meta.get("postTokenBalances", [])}
-        new_mints = {m for m in (post_mints - pre_mints) if m}
+        new_mints = {m for m in (post_mints - pre_mints) if m and m not in STONKFUN_QUOTE_MINTS}
         if not new_mints or not dev_wallet:
             return
         token_address = next(iter(new_mints))
+        if token_address in STONKFUN_QUOTE_MINTS:
+            return
     except Exception as exc:
         logger.warning(f"[solana/stonkfun] failed to resolve launch tx {signature}: {exc!r}")
         return
@@ -7468,6 +7711,9 @@ def _is_safe_vetted_token(token_address: str, entry: dict[str, Any]) -> bool:
     3. Honeypot / sell whitelist checks (no active freeze authority, no transfer hooks, not a honeypot chart).
     4. Dev has total launches <= 1 (discards serial launchers/ruggers).
     5. Dev has 0 failed/rug launches and is not blacklisted."""
+    if token_address in STONKFUN_QUOTE_MINTS:
+        return False
+
     # Under 100k MC ceiling check - strictly for TheStonkBoard / StonkFun coins
     mcap = entry.get("market_cap") or 0.0
     is_stonk = is_stonkboard_token(token_address, entry.get("platform"), entry.get("links"))
@@ -7505,6 +7751,8 @@ def _is_safe_vetted_token(token_address: str, entry: dict[str, Any]) -> bool:
 
 
 def _open_mock_position(token_address: str, entry: dict[str, Any], score: int, ts: float) -> None:
+    if token_address in STONKFUN_QUOTE_MINTS:
+        return
     if token_address in MOCK_PORTFOLIO:
         return
     if not _is_safe_vetted_token(token_address, entry):
@@ -7655,6 +7903,8 @@ async def _rescore_token_and_maybe_ping(token_address: str) -> None:
     momentum, volume...), which makes it the correct single choke point to
     hang the ping check off of rather than duplicating the check at every
     place a score-affecting field gets updated."""
+    if token_address in STONKFUN_QUOTE_MINTS:
+        return
     _rescore_token(token_address)
     entry = TOKEN_FEED.get(token_address)
     if not entry:
@@ -8300,7 +8550,12 @@ async def _process_watchlist_token(token_address: str, info: dict[str, Any], now
     # Cross-platform established coin / tokenized stock / implausible new-launch
     # mcap (any platform). Catches HYPE/MSTRx/ZEC leaks whose symbol only
     # resolved after DexScreener backfill.
-    est, est_reason = is_probably_established_or_stock(info.get("ticker"), market_cap, platform=info.get("platform"))
+    est, est_reason = is_probably_established_or_stock(
+        info.get("ticker"),
+        market_cap,
+        platform=info.get("platform"),
+        token_address=token_address,
+    )
     if est:
         await _kick_out_watchlist_token(
             token_address, info, now, "NOT_A_NEW_LAUNCH",
@@ -8583,6 +8838,8 @@ def _restore_tracking_from_mock_portfolio() -> int:
     tracking on every redeploy."""
     restored = 0
     for token_address, position in MOCK_PORTFOLIO.items():
+        if token_address in STONKFUN_QUOTE_MINTS:
+            continue
         if token_address in TOKEN_WATCHLIST:
             continue
         status = position.get("last_known_status")
@@ -8634,11 +8891,14 @@ def _restore_tracking_from_mock_portfolio() -> int:
 async def lifespan(app: FastAPI):
     _load_state_sync()
     _seed_big_runners()
+    purge_stonkfun_quote_tokens()
     purge_established_from_jev()
     try:
         await sync_stonkboard_coins()
     except Exception as exc:
         logger.debug(f"Initial stonkboard sync error: {exc!r}")
+    purge_stonkfun_quote_tokens()
+    await persist_state()
     restored_count = _restore_tracking_from_mock_portfolio()
     if restored_count:
         logger.info(f"Restored {restored_count} token(s) from mock_portfolio into the active hot loop after restart")
