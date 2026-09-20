@@ -315,6 +315,7 @@
   .dev-rep.clean { color: var(--accent); background: var(--accent-subtle); border: 1px solid rgba(56, 189, 248, 0.2); }
   .dev-rep.good { color: var(--green); background: var(--green-subtle); border: 1px solid rgba(16, 185, 129, 0.25); font-weight: 700; }
   .dev-rep.bad { color: var(--red); background: var(--red-subtle); border: 1px solid rgba(244, 63, 94, 0.25); font-weight: 700; }
+  .dev-rep.warn { color: var(--amber, #f59e0b); background: rgba(245, 158, 11, 0.15); border: 1px solid rgba(245, 158, 11, 0.35); font-weight: 700; }
   .dev-rep.infra { color: var(--purple); background: var(--purple-subtle); }
 
   /* Liquidity & Holder Badges */
@@ -1816,7 +1817,8 @@
   }
 
   function devBadge(payload) {
-    if (payload.dev_alias === "shared infra (not a person)") return '<span class="dev-rep infra">🏢 Infra</span>';
+    const devLower = (payload.dev_wallet || '').toLowerCase();
+    if (payload.dev_alias === "shared infra (not a person)" || devLower.startsWith("discovered:") || devLower.startsWith("stonkboard")) return '<span class="dev-rep infra">🏢 Infra</span>';
     const total = payload.dev_total_launches || 1;
     const moons = payload.dev_moons || 0;
     const rugs = payload.dev_rugs || 0;
@@ -1824,8 +1826,10 @@
     if (rugs > 0 || isBl) {
       return `<span class="dev-rep bad" title="Dev track record: ${total} launched, ${rugs} rugged — DISCARDED">💀 Rugger (${rugs} rug${rugs > 1 ? 's' : ''}${moons > 0 ? ', ' + moons + ' 🚀' : ''})</span>`;
     }
+    const priors = payload.dev_prior_tickers || [];
+    const priorStr = priors.length ? ` · Prior: $${priors.slice(0, 2).join(', $')}` : '';
     if (total > 1) {
-      return `<span class="dev-rep bad" title="Dev track record: ${total} launches (repeat dev) — DISCARDED">⚠️ Multi-Dev (${total} launches)</span>`;
+      return `<span class="dev-rep warn" title="Dev track record: ${total} launches on record${priors.length ? ' (Prior: $' + priors.join(', $') + ')' : ''}">⚠️ Multi-Dev (${total}x${priorStr}${moons > 0 ? ', ' + moons + ' 🚀' : ''})</span>`;
     }
     if (moons > 0) {
       return `<span class="dev-rep good" title="Dev track record: 1st launch, ${moons} graduated">🚀 1st launch (${moons} moon)</span>`;
@@ -2313,7 +2317,8 @@
       ? whySignals(payload.signals)
       : (payload.signals && payload.signals.length ? whySignals(payload.signals) : "");
 
-    const isInfra = (payload.dev_wallet || '').toLowerCase().includes('multicall') || (payload.dev_alias && payload.dev_alias.includes('shared'));
+    const devLower = (payload.dev_wallet || '').toLowerCase();
+    const isInfra = devLower.includes('multicall') || (payload.dev_alias && payload.dev_alias.includes('shared')) || devLower.startsWith('discovered:') || devLower.startsWith('stonkboard');
     const isMultiDev = !isInfra && ((payload.dev_total_launches || 0) > 1);
     const buys = payload.buys_24h || 0;
     const sells = payload.sells_24h || 0;
@@ -2338,7 +2343,7 @@
           <span class="badge dev-${devDecision}" title="dev: ${payload.dev_wallet}">${devDecision}</span>
           ${payload.bundle_detected ? `<span class="badge ${payload.bundle_known_bad_operator ? 'status-RUGGED' : 'dev-PASS'}" title="Bundled: ${payload.bundle_wallet_count||0} wallets, ${(payload.bundle_supply_pct||0).toFixed(0)}% supply">🎭 BUNDLE</span>` : ''}
           ${isHoneypot ? `<span class="badge status-RUGGED" title="Honeypot chart: 0 sells or freeze authority active — DISCARDED">🍯 HONEYPOT</span>` : ''}
-          ${isMultiDev ? `<span class="badge status-SKIPPED" title="Discarded: Dev has launched multiple tokens (${payload.dev_total_launches})">⚠️ MULTI-DEV</span>` : ''}
+          ${isMultiDev ? `<span class="badge" style="background:rgba(245,158,11,0.15);color:var(--amber, #f59e0b);border:1px solid rgba(245,158,11,0.35);font-size:9px;padding:1px 5px;border-radius:3px;" title="Dev has launched multiple tokens (${payload.dev_total_launches})${payload.dev_prior_tickers && payload.dev_prior_tickers.length ? '. Prior: $' + payload.dev_prior_tickers.join(', $') : ''}">⚠️ MULTI-DEV (${payload.dev_total_launches}x)</span>` : ''}
         </div>
         ${devBadge(payload)}
       </div>
@@ -3044,7 +3049,8 @@
     let bondingCount = 0;
     for (const [addr, payload] of tokenPayloadOf) {
       const status = tokenStatusOf.get(addr) || payload.status;
-      const isInfra = (payload.dev_wallet || '').toLowerCase().includes('multicall') || (payload.dev_alias && payload.dev_alias.includes('shared'));
+      const devLower = (payload.dev_wallet || '').toLowerCase();
+      const isInfra = devLower.includes('multicall') || (payload.dev_alias && payload.dev_alias.includes('shared')) || devLower.startsWith('discovered:') || devLower.startsWith('stonkboard');
       const devMultiLaunch = !isInfra && ((payload.dev_total_launches || 0) > 1);
       const devRugger = !isInfra && ((payload.dev_rugs || 0) > 0 || payload.dev_blacklisted);
       const buys = payload.buys_24h || 0;
@@ -3060,7 +3066,7 @@
       const isLaunchpad = ["pump.fun", "stonkfun", "four.meme", "flap.sh", "pons", "ember", "long.xyz"].some(lp => platLower.includes(lp));
       const qualifiesLaunch = isLaunchpad || endsTarget;
 
-      if (status === "WATCHING" && (payload.opportunity_score || 0) > 0 && !devMultiLaunch && !devRugger && !isHoneypot && mcapQualifies && qualifiesLaunch) {
+      if (status === "WATCHING" && (payload.opportunity_score || 0) > 0 && !devRugger && !isHoneypot && mcapQualifies && qualifiesLaunch) {
         candidates.push(payload);
       }
       if (isBonding(status, payload)) bondingCount += 1;
@@ -3122,7 +3128,10 @@ Dev: ${p.dev_wallet}">
           <span style="color:var(--text-dim);">🛡️ Security:</span> ${goplusBadge}
         </div>
         <div class="opp-dev-row">
-          <span style="color:var(--text-dim);font-size:10px;">👨‍💻 Dev:</span> ${devLine}
+          <div style="display:flex;align-items:center;gap:4px;flex-wrap:wrap;">
+            <span style="color:var(--text-dim);font-size:10px;">👨‍💻 Dev:</span> ${devLine}
+          </div>
+          ${(p.dev_prior_tickers && p.dev_prior_tickers.length) ? `<div style="font-size:10px; color:var(--amber, #f59e0b); margin-top:2px;">⚠️ Dev Prior: <b>$${p.dev_prior_tickers.slice(0, 3).join(', $')}</b>${p.dev_prior_tickers.length > 3 ? ` (+${p.dev_prior_tickers.length - 3} more)` : ''}</div>` : ''}
         </div>
         <div class="opp-reasons">${reasons}</div>
         <div style="margin-top:6px;display:flex;gap:6px;flex-wrap:wrap;align-items:center;">
@@ -3152,7 +3161,8 @@ Dev: ${p.dev_wallet}">
     for (const [addr, payload] of tokenPayloadOf) {
       const status = tokenStatusOf.get(addr) || payload.status;
       const mcap = payload.market_cap || 0;
-      const isInfra = (payload.dev_wallet || '').toLowerCase().includes('multicall') || (payload.dev_alias && payload.dev_alias.includes('shared'));
+      const devLower = (payload.dev_wallet || '').toLowerCase();
+      const isInfra = devLower.includes('multicall') || (payload.dev_alias && payload.dev_alias.includes('shared')) || devLower.startsWith('discovered:') || devLower.startsWith('stonkboard');
       const devMultiLaunch = !isInfra && ((payload.dev_total_launches || 0) > 1);
       const devRugger = !isInfra && ((payload.dev_rugs || 0) > 0 || payload.dev_blacklisted);
       const buys = payload.buys_24h || 0;
@@ -3171,7 +3181,6 @@ Dev: ${p.dev_wallet}">
         mcap >= EARLY_MOMENTUM_MIN_MCAP &&
         mcap <= maxEarlyMcap &&
         (payload.early_momentum_score || 0) > 0 &&
-        !devMultiLaunch &&
         !devRugger &&
         !isHoneypot &&
         qualifiesLaunch
@@ -3229,7 +3238,10 @@ Dev: ${p.dev_wallet}">
           <span style="color:var(--text-dim);">🛡️ Security:</span> ${goplusBadge}
         </div>
         <div class="opp-dev-row">
-          <span style="color:var(--text-dim);font-size:10px;">👨‍💻 Dev:</span> ${devLine}
+          <div style="display:flex;align-items:center;gap:4px;flex-wrap:wrap;">
+            <span style="color:var(--text-dim);font-size:10px;">👨‍💻 Dev:</span> ${devLine}
+          </div>
+          ${(p.dev_prior_tickers && p.dev_prior_tickers.length) ? `<div style="font-size:10px; color:var(--amber, #f59e0b); margin-top:2px;">⚠️ Dev Prior: <b>$${p.dev_prior_tickers.slice(0, 3).join(', $')}</b>${p.dev_prior_tickers.length > 3 ? ` (+${p.dev_prior_tickers.length - 3} more)` : ''}</div>` : ''}
         </div>
         <div class="opp-reasons">${reasons}</div>
         <div style="margin-top:6px;display:flex;gap:6px;flex-wrap:wrap;align-items:center;">

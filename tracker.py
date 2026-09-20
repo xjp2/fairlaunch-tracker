@@ -902,6 +902,29 @@ DEV_SPAM_LOG: dict[str, list[float]] = defaultdict(list)
 DEV_RUG_HISTORY: dict[str, list[dict[str, Any]]] = defaultdict(list)
 DEV_RUG_HISTORY_MAX_PER_DEV = 5
 
+# History of tokens launched by a developer wallet (used to warn users what dev previously launched)
+DEV_LAUNCH_HISTORY: dict[str, list[dict[str, Any]]] = defaultdict(list)
+DEV_LAUNCH_HISTORY_MAX_PER_DEV = 10
+
+
+def record_dev_launch_event(dev_wallet: str, token_address: str, ticker: str, chain: str, platform: str, ts: float) -> list[dict[str, Any]]:
+    """Records a token launch under the dev wallet and returns prior launched tokens."""
+    if not dev_wallet or dev_wallet.lower() in KNOWN_INFRASTRUCTURE_ADDRESSES or dev_wallet.lower().startswith("stonkboard") or dev_wallet.lower().startswith("discovered:"):
+        return []
+    history = DEV_LAUNCH_HISTORY[dev_wallet]
+    prior = [h for h in history if h.get("token_address") != token_address]
+    if not any(h.get("token_address") == token_address for h in history):
+        history.append({
+            "token_address": token_address,
+            "ticker": ticker or "UNKNOWN",
+            "chain": chain,
+            "platform": platform,
+            "timestamp": ts,
+        })
+        if len(history) > DEV_LAUNCH_HISTORY_MAX_PER_DEV:
+            del history[0]
+    return prior
+
 # --- Bundled-wallet detection (see detect_evm_bundle / detect_solana_bundle) -
 # A "bundle" is a set of wallets that only *look* like independent holders —
 # in reality they were all funded (Solana: same System Program transfer
@@ -2954,7 +2977,7 @@ def compute_opportunity_score(entry: dict[str, Any]) -> tuple[int, list[str]]:
         return 0, [f"Honeypot chart detected ({buys_24h} buys / {sells_24h} sells) — no sells possible (discarded)"]
 
     dev_wallet = entry.get("dev_wallet", "")
-    is_infra_wallet = dev_wallet.lower() in KNOWN_INFRASTRUCTURE_ADDRESSES or dev_wallet.lower().startswith("stonkboard")
+    is_infra_wallet = dev_wallet.lower() in KNOWN_INFRASTRUCTURE_ADDRESSES or dev_wallet.lower().startswith("stonkboard") or dev_wallet.lower().startswith("discovered:")
 
     if is_infra_wallet:
         reasons.append("Dev field is shared launchpad infrastructure, not a trackable individual — reputation neutral")
@@ -2964,13 +2987,26 @@ def compute_opportunity_score(entry: dict[str, Any]) -> tuple[int, list[str]]:
         dev_rugs = dev_rep.get("failed_spams", 0) if dev_rep else (entry.get("dev_rugs") or 0)
         is_bl = (dev_rep.get("is_blacklisted") if dev_rep else False) or bool(entry.get("dev_blacklisted"))
 
-        if dev_total > 1:
-            return 0, [f"Dev has launched {dev_total} tokens — discarded (only single-launch devs allowed)"]
         if is_bl:
             return 0, ["Dev is blacklisted — discarded"]
         if dev_rugs > 0 or len(DEV_RUG_HISTORY.get(dev_wallet, [])) > 0:
             return 0, [f"Dev has prior rug history ({dev_rugs} rugs) — serial rugger discarded"]
-        # Note: Elite dev scoring removed because it contradicts the strict single-launch rule
+
+        if dev_total > 1:
+            priors = entry.get("dev_prior_tickers") or [
+                h.get("ticker") for h in DEV_LAUNCH_HISTORY.get(dev_wallet, [])
+                if h.get("ticker") and h.get("ticker") != "UNKNOWN" and h.get("token_address") != entry.get("token_address")
+            ]
+            unique_priors = list(dict.fromkeys(priors))
+            prior_str = f" (${', $'.join(unique_priors[:3])})" if unique_priors else ""
+            reasons.append(f"⚠️ Multi-launch dev: {dev_total} launches on record{prior_str} (-5)")
+            score -= 5
+
+        dev_moons = dev_rep.get("successful_launches", 0) if dev_rep else (entry.get("dev_moons") or 0)
+        if dev_moons > 0:
+            moons_bonus = min(15, dev_moons * 5)
+            score += moons_bonus
+            reasons.append(f"🏆 Proven dev track record: {dev_moons} prior graduated/mooned coin(s) (+{moons_bonus})")
 
     # Free social presence & community engagement score (DexScreener/PumpPortal/TokenProfiles)
     soc_data = extract_social_presence(entry)
@@ -3300,18 +3336,26 @@ def compute_early_momentum_score(entry: dict[str, Any]) -> tuple[int, list[str]]
         return 0, [f"Honeypot chart detected ({buys_24h} buys / {sells_24h} sells) — no sells possible (discarded)"]
 
     dev_wallet = entry.get("dev_wallet", "")
-    is_infra_wallet = dev_wallet.lower() in KNOWN_INFRASTRUCTURE_ADDRESSES or dev_wallet.lower().startswith("stonkboard")
+    is_infra_wallet = dev_wallet.lower() in KNOWN_INFRASTRUCTURE_ADDRESSES or dev_wallet.lower().startswith("stonkboard") or dev_wallet.lower().startswith("discovered:")
     if not is_infra_wallet:
         dev_rep = DEV_REPUTATION_DATABASE.get(dev_wallet)
         dev_total = dev_rep.get("total_launches", 0) if dev_rep else (entry.get("dev_total_launches") or 0)
         dev_rugs = dev_rep.get("failed_spams", 0) if dev_rep else (entry.get("dev_rugs") or 0)
         is_bl = (dev_rep.get("is_blacklisted") if dev_rep else False) or bool(entry.get("dev_blacklisted"))
 
-        if dev_total > 1:
-            return 0, [f"Dev has launched {dev_total} tokens — discarded (only single-launch devs allowed)"]
         if is_bl:
             return 0, ["Dev is blacklisted — discarded"]
-        # Elite dev removed to resolve contradiction with single-launch requirement
+        if dev_rugs > 0 or len(DEV_RUG_HISTORY.get(dev_wallet, [])) > 0:
+            return 0, [f"Dev has prior rug history ({dev_rugs} rugs) — serial rugger discarded"]
+
+        if dev_total > 1:
+            priors = entry.get("dev_prior_tickers") or [
+                h.get("ticker") for h in DEV_LAUNCH_HISTORY.get(dev_wallet, [])
+                if h.get("ticker") and h.get("ticker") != "UNKNOWN" and h.get("token_address") != entry.get("token_address")
+            ]
+            unique_priors = list(dict.fromkeys(priors))
+            prior_str = f" (${', $'.join(unique_priors[:3])})" if unique_priors else ""
+            reasons.append(f"⚠️ Multi-launch dev: {dev_total} launches on record{prior_str}")
 
     # Free early social presence score
     soc_data = extract_social_presence(entry)
@@ -5737,6 +5781,7 @@ async def persist_state() -> None:
         "dev_reputation": dict(DEV_REPUTATION_DATABASE),
         "smart_wallets": dict(SMART_WALLETS),
         "dev_rug_history": dict(DEV_RUG_HISTORY),
+        "dev_launch_history": dict(DEV_LAUNCH_HISTORY),
         "daily_stats": {day: dict(counters) for day, counters in DAILY_STATS.items()},
         "hourly_launch_stats": dict(HOURLY_LAUNCH_STATS),
         "recent_graduations": list(RECENT_GRADUATIONS),
@@ -5783,6 +5828,9 @@ def _load_state_sync() -> None:
         loaded_rug_history = saved.get("dev_rug_history", {})
         for k, v in loaded_rug_history.items():
             DEV_RUG_HISTORY[k] = v
+        loaded_launch_history = saved.get("dev_launch_history", {})
+        for k, v in loaded_launch_history.items():
+            DEV_LAUNCH_HISTORY[k] = v
         loaded_daily_stats = saved.get("daily_stats", {})
         for day, counters in loaded_daily_stats.items():
             for field, value in counters.items():
@@ -5927,11 +5975,11 @@ def get_or_create_dev(dev_wallet: str, chain: str) -> dict[str, Any]:
     return entry
 
 
-def dev_rep_badge_fields(dev_wallet: str) -> dict[str, Any]:
+def dev_rep_badge_fields(dev_wallet: str, current_token_address: Optional[str] = None) -> dict[str, Any]:
     """Compact dev track-record summary attached to token cards, narrative
     launches, and alerts — so a wallet address is never the only thing shown.
     What matters is whether this dev has rugged or graduated something before,
-    how many total coins they have launched, and whether they are blacklisted."""
+    how many total coins they have launched, and what coins they previously launched."""
     if dev_wallet.lower().startswith("stonkboard"):
         return {
             "dev_alias": "StonkFun Launchpad",
@@ -5939,36 +5987,53 @@ def dev_rep_badge_fields(dev_wallet: str) -> dict[str, Any]:
             "dev_rugs": 0,
             "dev_total_launches": 1,
             "dev_blacklisted": False,
+            "dev_prior_tickers": [],
+            "dev_prior_launches": [],
         }
-    if dev_wallet.lower() in KNOWN_INFRASTRUCTURE_ADDRESSES:
+    if dev_wallet.lower() in KNOWN_INFRASTRUCTURE_ADDRESSES or dev_wallet.lower().startswith("discovered:"):
+        alias = "discovered token" if dev_wallet.lower().startswith("discovered:") else "shared infra (not a person)"
         return {
-            "dev_alias": "shared infra (not a person)",
+            "dev_alias": alias,
             "dev_moons": 0,
             "dev_rugs": 0,
             "dev_total_launches": 0,
             "dev_blacklisted": False,
+            "dev_prior_tickers": [],
+            "dev_prior_launches": [],
         }
     dev = DEV_REPUTATION_DATABASE.get(dev_wallet)
     spam_count = len(DEV_SPAM_LOG.get(dev_wallet, []))
     rug_history_count = len(DEV_RUG_HISTORY.get(dev_wallet, []))
+    all_launches = DEV_LAUNCH_HISTORY.get(dev_wallet, [])
+    prior_launches = [
+        h for h in all_launches
+        if not current_token_address or h.get("token_address") != current_token_address
+    ]
+    prior_tickers = [h.get("ticker", "") for h in prior_launches if h.get("ticker") and h.get("ticker") != "UNKNOWN"]
+    unique_prior_tickers = list(dict.fromkeys(prior_tickers))
+
     if not dev:
         return {
             "dev_alias": None,
             "dev_moons": 0,
             "dev_rugs": max(rug_history_count, 0),
-            "dev_total_launches": max(spam_count, 1),
+            "dev_total_launches": max(spam_count, len(all_launches), 1),
             "dev_blacklisted": rug_history_count > 0,
+            "dev_prior_tickers": unique_prior_tickers,
+            "dev_prior_launches": prior_launches[-5:],
         }
     moons = dev.get("successful_launches", 0)
     rugs = max(dev.get("failed_spams", 0), rug_history_count)
-    total = max(dev.get("total_launches", 0), spam_count, moons + rugs, 1)
-    is_bl = bool(dev.get("is_blacklisted", False) or rugs > 0 or total > 1 or rug_history_count > 0)
+    total = max(dev.get("total_launches", 0), spam_count, len(all_launches), moons + rugs, 1)
+    is_bl = bool(dev.get("is_blacklisted", False) or rugs > 0 or rug_history_count > 0)
     return {
         "dev_alias": dev.get("alias"),
         "dev_moons": moons,
         "dev_rugs": rugs,
         "dev_total_launches": total,
         "dev_blacklisted": is_bl,
+        "dev_prior_tickers": unique_prior_tickers,
+        "dev_prior_launches": prior_launches[-5:],
     }
 
 
@@ -5994,13 +6059,8 @@ def _record_bundle_operator(operator: str, token_address: str, dev_wallet: str, 
 
 
 def stage_a_dev_trust(dev_wallet: str, chain: str, ts: float) -> dict[str, Any]:
-    if dev_wallet.lower() in KNOWN_INFRASTRUCTURE_ADDRESSES or dev_wallet.lower().startswith("stonkboard"):
-        # A shared router/multicall contract, not a trackable individual — never
-        # accumulate blacklist/elite reputation on it. The alternative (treating
-        # it as one identity) would let one bad actor's multicall-routed rug
-        # blacklist every unrelated future launch that happens to route through
-        # the same generic infrastructure.
-        alias = "StonkFun Launchpad" if dev_wallet.lower().startswith("stonkboard") else "shared-infrastructure"
+    if dev_wallet.lower() in KNOWN_INFRASTRUCTURE_ADDRESSES or dev_wallet.lower().startswith("stonkboard") or dev_wallet.lower().startswith("discovered:"):
+        alias = "StonkFun Launchpad" if dev_wallet.lower().startswith("stonkboard") else ("discovered-token" if dev_wallet.lower().startswith("discovered:") else "shared-infrastructure")
         return {"decision": "PASS", "reason": "SHARED_INFRASTRUCTURE", "dev": {"alias": alias, "is_blacklisted": False, "successful_launches": 0, "total_launches": 1}}
 
     dev = get_or_create_dev(dev_wallet, chain)
@@ -6016,15 +6076,15 @@ def stage_a_dev_trust(dev_wallet: str, chain: str, ts: float) -> dict[str, Any]:
         dev["is_blacklisted"] = True
         return {"decision": "SKIP", "reason": "SERIAL_RUGGER_HISTORY", "dev": dev}
 
-    # Strict single-launch dev rule: discard any dev who has launched > 1 token
-    if dev["total_launches"] > 1:
-        return {"decision": "SKIP", "reason": f"DEV_MULTI_LAUNCH_DISCARDED ({dev['total_launches']} launches)", "dev": dev}
-
     if len(recent_spam) >= SPAM_THRESHOLD:
         dev["is_blacklisted"] = True
         return {"decision": "SKIP", "reason": "SERIAL_RUGGER_THRESHOLD", "dev": dev}
 
     dev["last_launch_time"] = ts
+
+    # Multi-launch dev is allowed — warn user with prior coins
+    if dev["total_launches"] > 1:
+        return {"decision": "PASS", "reason": f"DEV_MULTI_LAUNCH ({dev['total_launches']} launches)", "dev": dev}
 
     return {"decision": "PASS", "reason": "SINGLE_LAUNCH_DEV", "dev": dev}
 
@@ -6348,8 +6408,9 @@ async def process_new_token_event(
         early_momentum_score=0,
         early_momentum_reasons=[],
         image_url=img_url,
-        **dev_rep_badge_fields(dev_wallet),
+        **dev_rep_badge_fields(dev_wallet, token_address),
     )
+    record_dev_launch_event(dev_wallet, token_address, ticker_raw, chain, platform, ts)
     await bump_daily_stat(ts, "total_tokens")
     await bump_hourly_launch_stat(ts)
 
@@ -7407,7 +7468,28 @@ def _format_telegram_opportunity_message(entry: dict[str, Any]) -> str:
     dev_alias = entry.get("dev_alias") or (esc(entry.get("dev_wallet", ""))[:6] + "..." if entry.get("dev_wallet") else "Unknown")
     dev_moons = entry.get("dev_moons") or 0
     dev_rugs = entry.get("dev_rugs") or 0
+    dev_total = entry.get("dev_total_launches") or 1
+    dev_wallet = entry.get("dev_wallet", "")
+
+    priors = entry.get("dev_prior_tickers") or [
+        h.get("ticker") for h in DEV_LAUNCH_HISTORY.get(dev_wallet, [])
+        if h.get("ticker") and h.get("ticker") != "UNKNOWN" and h.get("token_address") != token_address
+    ]
+    unique_priors = list(dict.fromkeys(priors))
+
     dev_str = f"{esc(dev_alias)} (🚀{dev_moons}/💀{dev_rugs})"
+    if dev_total > 1:
+        dev_str += f" · ⚠️ {dev_total}x"
+
+    dev_warn_line = ""
+    if dev_total > 1:
+        if unique_priors:
+            prior_display = ", ".join(f"${esc(t)}" for t in unique_priors[:4])
+            if len(unique_priors) > 4:
+                prior_display += f" (+{len(unique_priors)-4} more)"
+            dev_warn_line = f"⚠️ <b>Dev Previously Launched ({dev_total}x):</b> {prior_display}\n"
+        else:
+            dev_warn_line = f"⚠️ <b>Dev History:</b> {dev_total} launches on record\n"
 
     # GoPlus security status
     gp = entry.get("goplus") or {}
@@ -7454,6 +7536,7 @@ def _format_telegram_opportunity_message(entry: dict[str, Any]) -> str:
         f"💰 <b>MCap:</b> {mcap_str}  │  💧 <b>Liq:</b> {liq_str}\n"
         f"📊 <b>Vol 24h:</b> {vol_str}  <i>({buys_24h}B / {sells_24h}S)</i>\n"
         f"👥 <b>Holders:</b> {holders_str}  │  🧑‍💻 <b>Dev:</b> {dev_str}\n"
+        + dev_warn_line +
         f"🛡️ <b>Security:</b> {esc(clean_gp)}  │  💸 <b>Tax:</b> {esc(tax_str)}\n"
         f"⏱️ <b>Timing:</b> {esc(timing_str)}\n\n"
     )
@@ -7582,7 +7665,28 @@ def _format_telegram_early_momentum_message(entry: dict[str, Any]) -> str:
     dev_alias = entry.get("dev_alias") or (esc(entry.get("dev_wallet", ""))[:6] + "..." if entry.get("dev_wallet") else "Unknown")
     dev_moons = entry.get("dev_moons") or 0
     dev_rugs = entry.get("dev_rugs") or 0
+    dev_total = entry.get("dev_total_launches") or 1
+    dev_wallet = entry.get("dev_wallet", "")
+
+    priors = entry.get("dev_prior_tickers") or [
+        h.get("ticker") for h in DEV_LAUNCH_HISTORY.get(dev_wallet, [])
+        if h.get("ticker") and h.get("ticker") != "UNKNOWN" and h.get("token_address") != token_address
+    ]
+    unique_priors = list(dict.fromkeys(priors))
+
     dev_str = f"{esc(dev_alias)} (🚀{dev_moons}/💀{dev_rugs})"
+    if dev_total > 1:
+        dev_str += f" · ⚠️ {dev_total}x"
+
+    dev_warn_line = ""
+    if dev_total > 1:
+        if unique_priors:
+            prior_display = ", ".join(f"${esc(t)}" for t in unique_priors[:4])
+            if len(unique_priors) > 4:
+                prior_display += f" (+{len(unique_priors)-4} more)"
+            dev_warn_line = f"⚠️ <b>Dev Previously Launched ({dev_total}x):</b> {prior_display}\n"
+        else:
+            dev_warn_line = f"⚠️ <b>Dev History:</b> {dev_total} launches on record\n"
 
     gp = entry.get("goplus") or {}
     gp_raw = gp.get("summary") or "Clean · Renounced"
@@ -7623,6 +7727,7 @@ def _format_telegram_early_momentum_message(entry: dict[str, Any]) -> str:
         f"💰 <b>MCap:</b> {mcap_str}  │  💧 <b>Liq:</b> {liq_str}\n"
         f"📊 <b>Vol 24h:</b> {vol_str}  <i>({buys_24h}B / {sells_24h}S)</i>\n"
         f"👥 <b>Holders:</b> {holders_str}  │  🧑‍💻 <b>Dev:</b> {dev_str}\n"
+        + dev_warn_line +
         f"🛡️ <b>Security:</b> {esc(clean_gp)}  │  💸 <b>Tax:</b> {esc(tax_str)}\n"
         f"⏱️ <b>Timing:</b> {esc(timing_str)}\n\n"
     )
@@ -7809,13 +7914,12 @@ def _mark_opportunity_recorded(token_address: str) -> None:
 
 
 def _is_safe_vetted_token(token_address: str, entry: dict[str, Any]) -> bool:
-    """Verifies that a token passes all strict anti-honeypot, single-launch dev,
+    """Verifies that a token passes all strict anti-honeypot, dev trust,
     launchpad / suffix, and under-100k market cap rules:
     1. Market cap strictly under $100k ceiling ONLY for TheStonkBoard / StonkFun coins.
     2. Launched from a recognized launchpad (pump.fun, stonkfun, etc.) and/or contract ends in 7777, pump, 4444.
     3. Honeypot / sell whitelist checks (no active freeze authority, no transfer hooks, not a honeypot chart).
-    4. Dev has total launches <= 1 (discards serial launchers/ruggers).
-    5. Dev has 0 failed/rug launches and is not blacklisted."""
+    4. Dev has 0 failed/rug launches and is not blacklisted (multi-launch allowed with warning)."""
     if token_address in STONKFUN_QUOTE_MINTS:
         return False
 
@@ -7843,13 +7947,12 @@ def _is_safe_vetted_token(token_address: str, entry: dict[str, Any]) -> bool:
         return False
 
     dev_wallet = entry.get("dev_wallet", "")
-    is_infra = (dev_wallet.lower() in KNOWN_INFRASTRUCTURE_ADDRESSES or dev_wallet.lower().startswith("stonkboard")) if dev_wallet else False
+    is_infra = (dev_wallet.lower() in KNOWN_INFRASTRUCTURE_ADDRESSES or dev_wallet.lower().startswith("stonkboard") or dev_wallet.lower().startswith("discovered:")) if dev_wallet else False
     if not is_infra and dev_wallet:
         dev_rep = DEV_REPUTATION_DATABASE.get(dev_wallet)
-        dev_total = dev_rep.get("total_launches", 0) if dev_rep else (entry.get("dev_total_launches") or 0)
         dev_rugs = dev_rep.get("failed_spams", 0) if dev_rep else (entry.get("dev_rugs") or 0)
         is_bl = (dev_rep.get("is_blacklisted") if dev_rep else False) or bool(entry.get("dev_blacklisted"))
-        if dev_total > 1 or is_bl or dev_rugs > 0 or len(DEV_RUG_HISTORY.get(dev_wallet, [])) > 0:
+        if is_bl or dev_rugs > 0 or len(DEV_RUG_HISTORY.get(dev_wallet, [])) > 0:
             return False
 
     return True
@@ -8672,18 +8775,12 @@ async def _process_watchlist_token(token_address: str, info: dict[str, Any], now
         )
         return
 
-    # Dev multi-launch & serial rugger check:
+    # Serial rugger check (multi-launch dev is allowed with warning, but ruggers are discarded):
     dev_wallet = info.get("dev_wallet", "")
-    is_infra = dev_wallet.lower() in KNOWN_INFRASTRUCTURE_ADDRESSES or dev_wallet.lower().startswith("stonkboard")
+    is_infra = dev_wallet.lower() in KNOWN_INFRASTRUCTURE_ADDRESSES or dev_wallet.lower().startswith("stonkboard") or dev_wallet.lower().startswith("discovered:")
     if not is_infra and dev_wallet:
         dev = DEV_REPUTATION_DATABASE.get(dev_wallet)
         if dev:
-            if dev.get("total_launches", 0) > 1 and info["status"] == "WATCHING":
-                await _kick_out_watchlist_token(
-                    token_address, info, now, "DEV_MULTI_LAUNCH_DISCARDED",
-                    f"SKIPPED - DEV LAUNCHED MULTIPLE TOKENS ({dev.get('total_launches')} launches)",
-                )
-                return
             if (dev.get("is_blacklisted") or dev.get("failed_spams", 0) > 0 or len(DEV_RUG_HISTORY.get(dev_wallet, [])) > 0) and info["status"] == "WATCHING":
                 await _kick_out_watchlist_token(
                     token_address, info, now, "SERIAL_RUGGER_DISCARDED",
