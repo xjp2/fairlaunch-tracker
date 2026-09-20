@@ -1618,8 +1618,20 @@
 
   function fmtTime(ts) {
     if (!ts) return "";
-    const d = new Date(ts * 1000);
-    return d.toLocaleTimeString();
+    const tsSec = ts > 1e11 ? ts / 1000 : ts;
+    const d = new Date(tsSec * 1000);
+    return d.toLocaleTimeString([], {hour: '2-digit', minute: '2-digit', second: '2-digit'});
+  }
+
+  function fmtTimeWithAge(ts) {
+    if (!ts) return "-";
+    const tsSec = ts > 1e11 ? ts / 1000 : ts;
+    const nowSec = Date.now() / 1000;
+    const diff = Math.max(0, nowSec - tsSec);
+    const ageStr = fmtAge(diff);
+    const d = new Date(tsSec * 1000);
+    const timeStr = d.toLocaleTimeString([], {hour: '2-digit', minute: '2-digit', second: '2-digit'});
+    return `${ageStr} ago (${timeStr})`;
   }
 
   function fmtAge(seconds) {
@@ -2027,10 +2039,16 @@
     const stonkUrl = (alert.links && alert.links.stonkboard) || (alert.is_stonkboard && ca ? `https://thestonkboard.com/coin/${ca}` : "");
     const isStonk = (alert.platform || "").toLowerCase() === "stonkfun" || Boolean(alert.is_stonkboard) || Boolean(alert.links && alert.links.stonkboard);
     const stonkBadge = isStonk ? `<span class="badge" style="background:#0284c7;color:#fff;font-weight:700;font-size:9px;padding:1px 5px;border-radius:3px;">📈 StonkFun</span>` : "";
+    const timeDisplay = fmtTimeWithAge(alert.timestamp);
     return `<a href="${href}" target="_blank" rel="noopener" style="text-decoration:none;color:inherit;">
-        <div class="title">${chainTag(alert.chain)} ${label} ${stonkBadge} <span class="opp-score ${scoreClass(alert.opportunity_score)}">${alert.opportunity_score}</span>${badge} ${secBadge}</div>
+        <div class="title" style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:4px;">
+          <div>${chainTag(alert.chain)} ${label} ${stonkBadge} <span class="opp-score ${scoreClass(alert.opportunity_score)}">${alert.opportunity_score}</span>${badge} ${secBadge}</div>
+          <span class="badge" style="background:rgba(255,255,255,0.08);color:var(--text-bright);font-size:10px;font-weight:600;padding:2px 6px;border-radius:4px;border:1px solid rgba(255,255,255,0.15);" title="Flagged time">⏱️ ${timeDisplay}</span>
+        </div>
         ${caRow}
-        <div class="meta">${fmtUsd(alert.market_cap_usd)} mcap &middot; vol ${fmtUsd(alert.volume_24h_usd)} &middot; ${fmtTime(alert.timestamp)}</div>
+        <div class="meta" style="display:flex;align-items:center;gap:8px;margin:2px 0;">
+          <span>${fmtUsd(alert.market_cap_usd)} mcap</span> &middot; <span>vol ${fmtUsd(alert.volume_24h_usd)}</span>
+        </div>
         <div class="meta" style="margin-top:4px;display:flex;gap:8px;font-size:11px;flex-wrap:wrap;align-items:center;">
           ${fomoUrl ? `<span style="color:#c084fc;font-weight:700;cursor:pointer;" onclick="window.open('${fomoUrl}','_blank','noopener');event.preventDefault();event.stopPropagation();">🦄 FOMO.family &rarr;</span>` : ""}
           <span style="color:var(--accent);cursor:pointer;" onclick="window.open('${href}','_blank','noopener');event.preventDefault();event.stopPropagation();">📊 DexScreener</span>
@@ -2972,7 +2990,10 @@
         <td class="${pnlClass}">${pnlPct >= 0 ? "+" : ""}${pnlPct.toFixed(1)}%</td>
         <td style="text-align:center;">${secBadge}</td>
         <td style="text-align:center;">${statusBadge}</td>
-        <td style="white-space:nowrap; font-size:10px; color:var(--text-dim);">${fmtTime(p.entry_ts)}</td>
+        <td style="white-space:nowrap; font-size:10px; text-align:right;">
+          <div style="color:var(--text-bright); font-weight:600;">${fmtAge(Math.max(0, (Date.now()/1000) - (p.entry_ts || 0)))} ago</div>
+          <div style="color:var(--text-dim); font-size:9px;">${fmtTime(p.entry_ts)}</div>
+        </td>
       </tr>`;
     }).join("");
 
@@ -3084,6 +3105,7 @@ Dev: ${p.dev_wallet}">
             ${isStonk 
               ? '<span class="badge" style="background:#0284c7;color:#fff;font-weight:700;font-size:9px;padding:1px 5px;border-radius:3px;">📈 StonkFun</span>' 
               : `<span style="color:var(--text-dim);font-size:10px;">${p.platform || "-"}</span>`}
+            ${(p.created_at || p.timestamp) ? `<span class="badge" style="background:rgba(255,255,255,0.06);color:var(--text-bright);font-size:9px;padding:1px 5px;border-radius:3px;border:1px solid rgba(255,255,255,0.1);">⏱️ ${fmtTimeWithAge(p.created_at || p.timestamp)}</span>` : ""}
           </div>
           <span class="opp-score ${scoreClass(p.opportunity_score)}">${p.opportunity_score} pts</span>
         </div>
@@ -3190,6 +3212,7 @@ Dev: ${p.dev_wallet}">
             ${isStonk 
               ? '<span class="badge" style="background:#0284c7;color:#fff;font-weight:700;font-size:9px;padding:1px 5px;border-radius:3px;">📈 StonkFun</span>' 
               : `<span style="color:var(--text-dim);font-size:10px;">${p.platform || "-"}</span>`}
+            ${(p.created_at || p.timestamp) ? `<span class="badge" style="background:rgba(255,255,255,0.06);color:var(--text-bright);font-size:9px;padding:1px 5px;border-radius:3px;border:1px solid rgba(255,255,255,0.1);">⏱️ ${fmtTimeWithAge(p.created_at || p.timestamp)}</span>` : ""}
           </div>
           <span class="opp-score ${scoreClass(p.early_momentum_score)}">${p.early_momentum_score} pts</span>
         </div>

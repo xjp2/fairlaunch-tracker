@@ -7430,6 +7430,22 @@ def _format_telegram_opportunity_message(entry: dict[str, Any]) -> str:
     plat_display = "📈 StonkFun" if is_stonk else esc(platform)
     title_badge = " <i>[📈 StonkFun]</i>" if is_stonk else ""
 
+    created_at = entry.get("created_at") or entry.get("timestamp")
+    timing_parts = []
+    if created_at:
+        age_sec = max(0, int(time.time() - created_at))
+        if age_sec < 60:
+            timing_parts.append(f"{age_sec}s ago")
+        elif age_sec < 3600:
+            timing_parts.append(f"{age_sec // 60}m ago")
+        elif age_sec < 86400:
+            timing_parts.append(f"{age_sec // 3600}h {(age_sec % 3600) // 60}m ago")
+        else:
+            timing_parts.append(f"{age_sec // 86400}d ago")
+    now_utc = datetime.fromtimestamp(entry.get("timestamp") or time.time(), tz=timezone.utc).strftime("%H:%M UTC")
+    timing_parts.append(now_utc)
+    timing_str = " · ".join(timing_parts)
+
     header_block = (
         f"🎯 <b>${esc(ticker)}</b>{title_badge}\n"
         f"🪐 <b>Platform:</b> {esc(chain)} • {plat_display}\n\n"
@@ -7438,7 +7454,8 @@ def _format_telegram_opportunity_message(entry: dict[str, Any]) -> str:
         f"💰 <b>MCap:</b> {mcap_str}  │  💧 <b>Liq:</b> {liq_str}\n"
         f"📊 <b>Vol 24h:</b> {vol_str}  <i>({buys_24h}B / {sells_24h}S)</i>\n"
         f"👥 <b>Holders:</b> {holders_str}  │  🧑‍💻 <b>Dev:</b> {dev_str}\n"
-        f"🛡️ <b>Security:</b> {esc(clean_gp)}  │  💸 <b>Tax:</b> {esc(tax_str)}\n\n"
+        f"🛡️ <b>Security:</b> {esc(clean_gp)}  │  💸 <b>Tax:</b> {esc(tax_str)}\n"
+        f"⏱️ <b>Timing:</b> {esc(timing_str)}\n\n"
     )
 
     # Key driving signals as neat bullet points (top 2 for high signal & guaranteed fit)
@@ -7582,6 +7599,22 @@ def _format_telegram_early_momentum_message(entry: dict[str, Any]) -> str:
     plat_display = "📈 StonkFun" if is_stonk else esc(platform)
     title_badge = " <i>[📈 StonkFun]</i>" if is_stonk else ""
 
+    created_at = entry.get("created_at") or entry.get("timestamp")
+    timing_parts = []
+    if created_at:
+        age_sec = max(0, int(time.time() - created_at))
+        if age_sec < 60:
+            timing_parts.append(f"{age_sec}s ago")
+        elif age_sec < 3600:
+            timing_parts.append(f"{age_sec // 60}m ago")
+        elif age_sec < 86400:
+            timing_parts.append(f"{age_sec // 3600}h {(age_sec % 3600) // 60}m ago")
+        else:
+            timing_parts.append(f"{age_sec // 86400}d ago")
+    now_utc = datetime.fromtimestamp(entry.get("timestamp") or time.time(), tz=timezone.utc).strftime("%H:%M UTC")
+    timing_parts.append(now_utc)
+    timing_str = " · ".join(timing_parts)
+
     header_block = (
         f"⚡ <b>Early Momentum: ${esc(ticker)}</b>{title_badge}\n"
         f"🪐 <b>Platform:</b> {esc(chain)} • {plat_display}\n\n"
@@ -7590,7 +7623,8 @@ def _format_telegram_early_momentum_message(entry: dict[str, Any]) -> str:
         f"💰 <b>MCap:</b> {mcap_str}  │  💧 <b>Liq:</b> {liq_str}\n"
         f"📊 <b>Vol 24h:</b> {vol_str}  <i>({buys_24h}B / {sells_24h}S)</i>\n"
         f"👥 <b>Holders:</b> {holders_str}  │  🧑‍💻 <b>Dev:</b> {dev_str}\n"
-        f"🛡️ <b>Security:</b> {esc(clean_gp)}  │  💸 <b>Tax:</b> {esc(tax_str)}\n\n"
+        f"🛡️ <b>Security:</b> {esc(clean_gp)}  │  💸 <b>Tax:</b> {esc(tax_str)}\n"
+        f"⏱️ <b>Timing:</b> {esc(timing_str)}\n\n"
     )
 
     reasons = entry.get("early_momentum_reasons") or []
