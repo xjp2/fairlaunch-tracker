@@ -907,23 +907,51 @@ DEV_LAUNCH_HISTORY: dict[str, list[dict[str, Any]]] = defaultdict(list)
 DEV_LAUNCH_HISTORY_MAX_PER_DEV = 10
 
 
-def record_dev_launch_event(dev_wallet: str, token_address: str, ticker: str, chain: str, platform: str, ts: float) -> list[dict[str, Any]]:
+def record_dev_launch_event(
+    dev_wallet: str,
+    token_address: str,
+    ticker: str,
+    chain: str,
+    platform: str,
+    ts: float,
+    peak_market_cap: float = 0.0,
+) -> list[dict[str, Any]]:
     """Records a token launch under the dev wallet and returns prior launched tokens."""
     if not dev_wallet or dev_wallet.lower() in KNOWN_INFRASTRUCTURE_ADDRESSES or dev_wallet.lower().startswith("stonkboard") or dev_wallet.lower().startswith("discovered:"):
         return []
     history = DEV_LAUNCH_HISTORY[dev_wallet]
     prior = [h for h in history if h.get("token_address") != token_address]
-    if not any(h.get("token_address") == token_address for h in history):
+    existing = next((h for h in history if h.get("token_address") == token_address), None)
+    if existing is None:
         history.append({
             "token_address": token_address,
             "ticker": ticker or "UNKNOWN",
             "chain": chain,
             "platform": platform,
             "timestamp": ts,
+            "peak_market_cap": float(peak_market_cap or 0.0),
         })
         if len(history) > DEV_LAUNCH_HISTORY_MAX_PER_DEV:
             del history[0]
+    elif peak_market_cap > float(existing.get("peak_market_cap") or 0.0):
+        existing["peak_market_cap"] = float(peak_market_cap)
     return prior
+
+
+def record_token_peak_mcap(token_address: str, peak_mcap: float, dev_wallet: Optional[str] = None) -> None:
+    """Updates peak market cap in DEV_LAUNCH_HISTORY for matching token_address."""
+    if not token_address or peak_mcap <= 0:
+        return
+    wallets = [dev_wallet] if dev_wallet else list(DEV_LAUNCH_HISTORY.keys())
+    for w in wallets:
+        if not w:
+            continue
+        for item in DEV_LAUNCH_HISTORY.get(w, []):
+            if item.get("token_address") == token_address:
+                if peak_mcap > float(item.get("peak_market_cap") or 0.0):
+                    item["peak_market_cap"] = float(peak_mcap)
+                break
+
 
 # --- Bundled-wallet detection (see detect_evm_bundle / detect_solana_bundle) -
 # A "bundle" is a set of wallets that only *look* like independent holders —
@@ -1137,6 +1165,40 @@ def token_feed_upsert(token_address: str, **fields: Any) -> dict[str, Any]:
         if not entry.get("image_url"):
             entry["image_url"] = f"https://thestonkboard.com/api/logos/{token_address}"
     return entry
+
+
+def format_mcap_compact(mcap: float) -> str:
+    if not mcap or mcap <= 0:
+        return ""
+    if mcap >= 1_000_000:
+        val = mcap / 1_000_000
+        return f"${val:.2f}M".replace(".00M", "M")
+    elif mcap >= 1_000:
+        val = mcap / 1_000
+        return f"${val:.1f}k".replace(".0k", "k")
+    else:
+        return f"${mcap:.0f}"
+
+
+def get_known_token_peak_mcap(token_address: str) -> float:
+    """Finds highest known peak market cap for a token address across in-memory tracking stores."""
+    if not token_address:
+        return 0.0
+    peaks = []
+    if token_address in MOCK_PORTFOLIO:
+        peaks.append(float(MOCK_PORTFOLIO[token_address].get("peak_market_cap") or 0.0))
+        peaks.append(float(MOCK_PORTFOLIO[token_address].get("last_known_market_cap") or 0.0))
+    if token_address in TOKEN_WATCHLIST:
+        peaks.append(float(TOKEN_WATCHLIST[token_address].get("peak_market_cap") or 0.0))
+        peaks.append(float(TOKEN_WATCHLIST[token_address].get("market_cap") or 0.0))
+    if token_address in TOKEN_FEED:
+        peaks.append(float(TOKEN_FEED[token_address].get("peak_market_cap") or 0.0))
+        peaks.append(float(TOKEN_FEED[token_address].get("market_cap") or 0.0))
+    for chain_runners in BIG_RUNNERS.values():
+        for r in chain_runners:
+            if r.get("token_address") == token_address and r.get("peak_mcap"):
+                peaks.append(float(r["peak_mcap"]))
+    return max(peaks, default=0.0)
 
 
 import re as _re_desc
@@ -1819,6 +1881,34 @@ async def fetch_token_price_usd(token_address: str) -> float:
 async def fetch_token_market_cap_usd(token_address: str) -> float:
     info = await fetch_dexscreener_info(token_address)
     return info.get("market_cap", 0.0)
+
+
+async def ensure_prior_launches_peak_mcap(entry: dict[str, Any]) -> None:
+    """Ensures prior launched tokens have their peak market caps populated before alerts are sent."""
+    dev_wallet = entry.get("dev_wallet", "")
+    if not dev_wallet or dev_wallet.lower().startswith("stonkboard") or dev_wallet.lower().startswith("discovered:"):
+        return
+    launches = entry.get("dev_prior_launches") or DEV_LAUNCH_HISTORY.get(dev_wallet, [])
+    current_addr = entry.get("token_address")
+    for h in launches:
+        t_addr = h.get("token_address")
+        if not t_addr or t_addr == current_addr:
+            continue
+        peak = float(h.get("peak_market_cap") or 0.0)
+        if peak <= 0:
+            peak = get_known_token_peak_mcap(t_addr)
+            if peak > 0:
+                h["peak_market_cap"] = peak
+                record_token_peak_mcap(t_addr, peak, dev_wallet)
+            else:
+                try:
+                    mcap = await fetch_token_market_cap_usd(t_addr)
+                    if mcap > 0:
+                        h["peak_market_cap"] = mcap
+                        record_token_peak_mcap(t_addr, mcap, dev_wallet)
+                except Exception:
+                    pass
+
 
 
 CHAIN_EXPLORER_URLS = {
@@ -2993,12 +3083,30 @@ def compute_opportunity_score(entry: dict[str, Any]) -> tuple[int, list[str]]:
             return 0, [f"Dev has prior rug history ({dev_rugs} rugs) — serial rugger discarded"]
 
         if dev_total > 1:
-            priors = entry.get("dev_prior_tickers") or [
-                h.get("ticker") for h in DEV_LAUNCH_HISTORY.get(dev_wallet, [])
-                if h.get("ticker") and h.get("ticker") != "UNKNOWN" and h.get("token_address") != entry.get("token_address")
+            prior_launches = entry.get("dev_prior_launches") or [
+                h for h in DEV_LAUNCH_HISTORY.get(dev_wallet, [])
+                if h.get("token_address") != entry.get("token_address")
             ]
-            unique_priors = list(dict.fromkeys(priors))
-            prior_str = f" (${', $'.join(unique_priors[:3])})" if unique_priors else ""
+            dedup_map: dict[str, dict[str, Any]] = {}
+            for h in prior_launches:
+                t = h.get("ticker")
+                if not t or t == "UNKNOWN":
+                    continue
+                peak = float(h.get("peak_market_cap") or 0.0) or get_known_token_peak_mcap(h.get("token_address", ""))
+                if t not in dedup_map or peak > float(dedup_map[t].get("peak_market_cap") or 0.0):
+                    dedup_map[t] = {"ticker": t, "peak_market_cap": peak}
+            if dedup_map:
+                prior_strs = []
+                for d in list(dedup_map.values())[:3]:
+                    if d["peak_market_cap"] > 0:
+                        prior_strs.append(f"${d['ticker']} peak {format_mcap_compact(d['peak_market_cap'])}")
+                    else:
+                        prior_strs.append(f"${d['ticker']}")
+                prior_str = f" ({', '.join(prior_strs)})"
+            elif entry.get("dev_prior_tickers"):
+                prior_str = f" (${', $'.join(entry.get('dev_prior_tickers')[:3])})"
+            else:
+                prior_str = ""
             reasons.append(f"⚠️ Multi-launch dev: {dev_total} launches on record{prior_str} (-5)")
             score -= 5
 
@@ -3349,12 +3457,30 @@ def compute_early_momentum_score(entry: dict[str, Any]) -> tuple[int, list[str]]
             return 0, [f"Dev has prior rug history ({dev_rugs} rugs) — serial rugger discarded"]
 
         if dev_total > 1:
-            priors = entry.get("dev_prior_tickers") or [
-                h.get("ticker") for h in DEV_LAUNCH_HISTORY.get(dev_wallet, [])
-                if h.get("ticker") and h.get("ticker") != "UNKNOWN" and h.get("token_address") != entry.get("token_address")
+            prior_launches = entry.get("dev_prior_launches") or [
+                h for h in DEV_LAUNCH_HISTORY.get(dev_wallet, [])
+                if h.get("token_address") != entry.get("token_address")
             ]
-            unique_priors = list(dict.fromkeys(priors))
-            prior_str = f" (${', $'.join(unique_priors[:3])})" if unique_priors else ""
+            dedup_map: dict[str, dict[str, Any]] = {}
+            for h in prior_launches:
+                t = h.get("ticker")
+                if not t or t == "UNKNOWN":
+                    continue
+                peak = float(h.get("peak_market_cap") or 0.0) or get_known_token_peak_mcap(h.get("token_address", ""))
+                if t not in dedup_map or peak > float(dedup_map[t].get("peak_market_cap") or 0.0):
+                    dedup_map[t] = {"ticker": t, "peak_market_cap": peak}
+            if dedup_map:
+                prior_strs = []
+                for d in list(dedup_map.values())[:3]:
+                    if d["peak_market_cap"] > 0:
+                        prior_strs.append(f"${d['ticker']} peak {format_mcap_compact(d['peak_market_cap'])}")
+                    else:
+                        prior_strs.append(f"${d['ticker']}")
+                prior_str = f" ({', '.join(prior_strs)})"
+            elif entry.get("dev_prior_tickers"):
+                prior_str = f" (${', $'.join(entry.get('dev_prior_tickers')[:3])})"
+            else:
+                prior_str = ""
             reasons.append(f"⚠️ Multi-launch dev: {dev_total} launches on record{prior_str}")
 
     # Free early social presence score
@@ -6005,10 +6131,18 @@ def dev_rep_badge_fields(dev_wallet: str, current_token_address: Optional[str] =
     spam_count = len(DEV_SPAM_LOG.get(dev_wallet, []))
     rug_history_count = len(DEV_RUG_HISTORY.get(dev_wallet, []))
     all_launches = DEV_LAUNCH_HISTORY.get(dev_wallet, [])
-    prior_launches = [
-        h for h in all_launches
-        if not current_token_address or h.get("token_address") != current_token_address
-    ]
+    prior_launches = []
+    for h in all_launches:
+        if current_token_address and h.get("token_address") == current_token_address:
+            continue
+        launch_copy = dict(h)
+        t_addr = launch_copy.get("token_address", "")
+        if float(launch_copy.get("peak_market_cap") or 0.0) <= 0 and t_addr:
+            known = get_known_token_peak_mcap(t_addr)
+            if known > 0:
+                launch_copy["peak_market_cap"] = known
+                h["peak_market_cap"] = known
+        prior_launches.append(launch_copy)
     prior_tickers = [h.get("ticker", "") for h in prior_launches if h.get("ticker") and h.get("ticker") != "UNKNOWN"]
     unique_prior_tickers = list(dict.fromkeys(prior_tickers))
 
@@ -7271,6 +7405,7 @@ async def mark_token_graduated(token_address: str, source: str) -> None:
 
     if market_cap > info["peak_market_cap"]:
         info["peak_market_cap"] = market_cap
+    record_token_peak_mcap(token_address, info["peak_market_cap"], info.get("dev_wallet"))
     record_big_runner_if_qualified(token_address, TOKEN_FEED.get(token_address, info), info["peak_market_cap"])
     info["status"] = "GRADUATED"
     _credit_early_buyers(token_address, info["chain"], "graduations")
@@ -7483,7 +7618,30 @@ def _format_telegram_opportunity_message(entry: dict[str, Any]) -> str:
 
     dev_warn_line = ""
     if dev_total > 1:
-        if unique_priors:
+        prior_launches = entry.get("dev_prior_launches") or [
+            h for h in DEV_LAUNCH_HISTORY.get(dev_wallet, [])
+            if h.get("token_address") != token_address
+        ]
+        dedup_map: dict[str, dict[str, Any]] = {}
+        for h in prior_launches:
+            t = h.get("ticker")
+            if not t or t == "UNKNOWN":
+                continue
+            peak = float(h.get("peak_market_cap") or 0.0) or get_known_token_peak_mcap(h.get("token_address", ""))
+            if t not in dedup_map or peak > float(dedup_map[t].get("peak_market_cap") or 0.0):
+                dedup_map[t] = {"ticker": t, "peak_market_cap": peak}
+        if dedup_map:
+            prior_items = []
+            for d in list(dedup_map.values())[:4]:
+                p_mcap = d["peak_market_cap"]
+                if p_mcap > 0:
+                    prior_items.append(f"${esc(d['ticker'])} (peak {format_mcap_compact(p_mcap)})")
+                else:
+                    prior_items.append(f"${esc(d['ticker'])}")
+            if len(dedup_map) > 4:
+                prior_items.append(f"(+{len(dedup_map)-4} more)")
+            dev_warn_line = f"⚠️ <b>Dev Previously Launched ({dev_total}x):</b> {', '.join(prior_items)}\n"
+        elif unique_priors:
             prior_display = ", ".join(f"${esc(t)}" for t in unique_priors[:4])
             if len(unique_priors) > 4:
                 prior_display += f" (+{len(unique_priors)-4} more)"
@@ -7680,7 +7838,30 @@ def _format_telegram_early_momentum_message(entry: dict[str, Any]) -> str:
 
     dev_warn_line = ""
     if dev_total > 1:
-        if unique_priors:
+        prior_launches = entry.get("dev_prior_launches") or [
+            h for h in DEV_LAUNCH_HISTORY.get(dev_wallet, [])
+            if h.get("token_address") != token_address
+        ]
+        dedup_map: dict[str, dict[str, Any]] = {}
+        for h in prior_launches:
+            t = h.get("ticker")
+            if not t or t == "UNKNOWN":
+                continue
+            peak = float(h.get("peak_market_cap") or 0.0) or get_known_token_peak_mcap(h.get("token_address", ""))
+            if t not in dedup_map or peak > float(dedup_map[t].get("peak_market_cap") or 0.0):
+                dedup_map[t] = {"ticker": t, "peak_market_cap": peak}
+        if dedup_map:
+            prior_items = []
+            for d in list(dedup_map.values())[:4]:
+                p_mcap = d["peak_market_cap"]
+                if p_mcap > 0:
+                    prior_items.append(f"${esc(d['ticker'])} (peak {format_mcap_compact(p_mcap)})")
+                else:
+                    prior_items.append(f"${esc(d['ticker'])}")
+            if len(dedup_map) > 4:
+                prior_items.append(f"(+{len(dedup_map)-4} more)")
+            dev_warn_line = f"⚠️ <b>Dev Previously Launched ({dev_total}x):</b> {', '.join(prior_items)}\n"
+        elif unique_priors:
             prior_display = ", ".join(f"${esc(t)}" for t in unique_priors[:4])
             if len(unique_priors) > 4:
                 prior_display += f" (+{len(unique_priors)-4} more)"
@@ -7966,6 +8147,7 @@ def _open_mock_position(token_address: str, entry: dict[str, Any], score: int, t
     if not _is_safe_vetted_token(token_address, entry):
         return
     entry_market_cap = entry.get("market_cap") or 0.0
+    record_token_peak_mcap(token_address, entry_market_cap, entry.get("dev_wallet"))
     is_stonk = is_stonkboard_token(token_address, entry.get("platform"), entry.get("links"))
     MOCK_PORTFOLIO[token_address] = {
         "ticker": entry.get("ticker"),
@@ -7985,6 +8167,9 @@ def _open_mock_position(token_address: str, entry: dict[str, Any], score: int, t
         "peak_ts": ts,
         "goplus": entry.get("goplus"),
         "is_stonkboard": is_stonk,
+        "dev_total_launches": entry.get("dev_total_launches"),
+        "dev_prior_tickers": entry.get("dev_prior_tickers"),
+        "dev_prior_launches": entry.get("dev_prior_launches"),
     }
     if len(MOCK_PORTFOLIO) > MOCK_PORTFOLIO_MAX:
         oldest_key = next(iter(MOCK_PORTFOLIO))
@@ -8008,6 +8193,7 @@ async def _update_mock_portfolio_market_caps() -> None:
             if mcap > pos.get("peak_market_cap", 0.0):
                 pos["peak_market_cap"] = mcap
                 pos["peak_ts"] = now
+                record_token_peak_mcap(addr, pos["peak_market_cap"], pos.get("dev_wallet"))
         elif now - last_ts > 45:
             try:
                 dex = await fetch_dexscreener_info(addr)
@@ -8018,6 +8204,7 @@ async def _update_mock_portfolio_market_caps() -> None:
                     if mcap > pos.get("peak_market_cap", 0.0):
                         pos["peak_market_cap"] = mcap
                         pos["peak_ts"] = now
+                        record_token_peak_mcap(addr, pos["peak_market_cap"], pos.get("dev_wallet"))
                 await asyncio.sleep(0.2)
             except Exception:
                 pass
@@ -8190,6 +8377,9 @@ async def _rescore_token_and_maybe_ping(token_address: str) -> None:
             "goplus": entry.get("goplus"),
             "debot": entry.get("debot"),
             "is_stonkboard": is_stonk,
+            "dev_total_launches": entry.get("dev_total_launches"),
+            "dev_prior_tickers": entry.get("dev_prior_tickers"),
+            "dev_prior_launches": entry.get("dev_prior_launches"),
             "timestamp": time.time(),
         }
         RECENT_OPPORTUNITIES.append(opp_alert)
@@ -8205,6 +8395,7 @@ async def _rescore_token_and_maybe_ping(token_address: str) -> None:
         _mark_telegram_pinged(token_address)
         if entry.get("debot") is None:
             entry["debot"] = await fetch_debot_story(token_address)
+        await ensure_prior_launches_peak_mcap(entry)
         text = _format_telegram_opportunity_message(entry)
         markup = _build_telegram_reply_markup(entry.get("chain", "solana"), token_address, entry.get("platform"))
         TELEGRAM_SEND_QUEUE.put_nowait((text, entry.get("image_url"), markup))
@@ -8230,6 +8421,7 @@ async def _rescore_token_and_maybe_ping(token_address: str) -> None:
             _mark_telegram_early_pinged(token_address)
             if entry.get("debot") is None:
                 entry["debot"] = await fetch_debot_story(token_address)
+            await ensure_prior_launches_peak_mcap(entry)
             early_text = _format_telegram_early_momentum_message(entry)
             markup = _build_telegram_reply_markup(entry.get("chain", "solana"), token_address, entry.get("platform"))
             TELEGRAM_SEND_QUEUE.put_nowait((early_text, entry.get("image_url"), markup))
@@ -8619,6 +8811,7 @@ async def _process_watchlist_token(token_address: str, info: dict[str, Any], now
     price_usd = dex_info.get("price_usd", 0.0)
     if market_cap > info["peak_market_cap"]:
         info["peak_market_cap"] = market_cap
+    record_token_peak_mcap(token_address, info["peak_market_cap"], info.get("dev_wallet"))
     record_big_runner_if_qualified(token_address, TOKEN_FEED.get(token_address) or info, info["peak_market_cap"])
 
     if token_address in MOCK_PORTFOLIO:
