@@ -1415,10 +1415,14 @@
       <button class="jev-subnav-btn" data-subtab="jev-view-proposals">
         🧪 Hypothesis Discovery <span class="sub-badge" id="jev-subtab-count-proposals">0</span>
       </button>
+      <button class="jev-subnav-btn" data-subtab="jev-view-smartmoney">
+        🧠 Smart Money Intel <span class="sub-badge" id="jev-subtab-count-smartmoney">0</span>
+      </button>
       <button class="jev-subnav-btn" data-subtab="jev-view-audit">
         📜 Decision Audit Log <span class="sub-badge" id="jev-subtab-count-audit">0</span>
       </button>
     </div>
+
 
     <!-- SUB-PANEL 1: Live Evaluations -->
     <div class="jev-sub-panel active" id="jev-view-evals">
@@ -1507,8 +1511,22 @@
       </div>
     </div>
 
+    <!-- SUB-PANEL 7: Smart Money Reverse Engineering -->
+    <div class="jev-sub-panel" id="jev-view-smartmoney">
+      <div class="panel">
+        <div class="panel-header">
+          <span>🧠 Smart Money Strategy Reverse Engineering</span>
+          <span class="hint">TypeSafe System One archetype classification, conviction scoring &amp; intent</span>
+        </div>
+        <div class="panel-body" id="jev-smartmoney-feed">
+          <div class="empty-state">No reverse-engineered smart money trades yet — watching 99 verified alpha wallets.</div>
+        </div>
+      </div>
+    </div>
+
   </div>
 </section>
+
 
 <!-- ======================================================================== -->
 <!-- TAB 4: MARKET ALPHA & ALERTS -->
@@ -2233,16 +2251,39 @@
       ? `https://solscan.io/token/${payload.token_address}`
       : `https://basescan.org/token/${payload.token_address}`;
 
+    let intelHtml = "";
+    if (payload.jev_intel) {
+      const intel = payload.jev_intel;
+      intelHtml = `
+        <div style="margin-top:7px;padding:6px 9px;background:rgba(255,255,255,0.03);border:1px solid rgba(255,255,255,0.08);border-radius:6px;font-size:0.75rem;">
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;">
+            <span style="color:var(--accent);font-weight:700;letter-spacing:0.02em;">🧠 JEV REVERSE ENG</span>
+            <span class="badge" style="background:rgba(59,130,246,0.18);color:#93c5fd;font-weight:600;padding:2px 6px;border-radius:4px;">${intel.archetype_label || intel.archetype}</span>
+          </div>
+          <div style="color:var(--text-muted);display:flex;gap:10px;flex-wrap:wrap;line-height:1.4;">
+            <span>⚡ <b>${intel.conviction_label || "Conviction"}</b> (${intel.conviction_score}/4)</span>
+            <span>📈 <b>${intel.hold_intent_pct}%</b> hold intent</span>
+            <span>📊 <b>${intel.size_multiple}x</b> avg size</span>
+          </div>
+        </div>
+      `;
+      if (typeof renderJevSmartMoney === "function") {
+        renderJevSmartMoney(intel);
+      }
+    }
+
     card.innerHTML = `
       <div class="title"><a href="${walletLink}" target="_blank" rel="noopener noreferrer" style="color:inherit;text-decoration:none;font-weight:600;">${payload.alias || shortAddr(payload.wallet)}</a></div>
       <div class="meta">${chainTag(payload.chain)} bought <a href="${tokenLink}" target="_blank" rel="noopener noreferrer" style="color:var(--text-muted);text-decoration:underline;">${shortAddr(payload.token_address)}</a></div>
       <div class="meta">${fmtUsd(payload.trade_size_usd)} &middot; ${fmtTime(payload.timestamp)}</div>
+      ${intelHtml}
     `;
     smartMoneyFeed.prepend(card);
     while (smartMoneyFeed.children.length > 150) {
       smartMoneyFeed.removeChild(smartMoneyFeed.lastChild);
     }
   }
+
 
 
   const tokenStatusCounts = { ALL: 0, WATCHING: 0, GRADUATED: 0, RUGGED: 0, SKIPPED: 0, EXPIRED_WATCH: 0 };
@@ -2777,17 +2818,22 @@
     // Populate recent judgments & events if present in snapshot/API
     if (stats.recent_judgments) renderJevActivity(stats.recent_judgments);
     if (stats.recent_events) renderJevEvents(stats.recent_events);
+    if (stats.recent_smart_money_intel && Array.isArray(stats.recent_smart_money_intel)) {
+      stats.recent_smart_money_intel.forEach(renderJevSmartMoney);
+    }
   }
 
   // --- Jev Event Log: every action, including skips ---
   const JEV_EVENT_STYLE = {
-    evaluated: { icon: "🧠", cls: "jev-ev-eval", label: "EVALUATED" },
-    vetoed:    { icon: "🚫", cls: "jev-ev-veto", label: "VETOED" },
-    skipped:   { icon: "⏭️", cls: "jev-ev-skip", label: "SKIPPED" },
-    error:     { icon: "⚠️", cls: "jev-ev-err", label: "ERROR" },
-    pvp_pick:  { icon: "⚔️", cls: "jev-ev-pvp", label: "PvP PICK" },
-    proposed:  { icon: "🧪", cls: "jev-ev-pvp", label: "PROPOSED" },
+    evaluated:         { icon: "🧠", cls: "jev-ev-eval", label: "EVALUATED" },
+    vetoed:            { icon: "🚫", cls: "jev-ev-veto", label: "VETOED" },
+    skipped:           { icon: "⏭️", cls: "jev-ev-skip", label: "SKIPPED" },
+    error:             { icon: "⚠️", cls: "jev-ev-err", label: "ERROR" },
+    pvp_pick:          { icon: "⚔️", cls: "jev-ev-pvp", label: "PvP PICK" },
+    proposed:          { icon: "🧪", cls: "jev-ev-pvp", label: "PROPOSED" },
+    smart_money_intel: { icon: "🧠", cls: "jev-ev-eval", label: "SMART MONEY" },
   };
+
   function jevEventRowHtml(e) {
     const s = JEV_EVENT_STYLE[e.type] || { icon: "•", cls: "", label: (e.type||"").toUpperCase() };
     const when = e.ts ? new Date(e.ts * 1000).toLocaleTimeString() : "";
@@ -2968,6 +3014,55 @@
     const countPvp = document.getElementById("jev-subtab-count-pvp");
     if (countPvp) countPvp.textContent = c.children.length;
   }
+
+  const seenJevSmartMoney = new Set();
+  function renderJevSmartMoney(intel) {
+    if (!intel || !intel.wallet) return;
+    const key = `${intel.wallet}:${intel.token_address}:${intel.evaluated_at || 0}`;
+    if (seenJevSmartMoney.has(key)) return;
+    seenJevSmartMoney.add(key);
+
+    const c = document.getElementById("jev-smartmoney-feed");
+    if (!c) return;
+    if (c.querySelector(".empty-state")) c.innerHTML = "";
+
+    const when = intel.evaluated_at ? new Date(intel.evaluated_at * 1000).toLocaleTimeString() : "";
+    const card = document.createElement("div");
+    card.className = "jev-judgment";
+    card.style.borderLeft = "3px solid var(--accent)";
+    card.style.marginBottom = "8px";
+
+    const solscanUrl = intel.chain === "solana"
+      ? `https://solscan.io/account/${intel.wallet}`
+      : `https://basescan.org/address/${intel.wallet}`;
+    const tokenUrl = intel.chain === "solana"
+      ? `https://solscan.io/token/${intel.token_address}`
+      : `https://basescan.org/token/${intel.token_address}`;
+
+    card.innerHTML = `
+      <div class="jev-j-head" style="margin-bottom:6px;">
+        <span class="jev-j-tick">
+          🧠 <a href="${solscanUrl}" target="_blank" rel="noopener" style="color:inherit;text-decoration:underline;">${intel.alias}</a>
+          bought <a href="${tokenUrl}" target="_blank" rel="noopener" style="color:var(--text);">$${intel.ticker || "TOKEN"}</a>
+        </span>
+        <span class="badge" style="background:rgba(59,130,246,0.18);color:#93c5fd;font-weight:600;padding:2px 8px;border-radius:4px;">${intel.archetype_label || intel.archetype}</span>
+        <span class="jev-j-when">${when}</span>
+      </div>
+      <div style="font-size:0.8rem;color:var(--text);margin-bottom:6px;line-height:1.4;">
+        ${intel.summary ? intel.summary.replace(/</g, "&lt;") : ""}
+      </div>
+      <div style="display:flex;gap:12px;font-size:0.75rem;color:var(--text-muted);background:rgba(255,255,255,0.02);padding:6px 10px;border-radius:4px;border:1px solid rgba(255,255,255,0.05);flex-wrap:wrap;">
+        <span>⚡ <b>Follow Conviction:</b> <span style="color:#60a5fa;">${intel.conviction_label}</span> (Score ${intel.conviction_score}/4)</span>
+        <span>📈 <b>Graduation Hold Intent:</b> <span style="color:${intel.hold_intent_pct >= 50 ? '#34d399' : '#f87171'}">${intel.hold_intent_pct}%</span></span>
+        <span>💰 <b>Trade Size:</b> $${(intel.trade_size_usd||0).toLocaleString()} (<b>${intel.size_multiple}x</b> historical avg)</span>
+      </div>
+    `;
+    c.prepend(card);
+    while (c.children.length > 50) c.removeChild(c.lastChild);
+    const countEl = document.getElementById("jev-subtab-count-smartmoney");
+    if (countEl) countEl.textContent = c.children.length;
+  }
+
 
   function renderMockPortfolio(positions) {
     const container = document.getElementById("mock-portfolio");
@@ -3426,6 +3521,10 @@ Dev: ${p.dev_wallet}">
       case "jev_event":
         renderJevEvent(msg.payload);
         break;
+      case "jev_smart_money":
+        renderJevSmartMoney(msg.payload);
+        break;
+
       case "opportunity_history":
         renderOpportunityHistoryList(msg.payload);
         break;

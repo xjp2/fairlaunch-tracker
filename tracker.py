@@ -1056,6 +1056,7 @@ RECENT_JEV_JUDGMENTS: "deque" = deque(maxlen=60)
 # (with the exact reason), every veto, every API error, every PvP pick/skip.
 # The point: no Jev action is invisible. Broadcast live + shown as a stream.
 RECENT_JEV_EVENTS: "deque" = deque(maxlen=200)
+RECENT_JEV_SMART_MONEY: "deque" = deque(maxlen=50)
 # Tokens that have already emitted a budget-block event today (dedup so a
 # capped day doesn't flood the log with the same token every poll).
 JEV_BUDGET_BLOCKED_SEEN: set[str] = set()
@@ -4335,7 +4336,143 @@ async def maybe_screen_early_momentum_with_jev(token_address: str, entry: dict[s
     logger.info(f"[jev/screen] Stage-1 screened {ticker} ({token_address[:8]}) — narrative_quality={dims.get('narrative_quality', {}).get('score')}")
 
 
+async def jev_reverse_engineer_smart_trade(
+    wallet_address: str,
+    token_address: str,
+    chain: str,
+    trade_size_usd: float,
+    extra: Optional[dict] = None,
+) -> Optional[dict[str, Any]]:
+    """Use TypeSafe Jev System One to reverse-engineer a smart wallet trade:
+    archetype classification, follow conviction score, and hold intent."""
+    if not JEV_ENABLED:
+        return None
+
+    can_call, reason = jev_budget_status()
+    if not can_call:
+        return None
+
+    wallet_info = SMART_WALLETS.get(wallet_address, {})
+    alias = wallet_info.get("alias") or f"{wallet_address[:4]}..{wallet_address[-4:]}"
+    avg_size = wallet_info.get("avg_trade_size_usd", 1000.0)
+    mult = (trade_size_usd / avg_size) if avg_size > 0 else 1.0
+
+    token_feed_entry = TOKEN_FEED.get(token_address) or {}
+    ticker = token_feed_entry.get("ticker") or "UNKNOWN"
+    mcap = float(token_feed_entry.get("market_cap") or token_feed_entry.get("market_cap_usd") or 0.0)
+    progress = token_feed_entry.get("bonding_curve_progress") or 0.0
+    created_at = token_feed_entry.get("created_at") or time.time()
+    age_mins = round(max(0.1, (time.time() - created_at) / 60), 1)
+
+    state = {
+        "wallet": {
+            "alias": alias,
+            "chain": chain,
+            "win_rate": wallet_info.get("win_rate", 0.5),
+            "avg_trade_size_usd": avg_size,
+            "current_trade_size_usd": round(trade_size_usd, 2),
+            "size_multiple_vs_average": round(mult, 2),
+        },
+        "token": {
+            "ticker": ticker,
+            "platform": token_feed_entry.get("platform") or "pump.fun",
+            "market_cap_usd": mcap,
+            "bonding_curve_progress_pct": progress,
+            "age_minutes": age_mins,
+        },
+    }
+
+    questions = {
+        "strategy_archetype": {
+            "type": "choice",
+            "instructions": "Which trading strategy archetype best describes this smart wallet buy in `token`?",
+            "criteria": {
+                "stealth_accumulation": "Early entry before volume spike, sizing up to hold for trend",
+                "block_0_snipe": "Automated instant entry at token pool creation",
+                "momentum_breakout": "Buying into existing green candles and breakout volume",
+                "narrative_frontrun": "Entering early on a trending meme meta cluster",
+                "scalp_flip": "Quick entry to flip into retail exit liquidity",
+            },
+        },
+        "follow_conviction": {
+            "type": "score",
+            "instructions": "How strong is the conviction and follow potential for this entry?",
+            "criteria": [
+                "Trap / High Dump Risk — likely to sell quickly on next tick",
+                "Low Conviction — minor speculative test or low upside setup",
+                "Moderate — solid trade but standard risk/reward",
+                "High Conviction — oversized entry at early market cap with good setup",
+                "Elite Alpha — prime signature setup with high multi-x graduation probability",
+            ],
+        },
+        "graduation_hold_intent": {
+            "type": "noul",
+            "instructions": "Is this wallet likely intending to hold this position toward bonding curve graduation (rather than quick intra-minute scalp)?",
+        },
+    }
+
+    body = await jev_call_system_one(state, questions)
+    if not body:
+        return None
+
+    answers = body.get("answers", {}) or {}
+    arch_ans = answers.get("strategy_archetype", {})
+    conv_ans = answers.get("follow_conviction", {})
+    hold_ans = answers.get("graduation_hold_intent", {})
+
+    raw_arch = arch_ans.get("choice", "stealth_accumulation")
+    arch_labels = {
+        "stealth_accumulation": "🎯 Stealth Accumulation",
+        "block_0_snipe": "⚡ Block-0 Snipe",
+        "momentum_breakout": "🚀 Momentum Breakout",
+        "narrative_frontrun": "🌊 Narrative Frontrun",
+        "scalp_flip": "🔄 Scalp / PVP Flip",
+    }
+    archetype_label = arch_labels.get(raw_arch, raw_arch.replace("_", " ").title())
+
+    score = float(conv_ans.get("score") or 0.0)
+    conv_levels = {
+        0: "Trap / Dump Risk",
+        1: "Low Conviction",
+        2: "Moderate",
+        3: "High Conviction",
+        4: "Elite Alpha",
+    }
+    conv_label = conv_levels.get(round(score), "Moderate")
+
+    hold_pct = round(float(hold_ans.get("noul") or 0.0) * 100)
+    summary = f"{alias} buy in ${ticker} analyzed: {archetype_label} | {conv_label} (Score {score:.1f}/4) | {hold_pct}% hold intent"
+
+    intel = {
+        "wallet": wallet_address,
+        "alias": alias,
+        "chain": chain,
+        "token_address": token_address,
+        "ticker": ticker,
+        "trade_size_usd": round(trade_size_usd, 2),
+        "size_multiple": round(mult, 2),
+        "archetype": raw_arch,
+        "archetype_label": archetype_label,
+        "conviction_score": round(score, 2),
+        "conviction_label": conv_label,
+        "hold_intent_pct": hold_pct,
+        "summary": summary,
+        "evaluated_at": time.time(),
+    }
+
+    RECENT_JEV_SMART_MONEY.append(intel)
+    jev_emit_event(
+        "smart_money_intel",
+        ticker=ticker,
+        token_address=token_address,
+        reason=summary,
+    )
+
+    return intel
+
+
 async def maybe_evaluate_token_with_jev(token_address: str, entry: dict[str, Any]) -> None:
+
     """Gate + call + cache. Called from the rescore path. Spends AT MOST one Jev
     call per token, and only for candidates that clear the cost gate. Mutates
     entry['jev'] in place and logs the judgment for the learning loop."""
@@ -5777,7 +5914,9 @@ def build_jev_stats() -> dict[str, Any]:
         "proposer_llm": bool(JEV_PROPOSER_LLM_KEY and JEV_PROPOSER_LLM_URL and JEV_PROPOSER_LLM_MODEL),
         "recent_judgments": list(RECENT_JEV_JUDGMENTS)[-15:],
         "recent_events": list(RECENT_JEV_EVENTS)[-20:],
+        "recent_smart_money_intel": list(RECENT_JEV_SMART_MONEY)[-20:],
     }
+
 
 
 def _build_jev_data_gap_stats() -> dict[str, Any]:
@@ -5966,6 +6105,7 @@ async def persist_state() -> None:
         "jev_semantic_cache": dict(JEV_SEMANTIC_CACHE),
         "jev_recent_judgments": list(RECENT_JEV_JUDGMENTS),
         "jev_recent_events": list(RECENT_JEV_EVENTS)[-80:],
+        "recent_jev_smart_money": list(RECENT_JEV_SMART_MONEY),
         "jev_pvp_log": {k: v for k, v in JEV_PVP_LOG.items()},
         "jev_pvp_token_index": {k: list(v) for k, v in JEV_PVP_TOKEN_INDEX.items()},
         "jev_proposed_questions": {k: v for k, v in JEV_PROPOSED_QUESTIONS.items()},
@@ -6082,6 +6222,9 @@ def _load_state_sync() -> None:
         for evt in saved.get("jev_recent_events", []):
             if evt.get("token_address") not in STONKFUN_QUOTE_MINTS:
                 RECENT_JEV_EVENTS.append(evt)
+        for intel in saved.get("recent_jev_smart_money", []):
+            RECENT_JEV_SMART_MONEY.append(intel)
+
         for k, v in saved.get("jev_pvp_log", {}).items():
             JEV_PVP_LOG[k] = v
         for k, v in saved.get("jev_pvp_token_index", {}).items():
@@ -6465,36 +6608,9 @@ def _extract_early_buyers(token_address: str, chain: str) -> list[str]:
 
 
 def _maybe_promote_smart_wallet(wallet: str, record: dict[str, Any]) -> None:
-    if wallet in SMART_WALLETS:
-        return
-    if wallet in BUNDLE_OPERATOR_BLACKLIST or wallet in BUNDLE_OPERATOR_HISTORY:
-        # This wallet is itself a bundle operator (see _maybe_check_bundle) —
-        # its "graduations" may just be its own bundled pump-and-dumps
-        # crossing the graduation bar, not real early-buyer conviction. Never
-        # let a bundle operator earn smart-money status on that basis.
-        return
-    total = record["graduations"] + record["rugs"]
-    if record["graduations"] < SMART_WALLET_MIN_GRADUATIONS or total == 0:
-        return
-    win_rate = record["graduations"] / total
-    if win_rate < SMART_WALLET_MIN_WIN_RATE:
-        return
-    SMART_WALLETS[wallet] = {
-        "alias": f"auto-{wallet[:6]}",
-        "chain": record["chain"],
-        # No reliable per-buy dollar amount is available from graduation/rug
-        # crediting alone (would need a live per-trade $ feed on every chain,
-        # which only EVM has right now) — 0 disables CONVICTION_BUY for this
-        # wallet (guarded by stage_c_smart_money's `if avg > 0`) rather than
-        # faking a number. It still fully participates in HIVE_MIND, which
-        # needs wallet identity only, no calibration.
-        "avg_trade_size_usd": 0.0,
-        "win_rate": win_rate,
-        "auto_discovered": True,
-    }
-    logger.info(
-        f"[smart-wallet] auto-promoted {wallet} ({record['graduations']}/{total} graduations, {win_rate:.0%} win rate)"
-    )
+    # Auto-discovery disabled per user request: only explicitly curated smart wallets are monitored.
+    return
+
 
 
 def _credit_early_buyers(token_address: str, chain: str, outcome: str) -> None:
@@ -6716,6 +6832,8 @@ async def process_wallet_buy_event(
 
     c_result = await stage_c_smart_money(wallet_address, token_address, chain, trade_size_usd, ts)
 
+    jev_intel = await jev_reverse_engineer_smart_trade(wallet_address, token_address, chain, trade_size_usd, extra)
+
     event_payload = {
         "wallet": wallet_address,
         "alias": wallet_info["alias"],
@@ -6723,9 +6841,15 @@ async def process_wallet_buy_event(
         "token_address": token_address,
         "trade_size_usd": trade_size_usd,
         "timestamp": ts,
+        "jev_intel": jev_intel,
     }
     RECENT_SMART_MONEY.append(event_payload)
     await broadcast_smart_money_activity(event_payload)
+    if jev_intel:
+        await broadcast_json({"kind": "jev_smart_money", "payload": jev_intel})
+
+    if token_address in TOKEN_FEED and jev_intel:
+        TOKEN_FEED[token_address]["smart_money_intel"] = jev_intel
 
     if c_result["conviction_alert"]:
         add_token_signal(token_address, "CONVICTION_BUY")
@@ -6740,6 +6864,7 @@ async def process_wallet_buy_event(
                 "token_address": token_address,
                 "trade_size_usd": trade_size_usd,
                 "avg_trade_size_usd": wallet_info["avg_trade_size_usd"],
+                "jev_intel": jev_intel,
                 "timestamp": ts,
             }
         )
@@ -6757,9 +6882,11 @@ async def process_wallet_buy_event(
                 "wallet_aliases": [
                     SMART_WALLETS.get(w, {}).get("alias", w) for w in c_result["hive_mind_wallets"]
                 ],
+                "jev_intel": jev_intel,
                 "timestamp": ts,
             }
         )
+
 
     if c_result["conviction_alert"] or c_result["hive_mind_alert"]:
         await _rescore_token_and_maybe_ping(token_address)
@@ -7742,6 +7869,9 @@ def _format_telegram_opportunity_message(entry: dict[str, Any]) -> str:
     # Key driving signals as neat bullet points (top 2 for high signal & guaranteed fit)
     reasons = entry.get("score_reasons") or []
     signal_bullets = []
+    sm_intel = entry.get("smart_money_intel")
+    if sm_intel:
+        signal_bullets.append(f"• 🧠 <b>Smart Money Intel:</b> {esc(sm_intel.get('archetype_label'))} · {esc(sm_intel.get('conviction_label'))} ({sm_intel.get('hold_intent_pct')}% hold)")
     active_boosts = int((entry.get("socials") or {}).get("active_boosts") or 0)
     if active_boosts > 0:
         signal_bullets.append(f"• ⚡ Paid DexScreener Boosts ({active_boosts}x)")
@@ -7753,6 +7883,7 @@ def _format_telegram_opportunity_message(entry: dict[str, Any]) -> str:
     if not signal_bullets:
         signal_bullets.append("• Strong launch momentum & volume activity")
     signals_block = "💡 <b>Key Signals:</b>\n" + "\n".join(signal_bullets[:2]) + "\n\n"
+
 
     # Dedicated link block (FOMO only, with StonkBoard for StonkFun)
     links = entry.get("links") or {}
@@ -7955,6 +8086,9 @@ def _format_telegram_early_momentum_message(entry: dict[str, Any]) -> str:
 
     reasons = entry.get("early_momentum_reasons") or []
     signal_bullets = []
+    sm_intel = entry.get("smart_money_intel")
+    if sm_intel:
+        signal_bullets.append(f"• 🧠 <b>Smart Money Intel:</b> {esc(sm_intel.get('archetype_label'))} · {esc(sm_intel.get('conviction_label'))} ({sm_intel.get('hold_intent_pct')}% hold)")
     active_boosts = int((entry.get("socials") or {}).get("active_boosts") or 0)
     if active_boosts > 0:
         signal_bullets.append(f"• ⚡ Paid DexScreener Boosts ({active_boosts}x)")
@@ -7966,6 +8100,7 @@ def _format_telegram_early_momentum_message(entry: dict[str, Any]) -> str:
     if not signal_bullets:
         signal_bullets.append("• Early breakout volume surge & velocity")
     signals_block = "💡 <b>Key Signals:</b>\n" + "\n".join(signal_bullets[:2]) + "\n\n"
+
 
     # Dedicated link block (FOMO only, with StonkBoard for StonkFun)
     links = entry.get("links") or {}
