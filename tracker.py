@@ -288,7 +288,7 @@ def is_stonkboard_token(token_address: str, platform: Optional[str] = None, link
 
 async def sync_stonkboard_coins() -> None:
     """Scrapes token roster from https://thestonkboard.com so we know exactly
-    which tokens are visible on TheStonkBoard."""
+    which tokens are visible on TheStonkBoard and ingests any newly discovered StonkFun coins."""
     global STONKBOARD_LAST_SYNC_TS
     try:
         headers = {
@@ -298,13 +298,35 @@ async def sync_stonkboard_coins() -> None:
             async with session.get("https://thestonkboard.com", timeout=aiohttp.ClientTimeout(total=10)) as resp:
                 if resp.status == 200:
                     text = await resp.text()
+                    token_objs = re.findall(r'\{[^{}]*\"mint\":\"([1-9A-HJ-NP-Za-km-z]{32,44})\"[^{}]*\"symbol\":\"([^\"]+)\"[^{}]*\}', text)
                     mints = set(re.findall(r'/coin/([1-9A-HJ-NP-Za-km-z]{32,44})', text))
                     json_mints = set(re.findall(r'"mint":"([1-9A-HJ-NP-Za-km-z]{32,44})"', text))
-                    all_mints = mints | json_mints
-                    if all_mints:
-                        STONKBOARD_COIN_ADDRESSES.update(all_mints)
-                        STONKBOARD_LAST_SYNC_TS = time.time()
-                        logger.debug(f"[stonkboard] Synced {len(all_mints)} tokens from thestonkboard.com (cache size: {len(STONKBOARD_COIN_ADDRESSES)})")
+                    all_mints = mints | json_mints | {m for m, _ in token_objs}
+                    symbol_by_mint = {m: s for m, s in token_objs}
+                    
+                    now = time.time()
+                    newly_ingested = 0
+                    for mint in all_mints:
+                        STONKBOARD_COIN_ADDRESSES.add(mint)
+                        if mint not in TOKEN_FEED and mint not in TOKEN_WATCHLIST:
+                            sym = symbol_by_mint.get(mint, "UNKNOWN").strip().upper()
+                            if sym and is_probably_established_or_stock(sym, 0.0)[0]:
+                                continue
+                            if sym and ticker_is_invalid(sym)[0]:
+                                continue
+                            await process_new_token_event(
+                                chain="solana",
+                                platform="stonkfun",
+                                token_address=mint,
+                                ticker_raw=sym,
+                                dev_wallet=f"stonkboard_{mint[:8]}",
+                                ts=now,
+                                extra={"source": "thestonkboard.com"},
+                            )
+                            newly_ingested += 1
+                    STONKBOARD_LAST_SYNC_TS = now
+                    if newly_ingested > 0:
+                        logger.info(f"[stonkboard] Synced {len(all_mints)} tokens; ingested {newly_ingested} new StonkFun coins into live tracker & PvP pipeline")
     except Exception as exc:
         logger.debug(f"[stonkboard] Sync failed: {exc!r}")
 
@@ -382,7 +404,7 @@ JEV_PVP_MIN_COHORT = int(os.getenv("JEV_PVP_MIN_COHORT", "2"))
 # PvP is expensive and was over-firing — gate it: at least one cohort member
 # must have real mcap, and don't re-run the same narrative within the cooldown
 # even if the cohort drifts a little (prevents churn re-spend).
-JEV_PVP_MIN_MCAP = float(os.getenv("JEV_PVP_MIN_MCAP", "20000"))
+JEV_PVP_MIN_MCAP = float(os.getenv("JEV_PVP_MIN_MCAP", "10000"))
 JEV_PVP_COOLDOWN_SECONDS = float(os.getenv("JEV_PVP_COOLDOWN_SECONDS", "1800"))  # 30 min per narrative
 # Points from the primary 'moon potential' judgment (confidence-scaled). Jev
 # judges upside-from-here for any LIVE coin (big or small); only already-run
@@ -1758,184 +1780,160 @@ SPL_TOKEN_PROGRAM_ID = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
 SPL_TOKEN_2022_PROGRAM_ID = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
 SPL_TOKEN_ACCOUNT_SIZE = 165
 SOLANA_LAST_HOLDER_BALANCES: dict[str, dict[str, float]] = {}
+SOLANA_MINT_SECURITY_CACHE: dict[str, dict[str, Any]] = {}
+SOLANA_TOKEN_SUPPLY_CACHE: dict[str, float] = {}
 
 
-async def fetch_solana_holder_stats(mint_address: str) -> dict[str, Any]:
-    """Holder count and concentration aren't something DexScreener exposes at
-    all — but every token account is public state, so getProgramAccounts
-    filtered to this mint returns literally every holder directly, no
-    transaction-history replay needed. This is the one RPC call in the whole
-    pipeline expensive enough to warrant its own slow, separately-throttled
-    poll cadence (see HOLDER_STATS_POLL_INTERVAL_SECONDS) — a full scan of
-    every token account for a mint, not a cheap indexed lookup."""
+async def fetch_solana_holder_stats(mint_address: str, force_full_scan: bool = False) -> dict[str, Any]:
+    """Holder count and concentration using lightweight indexed Solana RPC calls.
+    Uses getTokenLargestAccounts + getMultipleAccounts (2 cheap indexed credits)
+    instead of heavy getProgramAccounts table scans to aggressively conserve Helius quota."""
     if not (SOLANA_WS_RPC_URL or SOLANA_FALLBACK_RPC_URL):
         return {}
-    mint_authority_active = False
-    freeze_authority_active = False
+
+    sec = SOLANA_MINT_SECURITY_CACHE.get(mint_address)
     try:
         async with aiohttp.ClientSession() as session:
-            # jsonParsed (not base64) so the SAME call that identifies which
-            # token program owns this mint also hands back mintAuthority/
-            # freezeAuthority pre-decoded (null once renounced) — no separate
-            # RPC round-trip or manual byte-offset parsing needed for the
-            # mintable/freezable check below.
-            mint_result = await _solana_rpc_post(session, "getAccountInfo", [mint_address, {"encoding": "jsonParsed"}])
-            if mint_result is None:
+            if not sec:
+                mint_result = await _solana_rpc_post(session, "getAccountInfo", [mint_address, {"encoding": "jsonParsed"}])
+                if mint_result is None:
+                    return {}
+                mint_value = mint_result.get("value") or {}
+                owner_program = mint_value.get("owner")
+                parsed_info = ((mint_value.get("data") or {}).get("parsed") or {}).get("info") or {}
+                mint_authority_active = parsed_info.get("mintAuthority") is not None
+                freeze_authority_active = parsed_info.get("freezeAuthority") is not None
+
+                # Inspect Token-2022 extensions for transfer hooks, default frozen accounts, or permanent delegates
+                transfer_hook_active = False
+                default_account_frozen = False
+                permanent_delegate_active = False
+                extensions = parsed_info.get("extensions") or []
+                if isinstance(extensions, list):
+                    for ext in extensions:
+                        if not isinstance(ext, dict):
+                            continue
+                        ename = ext.get("extension")
+                        estate = ext.get("state") or {}
+                        if ename == "transferHook":
+                            prog = estate.get("programId")
+                            if prog and prog != "11111111111111111111111111111111":
+                                transfer_hook_active = True
+                        elif ename == "defaultAccountState":
+                            if estate.get("accountState") == "frozen":
+                                default_account_frozen = True
+                        elif ename == "permanentDelegate":
+                            if estate.get("delegate"):
+                                permanent_delegate_active = True
+
+                is_honeypot = bool(freeze_authority_active or transfer_hook_active or default_account_frozen or permanent_delegate_active)
+                sell_whitelist = bool(transfer_hook_active or default_account_frozen)
+                honeypot_reason = ""
+                if transfer_hook_active:
+                    honeypot_reason = "Token-2022 transfer hook active (sells whitelisted)"
+                elif default_account_frozen:
+                    honeypot_reason = "Token-2022 default account state is frozen (whitelisted sells only)"
+                elif freeze_authority_active:
+                    honeypot_reason = "Freeze authority active (honeypot risk)"
+                elif permanent_delegate_active:
+                    honeypot_reason = "Permanent delegate active (honeypot risk)"
+
+                sec = {
+                    "owner_program": owner_program,
+                    "mint_authority_active": mint_authority_active,
+                    "freeze_authority_active": freeze_authority_active,
+                    "transfer_hook_active": transfer_hook_active,
+                    "default_account_frozen": default_account_frozen,
+                    "permanent_delegate_active": permanent_delegate_active,
+                    "is_honeypot": is_honeypot,
+                    "sell_whitelist": sell_whitelist,
+                    "honeypot_reason": honeypot_reason,
+                }
+                SOLANA_MINT_SECURITY_CACHE[mint_address] = sec
+
+            if sec.get("owner_program") not in (SPL_TOKEN_PROGRAM_ID, SPL_TOKEN_2022_PROGRAM_ID):
                 return {}
-            mint_value = mint_result.get("value") or {}
-            owner_program = mint_value.get("owner")
-            parsed_info = ((mint_value.get("data") or {}).get("parsed") or {}).get("info") or {}
-            mint_authority_active = parsed_info.get("mintAuthority") is not None
-            freeze_authority_active = parsed_info.get("freezeAuthority") is not None
 
-            # Inspect Token-2022 extensions for transfer hooks, default frozen accounts, or permanent delegates
-            transfer_hook_active = False
-            default_account_frozen = False
-            permanent_delegate_active = False
-            extensions = parsed_info.get("extensions") or []
-            if isinstance(extensions, list):
-                for ext in extensions:
-                    if not isinstance(ext, dict):
-                        continue
-                    ename = ext.get("extension")
-                    estate = ext.get("state") or {}
-                    if ename == "transferHook":
-                        prog = estate.get("programId")
-                        if prog and prog != "11111111111111111111111111111111":
-                            transfer_hook_active = True
-                    elif ename == "defaultAccountState":
-                        if estate.get("accountState") == "frozen":
-                            default_account_frozen = True
-                    elif ename == "permanentDelegate":
-                        if estate.get("delegate"):
-                            permanent_delegate_active = True
+            if sec.get("is_honeypot") or sec.get("sell_whitelist") or sec.get("mint_authority_active") or sec.get("freeze_authority_active"):
+                return {
+                    "holder_count": 0, "top_holder_pct": 100.0, "top10_holder_pct": 100.0,
+                    "top_holder_address": None, "top_holder_balance": 0.0,
+                    **sec,
+                }
 
-            is_honeypot = bool(freeze_authority_active or transfer_hook_active or default_account_frozen or permanent_delegate_active)
-            sell_whitelist = bool(transfer_hook_active or default_account_frozen)
-            honeypot_reason = ""
-            if transfer_hook_active:
-                honeypot_reason = "Token-2022 transfer hook active (sells whitelisted)"
-            elif default_account_frozen:
-                honeypot_reason = "Token-2022 default account state is frozen (whitelisted sells only)"
-            elif freeze_authority_active:
-                honeypot_reason = "Freeze authority active (honeypot risk)"
-            elif permanent_delegate_active:
-                honeypot_reason = "Permanent delegate active (honeypot risk)"
+            # Cache token total supply
+            supply_val = SOLANA_TOKEN_SUPPLY_CACHE.get(mint_address)
+            if supply_val is None:
+                supply_res = await _solana_rpc_post(session, "getTokenSupply", [mint_address], timeout=10.0)
+                supply_val = float(((supply_res or {}).get("value") or {}).get("uiAmount") or 1_000_000_000.0)
+                if supply_val > 0:
+                    SOLANA_TOKEN_SUPPLY_CACHE[mint_address] = supply_val
 
-            if owner_program not in (SPL_TOKEN_PROGRAM_ID, SPL_TOKEN_2022_PROGRAM_ID):
-                return {}
+            # Indexed top holder lookup (1 cheap credit)
+            largest_res = await _solana_rpc_post(session, "getTokenLargestAccounts", [mint_address], timeout=10.0)
+            largest_accounts = (largest_res or {}).get("value") or []
+            balances: dict[str, float] = {}
 
-            filters: list[dict[str, Any]] = [{"memcmp": {"offset": 0, "bytes": mint_address}}]
-            if owner_program == SPL_TOKEN_PROGRAM_ID:
-                # Only the classic program has a fixed, non-extensible account
-                # size — safe to narrow the scan with it. Token-2022 accounts
-                # vary in length once extensions are attached, so no dataSize
-                # filter is applied for that program.
-                filters.insert(0, {"dataSize": SPL_TOKEN_ACCOUNT_SIZE})
-
-            # getProgramAccounts is a full-table-scan-style call that most
-            # free public RPCs explicitly disable — the fallback in
-            # _solana_rpc_post will still be attempted, but only ever expect
-            # it to help with the cheap getAccountInfo call above.
-            accounts = await _solana_rpc_post(
-                session, "getProgramAccounts",
-                [owner_program, {"encoding": "jsonParsed", "filters": filters}],
-                timeout=20.0,
-            )
-            if accounts is None:
-                # Fallback for free/public RPCs that disable getProgramAccounts:
-                # getTokenLargestAccounts is cheap, indexed, and supported on ALL free RPCs.
-                largest_res = await _solana_rpc_post(
-                    session, "getTokenLargestAccounts", [mint_address], timeout=10.0
-                )
-                if largest_res and "value" in largest_res:
-                    largest_accounts = largest_res["value"] or []
-                    supply_res = await _solana_rpc_post(
-                        session, "getTokenSupply", [mint_address], timeout=10.0
+            if largest_accounts:
+                token_acc_addrs = [item["address"] for item in largest_accounts[:20] if item.get("address")]
+                if token_acc_addrs:
+                    multi_res = await _solana_rpc_post(
+                        session, "getMultipleAccounts", [token_acc_addrs, {"encoding": "jsonParsed"}], timeout=10.0
                     )
-                    supply_val = float(((supply_res or {}).get("value") or {}).get("uiAmount") or 1_000_000_000.0)
-                    fallback_balances: dict[str, float] = {}
-                    for item in largest_accounts:
-                        addr = item.get("address")
+                    vals = (multi_res or {}).get("value") or []
+                    for item, acc_info in zip(largest_accounts[:20], vals):
+                        owner = (((acc_info or {}).get("data") or {}).get("parsed") or {}).get("info", {}).get("owner")
+                        addr = owner or item.get("address")
                         ui_amt = float(item.get("uiAmount") or 0.0)
                         if addr and ui_amt > 0:
-                            fallback_balances[addr] = ui_amt
-                    if fallback_balances:
-                        SOLANA_LAST_HOLDER_BALANCES[mint_address] = fallback_balances
-                        sorted_items = sorted(fallback_balances.items(), key=lambda kv: kv[1], reverse=True)
-                        top_holder_pct = (sorted_items[0][1] / supply_val * 100.0) if supply_val > 0 else 0.0
-                        top10_sum = sum(v for _, v in sorted_items[:10])
-                        top10_holder_pct = (top10_sum / supply_val * 100.0) if supply_val > 0 else 0.0
-                        return {
-                            "holder_count": len(fallback_balances),
-                            "top_holder_pct": top_holder_pct,
-                            "top10_holder_pct": top10_holder_pct,
-                            "top_holder_address": sorted_items[0][0],
-                            "top_holder_balance": sorted_items[0][1],
-                            "mint_authority_active": mint_authority_active,
-                            "freeze_authority_active": freeze_authority_active,
-                            "transfer_hook_active": transfer_hook_active,
-                            "default_account_frozen": default_account_frozen,
-                            "permanent_delegate_active": permanent_delegate_active,
-                            "is_honeypot": is_honeypot,
-                            "sell_whitelist": sell_whitelist,
-                            "honeypot_reason": honeypot_reason,
-                        }
-                return {}
+                            balances[addr] = balances.get(addr, 0.0) + ui_amt
+
+            if not balances and force_full_scan:
+                # Heavy scan fallback only when requested
+                filters: list[dict[str, Any]] = [{"memcmp": {"offset": 0, "bytes": mint_address}}]
+                if sec.get("owner_program") == SPL_TOKEN_PROGRAM_ID:
+                    filters.insert(0, {"dataSize": SPL_TOKEN_ACCOUNT_SIZE})
+                accounts = await _solana_rpc_post(
+                    session, "getProgramAccounts",
+                    [sec.get("owner_program"), {"encoding": "jsonParsed", "filters": filters}],
+                    timeout=20.0,
+                )
+                if accounts:
+                    for acc in accounts:
+                        try:
+                            info = acc["account"]["data"]["parsed"]["info"]
+                            amount = float(info["tokenAmount"]["uiAmount"] or 0)
+                            if amount <= 0:
+                                continue
+                            owner = info["owner"]
+                            balances[owner] = balances.get(owner, 0.0) + amount
+                        except (KeyError, TypeError):
+                            continue
+
+            SOLANA_LAST_HOLDER_BALANCES[mint_address] = balances
+
+            if not balances:
+                return {
+                    "holder_count": 0, "top_holder_pct": 0.0, "top10_holder_pct": 0.0,
+                    "top_holder_address": None, "top_holder_balance": 0.0,
+                    **sec,
+                }
+
+            sorted_items = sorted(balances.items(), key=lambda kv: kv[1], reverse=True)
+            sorted_amounts = [v for _, v in sorted_items]
+            top_holder_pct = (sorted_amounts[0] / supply_val * 100.0) if supply_val > 0 else 0.0
+            top10_holder_pct = (sum(sorted_amounts[:10]) / supply_val * 100.0) if supply_val > 0 else 0.0
+            return {
+                "holder_count": len(balances),
+                "top_holder_pct": top_holder_pct,
+                "top10_holder_pct": top10_holder_pct,
+                "top_holder_address": sorted_items[0][0],
+                "top_holder_balance": sorted_items[0][1],
+                **sec,
+            }
     except Exception as exc:
         logger.debug(f"fetch_solana_holder_stats({mint_address}) failed: {exc!r}")
         return {}
-
-    balances: dict[str, float] = {}
-    for acc in accounts:
-        try:
-            info = acc["account"]["data"]["parsed"]["info"]
-            amount = float(info["tokenAmount"]["uiAmount"] or 0)
-            if amount <= 0:
-                continue
-            owner = info["owner"]
-            balances[owner] = balances.get(owner, 0.0) + amount
-        except (KeyError, TypeError):
-            continue
-
-    # Stashed for detect_solana_bundle — the per-wallet balances behind these
-    # aggregates are exactly what bundle detection needs to pick which wallets
-    # are worth checking, without re-running this whole scan a second time.
-    SOLANA_LAST_HOLDER_BALANCES[mint_address] = balances
-
-    if not balances:
-        return {
-            "holder_count": 0, "top_holder_pct": 0.0, "top10_holder_pct": 0.0,
-            "mint_authority_active": mint_authority_active,
-            "freeze_authority_active": freeze_authority_active,
-            "transfer_hook_active": transfer_hook_active,
-            "default_account_frozen": default_account_frozen,
-            "permanent_delegate_active": permanent_delegate_active,
-            "is_honeypot": is_honeypot,
-            "sell_whitelist": sell_whitelist,
-            "honeypot_reason": honeypot_reason,
-        }
-
-    total = sum(balances.values())
-    sorted_items = sorted(balances.items(), key=lambda kv: kv[1], reverse=True)
-    sorted_amounts = [v for _, v in sorted_items]
-    top_holder_pct = (sorted_amounts[0] / total * 100.0) if total > 0 else 0.0
-    top10_holder_pct = (sum(sorted_amounts[:10]) / total * 100.0) if total > 0 else 0.0
-    return {
-        "holder_count": len(balances),
-        "top_holder_pct": top_holder_pct,
-        "top10_holder_pct": top10_holder_pct,
-        "top_holder_address": sorted_items[0][0],
-        "top_holder_balance": sorted_items[0][1],
-        "mint_authority_active": mint_authority_active,
-        "freeze_authority_active": freeze_authority_active,
-        "transfer_hook_active": transfer_hook_active,
-        "default_account_frozen": default_account_frozen,
-        "permanent_delegate_active": permanent_delegate_active,
-        "is_honeypot": is_honeypot,
-        "sell_whitelist": sell_whitelist,
-        "honeypot_reason": honeypot_reason,
-    }
 
 
 TOKEN_SECURITY_CACHE: dict[str, dict[str, Any]] = {}
@@ -2334,27 +2332,26 @@ async def verify_twitter_quality(twitter_input: Optional[str]) -> tuple[bool, st
 
 
 SOLANA_BUNDLE_MIN_WALLETS = 2  # holders sharing one funder before it counts as a bundle
-SOLANA_BUNDLE_MAX_HOLDERS_TO_CHECK = 30  # bounds RPC cost — bundle wallets are near-always among the largest holders anyway
+SOLANA_BUNDLE_MAX_HOLDERS_TO_CHECK = 10  # bounds RPC cost — bundle wallets are near-always among the top holders
+SOLANA_WALLET_FUNDER_CACHE: dict[str, Optional[str]] = {}
+SOLANA_WALLET_FUNDER_CACHE_MAX = 10000
 
 
 async def _resolve_solana_wallet_funder(wallet: str) -> Optional[str]:
     """Best-effort: walk to this wallet's OLDEST transaction and look for a
-    System Program transfer landing in it, returning who sent it. Confirmed
-    directly against Helius that getSignaturesForAddress/getTransaction have
-    no archive restriction (unlike this project's EVM RPC plan), so this is
-    reliable for genuinely fresh throwaway wallets — which is exactly what a
-    real sniper/bundle wallet is: a handful of lifetime transactions, so
-    `limit: 1000` reliably captures its entire history in one page.
-    Degrades to None (not a false "no funder") when the earliest transaction
-    isn't a simple funding transfer — e.g. a wallet that already existed
-    before ever touching this token, which happens for genuine early buyers
-    and shouldn't be forced into a false bundle match."""
+    System Program transfer landing in it, returning who sent it.
+    Results are permanently cached in SOLANA_WALLET_FUNDER_CACHE to prevent
+    repeated RPC queries for known holders."""
     if not (SOLANA_WS_RPC_URL or SOLANA_FALLBACK_RPC_URL):
         return None
+    if wallet in SOLANA_WALLET_FUNDER_CACHE:
+        return SOLANA_WALLET_FUNDER_CACHE[wallet]
     try:
         async with aiohttp.ClientSession() as session:
             sigs = await _solana_rpc_post(session, "getSignaturesForAddress", [wallet, {"limit": 1000}], timeout=15.0)
             if not sigs:
+                if len(SOLANA_WALLET_FUNDER_CACHE) < SOLANA_WALLET_FUNDER_CACHE_MAX:
+                    SOLANA_WALLET_FUNDER_CACHE[wallet] = None
                 return None
             oldest_sig = sigs[-1]["signature"]
 
@@ -2374,9 +2371,14 @@ async def _resolve_solana_wallet_funder(wallet: str) -> Optional[str]:
                         continue
                     info = parsed.get("info") or {}
                     if info.get("destination") == wallet and info.get("source"):
-                        return info["source"]
+                        src = info["source"]
+                        if len(SOLANA_WALLET_FUNDER_CACHE) < SOLANA_WALLET_FUNDER_CACHE_MAX:
+                            SOLANA_WALLET_FUNDER_CACHE[wallet] = src
+                        return src
     except Exception as exc:
         logger.debug(f"_resolve_solana_wallet_funder({wallet}) failed: {exc!r}")
+    if len(SOLANA_WALLET_FUNDER_CACHE) < SOLANA_WALLET_FUNDER_CACHE_MAX:
+        SOLANA_WALLET_FUNDER_CACHE[wallet] = None
     return None
 
 
@@ -2676,10 +2678,10 @@ def compute_opportunity_score(entry: dict[str, Any]) -> tuple[int, list[str]]:
         return 0, [f"Honeypot chart detected ({buys_24h} buys / {sells_24h} sells) — no sells possible (discarded)"]
 
     dev_wallet = entry.get("dev_wallet", "")
-    is_infra_wallet = dev_wallet.lower() in KNOWN_INFRASTRUCTURE_ADDRESSES
+    is_infra_wallet = dev_wallet.lower() in KNOWN_INFRASTRUCTURE_ADDRESSES or dev_wallet.lower().startswith("stonkboard")
 
     if is_infra_wallet:
-        reasons.append("Dev field is a shared router/multicall contract, not a trackable individual — reputation ignored")
+        reasons.append("Dev field is shared launchpad infrastructure, not a trackable individual — reputation neutral")
     else:
         dev_rep = DEV_REPUTATION_DATABASE.get(dev_wallet)
         dev_total = dev_rep.get("total_launches", 0) if dev_rep else (entry.get("dev_total_launches") or 0)
@@ -3022,7 +3024,7 @@ def compute_early_momentum_score(entry: dict[str, Any]) -> tuple[int, list[str]]
         return 0, [f"Honeypot chart detected ({buys_24h} buys / {sells_24h} sells) — no sells possible (discarded)"]
 
     dev_wallet = entry.get("dev_wallet", "")
-    is_infra_wallet = dev_wallet.lower() in KNOWN_INFRASTRUCTURE_ADDRESSES
+    is_infra_wallet = dev_wallet.lower() in KNOWN_INFRASTRUCTURE_ADDRESSES or dev_wallet.lower().startswith("stonkboard")
     if not is_infra_wallet:
         dev_rep = DEV_REPUTATION_DATABASE.get(dev_wallet)
         dev_total = dev_rep.get("total_launches", 0) if dev_rep else (entry.get("dev_total_launches") or 0)
@@ -5623,6 +5625,14 @@ def dev_rep_badge_fields(dev_wallet: str) -> dict[str, Any]:
     launches, and alerts — so a wallet address is never the only thing shown.
     What matters is whether this dev has rugged or graduated something before,
     how many total coins they have launched, and whether they are blacklisted."""
+    if dev_wallet.lower().startswith("stonkboard"):
+        return {
+            "dev_alias": "StonkFun Launchpad",
+            "dev_moons": 0,
+            "dev_rugs": 0,
+            "dev_total_launches": 1,
+            "dev_blacklisted": False,
+        }
     if dev_wallet.lower() in KNOWN_INFRASTRUCTURE_ADDRESSES:
         return {
             "dev_alias": "shared infra (not a person)",
@@ -5677,13 +5687,14 @@ def _record_bundle_operator(operator: str, token_address: str, dev_wallet: str, 
 
 
 def stage_a_dev_trust(dev_wallet: str, chain: str, ts: float) -> dict[str, Any]:
-    if dev_wallet.lower() in KNOWN_INFRASTRUCTURE_ADDRESSES:
+    if dev_wallet.lower() in KNOWN_INFRASTRUCTURE_ADDRESSES or dev_wallet.lower().startswith("stonkboard"):
         # A shared router/multicall contract, not a trackable individual — never
         # accumulate blacklist/elite reputation on it. The alternative (treating
         # it as one identity) would let one bad actor's multicall-routed rug
         # blacklist every unrelated future launch that happens to route through
         # the same generic infrastructure.
-        return {"decision": "PASS", "reason": "SHARED_INFRASTRUCTURE", "dev": {"alias": "shared-infrastructure", "is_blacklisted": False, "successful_launches": 0, "total_launches": 0}}
+        alias = "StonkFun Launchpad" if dev_wallet.lower().startswith("stonkboard") else "shared-infrastructure"
+        return {"decision": "PASS", "reason": "SHARED_INFRASTRUCTURE", "dev": {"alias": alias, "is_blacklisted": False, "successful_launches": 0, "total_launches": 1}}
 
     dev = get_or_create_dev(dev_wallet, chain)
     dev["total_launches"] = dev.get("total_launches", 0) + 1
@@ -6694,7 +6705,7 @@ async def evm_wallet_monitor(chain: str, ws_url: str) -> None:
 
 WATCHLIST_PRUNE_AGE_SECONDS = 2 * 3600  # drop terminal entries from the hot loop after this long
 TERMINAL_POLL_INTERVAL_SECONDS = 300  # GRADUATED/RUGGED tokens keep getting mcap/volume refreshes, just less often than active WATCHING ones
-HOLDER_STATS_POLL_INTERVAL_SECONDS = 60  # getProgramAccounts is a full scan — throttled separately from the 20s mcap poll
+HOLDER_STATS_POLL_INTERVAL_SECONDS = 120  # throttled separately from the 20s mcap poll
 
 # --- Long-tail revival watch --------------------------------------------
 # A token leaving the hot loop (see WATCHLIST_PRUNE_AGE_SECONDS) doesn't mean
@@ -7117,12 +7128,12 @@ def _format_telegram_opportunity_message(entry: dict[str, Any]) -> str:
 
     # Research links (MUST ALWAYS BE INCLUDED)
     links = entry.get("links") or {}
-    dex_url = links.get("dexscreener") or links.get("explorer")
+    dex_url = links.get("dexscreener") or links.get("explorer") or (f"https://dexscreener.com/solana/{token_address}" if chain == "SOLANA" else None)
     fomo_url = links.get("fomo")
-    stonk_url = links.get("stonkboard")
+    stonk_url = links.get("stonkboard") or (f"https://thestonkboard.com/coin/{token_address}" if (platform.lower() == "stonkfun" or is_stonkboard_token(token_address)) else None)
     flap_url = links.get("flap") or (f"https://flap.sh/{token_address}" if token_address.lower().endswith("7777") else None)
     four_url = links.get("fourmeme") or (f"https://four.meme/token/{token_address}" if token_address.lower().endswith("4444") else None)
-    pump_url = links.get("pumpfun") or (f"https://pump.fun/{token_address}" if token_address.lower().endswith("pump") else None)
+    pump_url = links.get("pumpfun") or (f"https://pump.fun/{token_address}" if (token_address.lower().endswith("pump") or platform.lower() == "pump.fun") else None)
 
     research_items = []
     if flap_url:
@@ -7254,12 +7265,12 @@ def _format_telegram_early_momentum_message(entry: dict[str, Any]) -> str:
     signals_block = "💡 <b>Key Signals:</b>\n" + "\n".join(signal_bullets[:2]) + "\n\n"
 
     links = entry.get("links") or {}
-    dex_url = links.get("dexscreener") or links.get("explorer")
+    dex_url = links.get("dexscreener") or links.get("explorer") or (f"https://dexscreener.com/solana/{token_address}" if chain == "SOLANA" else None)
     fomo_url = links.get("fomo")
-    stonk_url = links.get("stonkboard")
+    stonk_url = links.get("stonkboard") or (f"https://thestonkboard.com/coin/{token_address}" if (platform.lower() == "stonkfun" or is_stonkboard_token(token_address)) else None)
     flap_url = links.get("flap") or (f"https://flap.sh/{token_address}" if token_address.lower().endswith("7777") else None)
     four_url = links.get("fourmeme") or (f"https://four.meme/token/{token_address}" if token_address.lower().endswith("4444") else None)
-    pump_url = links.get("pumpfun") or (f"https://pump.fun/{token_address}" if token_address.lower().endswith("pump") else None)
+    pump_url = links.get("pumpfun") or (f"https://pump.fun/{token_address}" if (token_address.lower().endswith("pump") or platform.lower() == "pump.fun") else None)
 
     research_items = []
     if flap_url:
@@ -7332,7 +7343,9 @@ def _build_telegram_reply_markup(chain: str, token_address: str, platform: Optio
         row2 = [
             {"text": "📊 DexScreener", "url": f"https://dexscreener.com/solana/{token_address}"},
         ]
-        if (platform or "").lower() == "pump.fun" or token_address.lower().endswith("pump"):
+        if (platform or "").lower() == "stonkfun" or is_stonkboard_token(token_address):
+            row2.insert(0, {"text": "📈 StonkBoard", "url": f"https://thestonkboard.com/coin/{token_address}"})
+        elif (platform or "").lower() == "pump.fun" or token_address.lower().endswith("pump"):
             row2.insert(0, {"text": "💊 Pump.fun", "url": f"https://pump.fun/coin/{token_address}"})
         else:
             row2.insert(0, {"text": "🦄 Raydium", "url": f"https://raydium.io/swap/?inputMint=sol&outputMint={token_address}"})
@@ -7467,7 +7480,7 @@ def _is_safe_vetted_token(token_address: str, entry: dict[str, Any]) -> bool:
         return False
 
     dev_wallet = entry.get("dev_wallet", "")
-    is_infra = dev_wallet.lower() in KNOWN_INFRASTRUCTURE_ADDRESSES if dev_wallet else False
+    is_infra = (dev_wallet.lower() in KNOWN_INFRASTRUCTURE_ADDRESSES or dev_wallet.lower().startswith("stonkboard")) if dev_wallet else False
     if not is_infra and dev_wallet:
         dev_rep = DEV_REPUTATION_DATABASE.get(dev_wallet)
         dev_total = dev_rep.get("total_launches", 0) if dev_rep else (entry.get("dev_total_launches") or 0)
@@ -7795,9 +7808,19 @@ async def _maybe_refresh_holder_stats(token_address: str, info: dict[str, Any], 
     next_due = info.get("next_holder_poll_at", 0.0)
     if now < next_due:
         return
-    info["next_holder_poll_at"] = now + HOLDER_STATS_POLL_INTERVAL_SECONDS
 
     chain = info["chain"]
+    # Quota guardrail: for Solana tokens with small mcap / low score that have already had their initial security check,
+    # poll at a much slower cadence (every 5 min) so dead/dust tokens don't consume RPC quota.
+    if chain == "solana" and info.get("holder_stats_initial_checked"):
+        mcap = float(info.get("market_cap") or (TOKEN_FEED.get(token_address, {}).get("market_cap")) or 0.0)
+        opp_score = float((TOKEN_FEED.get(token_address, {}).get("opportunity_score")) or 0.0)
+        if mcap < 5000 and opp_score < 8:
+            info["next_holder_poll_at"] = now + 300.0
+            return
+
+    info["next_holder_poll_at"] = now + HOLDER_STATS_POLL_INTERVAL_SECONDS
+    info["holder_stats_initial_checked"] = True
     if chain == "solana":
         holder_stats = (await fetch_solana_holder_stats(token_address)) or {}
         # Fallback: only when the RPC scan returned no holders AND this is a real
@@ -7900,6 +7923,14 @@ async def _maybe_check_bundle(token_address: str, info: dict[str, Any], now: flo
     next_due = info.get("next_bundle_check_at", 0.0)
     if now < next_due:
         return
+
+    # Quota guardrail: don't waste RPC calls bundle-checking dead/dust tokens
+    mcap = float(info.get("market_cap") or (TOKEN_FEED.get(token_address, {}).get("market_cap")) or 0.0)
+    opp_score = float((TOKEN_FEED.get(token_address, {}).get("opportunity_score")) or 0.0)
+    if mcap < 10000 and opp_score < 10:
+        info["next_bundle_check_at"] = now + 60.0  # defer until token gains traction
+        return
+
     info["next_bundle_check_at"] = now + BUNDLE_CHECK_INTERVAL_SECONDS
 
     chain = info["chain"]
@@ -8267,7 +8298,7 @@ async def _process_watchlist_token(token_address: str, info: dict[str, Any], now
 
     # Dev multi-launch & serial rugger check:
     dev_wallet = info.get("dev_wallet", "")
-    is_infra = dev_wallet.lower() in KNOWN_INFRASTRUCTURE_ADDRESSES
+    is_infra = dev_wallet.lower() in KNOWN_INFRASTRUCTURE_ADDRESSES or dev_wallet.lower().startswith("stonkboard")
     if not is_infra and dev_wallet:
         dev = DEV_REPUTATION_DATABASE.get(dev_wallet)
         if dev:
