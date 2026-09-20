@@ -308,9 +308,17 @@ async def sync_stonkboard_coins() -> None:
                     newly_ingested = 0
                     for mint in all_mints:
                         STONKBOARD_COIN_ADDRESSES.add(mint)
-                        if mint not in TOKEN_FEED and mint not in TOKEN_WATCHLIST:
+                        existing_wl = TOKEN_WATCHLIST.get(mint)
+                        if existing_wl and existing_wl.get("status") == "SKIPPED":
+                            dev_w = existing_wl.get("dev_wallet", "")
+                            if dev_w.startswith("stonkboard_"):
+                                existing_wl["status"] = "WATCHING"
+                                existing_wl["dev_decision"] = "PASS"
+                                if mint in TOKEN_FEED:
+                                    TOKEN_FEED[mint]["status"] = "WATCHING"
+                        elif mint not in TOKEN_FEED and mint not in TOKEN_WATCHLIST:
                             sym = symbol_by_mint.get(mint, "UNKNOWN").strip().upper()
-                            if sym and is_probably_established_or_stock(sym, 0.0)[0]:
+                            if sym and is_stock_style_ticker(sym):
                                 continue
                             if sym and ticker_is_invalid(sym)[0]:
                                 continue
@@ -2500,19 +2508,23 @@ def is_stock_style_ticker(ticker: Optional[str]) -> bool:
     return bool(re.fullmatch(r"[A-Z]{1,5}[0-9]?x", ticker.strip()))
 
 
-def is_probably_established_or_stock(ticker: Optional[str], market_cap: float = 0.0) -> tuple[bool, str]:
+def is_probably_established_or_stock(
+    ticker: Optional[str], market_cap: float = 0.0, platform: Optional[str] = None
+) -> tuple[bool, str]:
     """True + reason if this looks like an ALREADY-ESTABLISHED coin or a
     tokenized stock rather than a genuine new fair-launch. Three signals:
       - a known established symbol (HYPE, ZEC, BTC, ...) — case-insensitive
       - the xStocks tokenized-equity pattern (MSTRx, AAPLx, ...)
       - an implausibly high mcap for something we're seeing as 'new'
+    NOTE: StonkFun tokens intentionally share meme tickers with real stocks;
+    they are allowed as long as they are fresh (mcap < $1M) and not xStocks.
     """
     if ticker:
         sym = ticker.strip().upper()
-        if sym in ESTABLISHED_SYMBOL_BLOCKLIST:
-            return True, f"'{ticker}' is a known established coin, not a new launch"
         if is_stock_style_ticker(ticker):
             return True, f"'{ticker}' looks like a tokenized stock (xStocks pattern), not a memecoin"
+        if (platform or "").lower() != "stonkfun" and sym in ESTABLISHED_SYMBOL_BLOCKLIST:
+            return True, f"'{ticker}' is a known established coin, not a new launch"
     if market_cap and market_cap >= IMPLAUSIBLE_NEW_LAUNCH_MCAP_USD:
         return True, f"mcap ${market_cap:,.0f} is implausibly high for a genuinely new launch — likely an established coin mislabeled as new"
     return False, ""
@@ -3876,7 +3888,7 @@ async def maybe_evaluate_token_with_jev(token_address: str, entry: dict[str, Any
         return
     # Safety net: never evaluate established coins / tokenized stocks even if one
     # leaked into the feed — these aren't new fair-launches (user doesn't want them).
-    est, est_reason = is_probably_established_or_stock(ticker, entry.get("market_cap") or 0.0)
+    est, est_reason = is_probably_established_or_stock(ticker, entry.get("market_cap") or 0.0, platform=entry.get("platform"))
     if est:
         jev_emit_event("skipped", ticker=ticker, token_address=token_address,
                        reason=f"not a new launch: {est_reason}")
@@ -6039,7 +6051,7 @@ async def process_new_token_event(
     # new fair-launches (HYPE, ZEC, MSTRx, AAPLx...). Blocking here keeps them
     # out of narrative clustering, scoring, and Jev entirely. The mcap arm of
     # the detector fires later in the poll loop once DexScreener fills mcap in.
-    est, est_reason = is_probably_established_or_stock(ticker_raw, 0.0)
+    est, est_reason = is_probably_established_or_stock(ticker_raw, 0.0, platform=platform)
     _tinv, _treason = ticker_is_invalid(ticker_raw)
     if est or _tinv:
         _reason = est_reason if est else _treason
@@ -8288,7 +8300,7 @@ async def _process_watchlist_token(token_address: str, info: dict[str, Any], now
     # Cross-platform established coin / tokenized stock / implausible new-launch
     # mcap (any platform). Catches HYPE/MSTRx/ZEC leaks whose symbol only
     # resolved after DexScreener backfill.
-    est, est_reason = is_probably_established_or_stock(info.get("ticker"), market_cap)
+    est, est_reason = is_probably_established_or_stock(info.get("ticker"), market_cap, platform=info.get("platform"))
     if est:
         await _kick_out_watchlist_token(
             token_address, info, now, "NOT_A_NEW_LAUNCH",
