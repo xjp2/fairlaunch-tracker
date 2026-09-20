@@ -1817,7 +1817,8 @@ def build_token_links(chain: str, token_address: str, platform: Optional[str] = 
     slug = DEXSCREENER_CHAIN_SLUGS.get(chain)
     if slug:
         links["dexscreener"] = f"https://dexscreener.com/{slug}/{token_address}"
-    fomo_chain = chain if chain in ("solana", "bnb", "base", "robinhood") else "solana"
+    chain_lower = (chain or "solana").lower()
+    fomo_chain = chain_lower if chain_lower in ("solana", "bnb", "base", "robinhood") else ("bnb" if chain_lower in ("bsc", "binance") else "solana")
     links["fomo"] = f"https://fomo.family/tokens/{fomo_chain}/{token_address}"
     addr_lower = (token_address or "").lower()
     if chain == "solana":
@@ -7455,30 +7456,20 @@ def _format_telegram_opportunity_message(entry: dict[str, Any]) -> str:
         signal_bullets.append("• Strong launch momentum & volume activity")
     signals_block = "💡 <b>Key Signals:</b>\n" + "\n".join(signal_bullets[:2]) + "\n\n"
 
-    # Research links (MUST ALWAYS BE INCLUDED)
+    # Dedicated link block (FOMO only, with StonkBoard for StonkFun)
     links = entry.get("links") or {}
-    dex_url = links.get("dexscreener") or links.get("explorer") or (f"https://dexscreener.com/solana/{token_address}" if chain == "SOLANA" else None)
     fomo_url = links.get("fomo")
+    if not fomo_url:
+        chain_lower = (chain or "solana").lower()
+        fomo_chain = chain_lower if chain_lower in ("solana", "bnb", "base", "robinhood") else ("bnb" if chain_lower in ("bsc", "binance") else "solana")
+        fomo_url = f"https://fomo.family/tokens/{fomo_chain}/{token_address}"
     stonk_url = links.get("stonkboard") or (f"https://thestonkboard.com/coin/{token_address}" if (platform.lower() == "stonkfun" or is_stonkboard_token(token_address)) else None)
-    flap_url = links.get("flap") or (f"https://flap.sh/{token_address}" if token_address.lower().endswith("7777") else None)
-    four_url = links.get("fourmeme") or (f"https://four.meme/token/{token_address}" if token_address.lower().endswith("4444") else None)
-    pump_url = links.get("pumpfun") or (f"https://pump.fun/{token_address}" if (token_address.lower().endswith("pump") or platform.lower() == "pump.fun") else None)
 
-    research_items = []
-    if flap_url:
-        research_items.append(f'<a href="{esc(flap_url)}">🥞 flap.sh</a>')
-    if four_url:
-        research_items.append(f'<a href="{esc(four_url)}">4️⃣ four.meme</a>')
-    if pump_url:
-        research_items.append(f'<a href="{esc(pump_url)}">💊 pump.fun</a>')
-    if fomo_url:
-        research_items.append(f'<a href="{esc(fomo_url)}">🦄 FOMO</a>')
-    if dex_url:
-        research_items.append(f'<a href="{esc(dex_url)}">📊 DexScreener</a>')
+    link_items = [f'<a href="{esc(fomo_url)}">🦄 FOMO.family</a>']
     if stonk_url:
-        research_items.append(f'<a href="{esc(stonk_url)}">📈 StonkBoard</a>')
-    research_str = " │ ".join(research_items) if research_items else (f'<a href="{esc(dex_url)}">📊 DexScreener</a>' if dex_url else "None")
-    research_block = f"🔗 <b>Research:</b> {research_str}"
+        link_items.append(f'<a href="{esc(stonk_url)}">📈 StonkBoard</a>')
+    research_str = " │ ".join(link_items)
+    research_block = f"🔗 <b>Link:</b> {research_str}"
 
     # Social channels (only appended if at least one exists)
     soc_links = entry.get("socials") or {}
@@ -7616,29 +7607,20 @@ def _format_telegram_early_momentum_message(entry: dict[str, Any]) -> str:
         signal_bullets.append("• Early breakout volume surge & velocity")
     signals_block = "💡 <b>Key Signals:</b>\n" + "\n".join(signal_bullets[:2]) + "\n\n"
 
+    # Dedicated link block (FOMO only, with StonkBoard for StonkFun)
     links = entry.get("links") or {}
-    dex_url = links.get("dexscreener") or links.get("explorer") or (f"https://dexscreener.com/solana/{token_address}" if chain == "SOLANA" else None)
     fomo_url = links.get("fomo")
+    if not fomo_url:
+        chain_lower = (chain or "solana").lower()
+        fomo_chain = chain_lower if chain_lower in ("solana", "bnb", "base", "robinhood") else ("bnb" if chain_lower in ("bsc", "binance") else "solana")
+        fomo_url = f"https://fomo.family/tokens/{fomo_chain}/{token_address}"
     stonk_url = links.get("stonkboard") or (f"https://thestonkboard.com/coin/{token_address}" if (platform.lower() == "stonkfun" or is_stonkboard_token(token_address)) else None)
-    flap_url = links.get("flap") or (f"https://flap.sh/{token_address}" if token_address.lower().endswith("7777") else None)
-    four_url = links.get("fourmeme") or (f"https://four.meme/token/{token_address}" if token_address.lower().endswith("4444") else None)
-    pump_url = links.get("pumpfun") or (f"https://pump.fun/{token_address}" if (token_address.lower().endswith("pump") or platform.lower() == "pump.fun") else None)
 
-    research_items = []
-    if flap_url:
-        research_items.append(f'<a href="{esc(flap_url)}">🥞 flap.sh</a>')
-    if four_url:
-        research_items.append(f'<a href="{esc(four_url)}">4️⃣ four.meme</a>')
-    if pump_url:
-        research_items.append(f'<a href="{esc(pump_url)}">💊 pump.fun</a>')
-    if fomo_url:
-        research_items.append(f'<a href="{esc(fomo_url)}">🦄 FOMO</a>')
-    if dex_url:
-        research_items.append(f'<a href="{esc(dex_url)}">📊 DexScreener</a>')
+    link_items = [f'<a href="{esc(fomo_url)}">🦄 FOMO.family</a>']
     if stonk_url:
-        research_items.append(f'<a href="{esc(stonk_url)}">📈 StonkBoard</a>')
-    research_str = " │ ".join(research_items) if research_items else (f'<a href="{esc(dex_url)}">📊 DexScreener</a>' if dex_url else "None")
-    research_block = f"🔗 <b>Research:</b> {research_str}"
+        link_items.append(f'<a href="{esc(stonk_url)}">📈 StonkBoard</a>')
+    research_str = " │ ".join(link_items)
+    research_block = f"🔗 <b>Link:</b> {research_str}"
 
     soc_links = entry.get("socials") or {}
     soc_items = []
@@ -7704,43 +7686,16 @@ def _format_telegram_early_momentum_message(entry: dict[str, Any]) -> str:
 
 def _build_telegram_reply_markup(chain: str, token_address: str, platform: Optional[str] = None) -> Optional[dict[str, Any]]:
     chain_norm = (chain or "solana").lower()
-    inline_keyboard: list[list[dict[str, str]]] = []
-    if chain_norm == "solana":
-        row1 = [
-            {"text": "⚡ Photon", "url": f"https://photon-sol.tinyastro.io/en/lp/{token_address}"},
-            {"text": "🎯 Trojan", "url": f"https://t.me/solana_trojanbot?start=r-snipe_{token_address}"},
-            {"text": "🐂 BullX", "url": f"https://neo.bullx.io/terminal?chainId=1399811149&address={token_address}"},
-        ]
-        row2 = [
-            {"text": "📊 DexScreener", "url": f"https://dexscreener.com/solana/{token_address}"},
-        ]
-        if (platform or "").lower() == "stonkfun" or is_stonkboard_token(token_address):
-            row2.insert(0, {"text": "📈 StonkBoard", "url": f"https://thestonkboard.com/coin/{token_address}"})
-        elif (platform or "").lower() == "pump.fun" or token_address.lower().endswith("pump"):
-            row2.insert(0, {"text": "💊 Pump.fun", "url": f"https://pump.fun/coin/{token_address}"})
-        else:
-            row2.insert(0, {"text": "🦄 Raydium", "url": f"https://raydium.io/swap/?inputMint=sol&outputMint={token_address}"})
-        inline_keyboard = [row1, row2]
-    elif chain_norm in ("bnb", "bsc"):
-        row1 = [
-            {"text": "🥞 PancakeSwap", "url": f"https://pancakeswap.finance/swap?outputCurrency={token_address}"},
-            {"text": "📊 DexScreener", "url": f"https://dexscreener.com/bsc/{token_address}"},
-        ]
-        row2 = []
-        if (platform or "").lower() == "four.meme" or token_address.lower().endswith("4444"):
-            row2.append({"text": "4️⃣ four.meme", "url": f"https://four.meme/token/{token_address}"})
-        elif (platform or "").lower() == "flap.sh" or token_address.lower().endswith("7777"):
-            row2.append({"text": "🥞 flap.sh", "url": f"https://flap.sh/{token_address}"})
-        row2.append({"text": "🔍 BscScan", "url": f"https://bscscan.com/token/{token_address}"})
-        inline_keyboard = [row1, row2]
-    elif chain_norm == "robinhood":
-        inline_keyboard = [
-            [
-                {"text": "📊 DexScreener", "url": f"https://dexscreener.com/robinhood/{token_address}"},
-                {"text": "🔍 Explorer", "url": f"https://robinhoodchain.blockscout.com/token/{token_address}"},
-            ]
-        ]
-    return {"inline_keyboard": inline_keyboard} if inline_keyboard else None
+    fomo_chain = chain_norm if chain_norm in ("solana", "bnb", "base", "robinhood") else ("bnb" if chain_norm in ("bsc", "binance") else "solana")
+    fomo_url = f"https://fomo.family/tokens/{fomo_chain}/{token_address}"
+
+    buttons: list[dict[str, str]] = [
+        {"text": "🦄 Open in FOMO.family", "url": fomo_url}
+    ]
+    if (platform or "").lower() == "stonkfun" or is_stonkboard_token(token_address):
+        buttons.append({"text": "📈 StonkBoard", "url": f"https://thestonkboard.com/coin/{token_address}"})
+
+    return {"inline_keyboard": [buttons]}
 
 
 async def send_telegram_message(
