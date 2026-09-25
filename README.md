@@ -4,7 +4,7 @@ A real-time monitoring dashboard for fair-launch token activity across major lau
 
 Fairlaunch Tracker watches live token creation and market activity across Solana, BNB Chain, and Robinhood Chain, then scores and ranks launches based on liquidity, holder structure, dev reputation, momentum, and a range of market-quality heuristics.
 
-The project is built to help identify promising new launches early while filtering out noisy or suspicious activity.
+The project is designed to help identify promising new launches early while filtering out noisy or suspicious activity.
 
 ## Overview
 
@@ -42,8 +42,45 @@ Current supported coverage includes:
 - dashboard UI for tracking active, graduated, and rugged tokens
 - configurable environment-driven tuning
 - optional Telegram notifications for high-scoring opportunities
+- optional TypeSafe AI System One (Jev) integration for qualitative signal evaluation
 - Docker deployment support
 - persistent data directory for snapshots and state
+
+## TypeSafe AI System One (Jev)
+
+Fairlaunch Tracker includes an optional integration with TypeSafe's AI System One, referred to in the codebase as `Jev`.
+
+This system is used to evaluate qualitative dimensions that deterministic on-chain metrics alone cannot fully assess, such as:
+
+- narrative quality
+- legitimacy and impersonation risk
+- durability and sustainability
+- trap/rug risk
+- moon potential and comparative pick quality
+
+In practice, Jev is used as a second-stage reasoning layer after a token has already cleared basic quantitative filters. It can add or subtract confidence as part of the opportunity score, and it can help judge whether a token looks like a coherent launch or a coordinated trap.
+
+The integration is optional. If `TYPESAFE_API_KEY` is blank or disabled, the tracker continues to run using the deterministic scoring model without Jev evaluation.
+
+### Jev configuration
+
+The `.env.example` file includes settings such as:
+
+- `TYPESAFE_API_KEY`
+- `TYPESAFE_API_BASE`
+- `TYPESAFE_MODEL`
+- `JEV_MIN_SCORE_TO_EVALUATE`
+- `JEV_MAX_CALLS_PER_DAY`
+- `JEV_MAX_CALLS_TOTAL`
+- `JEV_WEIGHT_*` tuning values
+
+These controls allow the project to balance AI-based evaluations with cost, confidence, and output quality constraints.
+
+## Jev dashboard example
+
+The system evaluates a token across a matrix of qualitative dimensions and scores them with explanatory confidence. This is a representative view of the TypeSafe AI scoring layer used in the app:
+
+![Jev dashboard example](docs/images/jev-dashboard.svg)
 
 ## Project structure
 
@@ -57,6 +94,9 @@ Current supported coverage includes:
 ├── tracker.py               # Main tracker logic and API server
 ├── static/
 │   └── dashboard.html       # Web dashboard frontend
+├── docs/
+│   └── images/
+│       └── jev-dashboard.svg
 ├── exports/
 │   └── snapshot-2026-09-17.json
 └── README.md
@@ -128,7 +168,7 @@ Key configuration areas include:
 - market-data API endpoints
 - scoring and filtering thresholds
 - Telegram notification settings
-- optional TypeSafe/Jev evaluation settings
+- optional TypeSafe AI System One (Jev) evaluation settings
 
 The app is designed to start with safe defaults for many values and only requires specific endpoints when you want full coverage for a chain or system.
 
@@ -155,6 +195,8 @@ The Docker image includes a health check against:
 ## Notes
 
 This project is focused on live monitoring and opportunity detection for fast-moving launch environments. It is best used with properly configured RPC/WebSocket endpoints and a real-time environment where you want continuous visibility into launch activity.
+
+The TypeSafe AI System One (Jev) layer is intended to improve judgment quality by evaluating qualitative risk and opportunity signals beyond simple numerical thresholds, but it remains optional and cost-aware.
 
 ## License
 
