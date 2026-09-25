@@ -78,9 +78,9 @@ These controls allow the project to balance AI-based evaluations with cost, conf
 
 ## Jev dashboard example
 
-The system evaluates a token across a matrix of qualitative dimensions and scores them with explanatory confidence. This is a representative view of the TypeSafe AI scoring layer used in the app:
+The system evaluates a token across a matrix of qualitative dimensions and scores them with explanatory confidence. This is a representative snapshot of the TypeSafe AI System One (Jev) reasoning layer used in the app:
 
-![Jev dashboard example](docs/images/jev-dashboard.svg)
+![Jev dashboard example](image.png)
 
 ## Project structure
 
@@ -94,9 +94,7 @@ The system evaluates a token across a matrix of qualitative dimensions and score
 ├── tracker.py               # Main tracker logic and API server
 ├── static/
 │   └── dashboard.html       # Web dashboard frontend
-├── docs/
-│   └── images/
-│       └── jev-dashboard.svg
+├── image.png                # Jev dashboard example image
 ├── exports/
 │   └── snapshot-2026-09-17.json
 └── README.md
